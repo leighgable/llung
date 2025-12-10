@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Feedback Screen</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Epilogue:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet"/>
+<script>
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#2bee79",
+                        "background-light": "#f6f8f7",
+                        "background-dark": "#102217",
+                        "text-light": "#0d1b13",
+                        "text-dark": "#e0e6e2",
+                        "border-light": "#cfe7d9",
+                        "border-dark": "#2a3b31"
+                    },
+                    fontFamily: {
+                        "display": ["Epilogue", "sans-serif"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.5rem",
+                        "lg": "1rem",
+                        "xl": "1.5rem",
+                        "full": "9999px"
+                    },
+                },
+            },
+        }
+    </script>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background-light dark:bg-background-dark">
+<div class="relative flex min-h-screen w-full flex-col font-display group/design-root overflow-x-hidden">
+<!-- Top App Bar -->
+<header class="flex items-center bg-background-light dark:bg-background-dark p-4 pb-2 justify-between sticky top-0 z-10">
+<button class="text-text-light dark:text-text-dark flex size-10 shrink-0 items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
+<span class="material-symbols-outlined text-2xl">arrow_back</span>
+</button>
+<h2 class="text-text-light dark:text-text-dark text-lg font-bold leading-tight tracking-[-0.015em] flex-1 text-center">Provide Feedback</h2>
+<div class="size-10 shrink-0"></div> <!-- Spacer for centering -->
+</header>
+<main class="flex flex-col px-4 pt-4 flex-grow">
+<!-- Headline Text -->
+<h1 class="text-text-light dark:text-text-dark tracking-light text-[32px] font-bold leading-tight text-left pb-2">Share Your Feedback</h1>
+<!-- Body Text -->
+<p class="text-text-light dark:text-text-dark/70 text-base font-normal leading-normal pb-6">We read every suggestion to help improve your experience.</p>
+<!-- Text Field -->
+<div class="flex flex-col flex-grow">
+<label class="flex flex-col flex-1">
+<p class="text-text-light dark:text-text-dark text-base font-medium leading-normal pb-2">Your Feedback</p>
+<textarea class="form-input flex w-full min-w-0 flex-1 resize-none overflow-hidden rounded-xl text-text-light dark:text-text-dark focus:outline-0 focus:ring-2 focus:ring-primary/50 border border-border-light dark:border-border-dark bg-background-light dark:bg-background-dark placeholder:text-text-light/40 dark:placeholder:text-text-dark/40 p-[15px] text-base font-normal leading-normal min-h-48" placeholder="What's on your mind? Suggestions for new features, bug reports, or general feedback are all welcome!"></textarea>
+</label>
+</div>
+</main>
+<!-- Footer with Button -->
+<footer class="sticky bottom-0 bg-background-light dark:bg-background-dark p-4 pt-3">
+<!-- Single Button -->
+<button class="flex min-w-[84px] w-full cursor-pointer items-center justify-center overflow-hidden rounded-xl h-14 px-5 bg-primary text-text-light text-base font-bold leading-normal tracking-[0.015em] hover:opacity-90 active:opacity-80 transition-opacity">
+<span class="truncate">Send Feedback</span>
+</button>
+</footer>
+</div>
+</body></html>

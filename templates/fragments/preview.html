@@ -1,0 +1,14 @@
+<div id="app" class="relative h-screen flex flex-col items-center justify-center bg-black text-white" hx-target="this"
+  hx-swap="outerHTML">
+  <img src="{{ photo_data }}" alt="Preview" class="preview absolute inset-0 w-full h-full object-cover" />
+  <div class="absolute bottom-24 flex gap-6">
+    <button hx-get="/" hx-target="#app" hx-swap="outerHTML"
+      class="px-6 py-3 bg-white/20 rounded-xl text-white font-medium backdrop-blur-sm">↩️ Retake</button>
+    <form hx-post="/analyze" hx-target="#app" hx-swap="outerHTML" hx-indicator="#loading-indicator"
+      enctype="multipart/form-data">
+      <input type="hidden" name="photo_data" value="{{ photo_data }}">
+      <button type="submit" class="px-6 py-3 bg-primary text-background-dark rounded-xl font-semibold shadow">🚀
+        Send</button>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Recipe App Welcome Screen</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Epilogue:wght@400;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet"/>
+<script>
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#2bee79",
+                        "background-light": "#f6f8f7",
+                        "background-dark": "#102217",
+                        "text-light": "#0d1b13",
+                        "text-dark": "#e0f8e9",
+                        "text-light-secondary": "#6b7280",
+                        "text-dark-secondary": "#9ca3af",
+                        "primary-text": "#0d1b13"
+                    },
+                    fontFamily: {
+                        "display": ["Epilogue", "sans-serif"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.5rem",
+                        "lg": "1rem",
+                        "xl": "1.5rem",
+                        "full": "9999px"
+                    },
+                },
+            },
+        }
+    </script>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background-light dark:bg-background-dark font-display">
+<div class="relative flex h-auto min-h-screen w-full flex-col group/design-root overflow-x-hidden">
+<div class="flex flex-col flex-grow">
+<!-- HeaderImage -->
+<div class="@container">
+<div class="@[480px]:px-4 @[480px]:py-3 p-0">
+<div class="w-full bg-center bg-no-repeat bg-cover flex flex-col justify-end overflow-hidden @[480px]:rounded-xl min-h-[320px] md:min-h-[400px]" data-alt="A colorful assortment of fresh vegetables on a clean kitchen counter." style='background-image: url("https://lh3.googleusercontent.com/aida-public/AB6AXuBPwOd_XwfYDbDmfYUaK4fTcdM5NeL8e_6-ECM6r0KOit-y5yJdWRUNIWRPLSVLzrABoJ2SEXNq-rDaubyJfI1t83W10tptb7vb4IxI5Puh9A-YLsBiIxt_5HyKJ5qYjQNrnPlLQpLWaG9R04zSa2BzcZYh2EGGtsuiYCXUT4kT_Z7utvmNw55vrLCXIsPLz37PFeGY8toZl7Ufxa4Rtt2Y0lf6_80xrg2V5NkNfpOP3kOv__zzXgR3JwIwT6HN8Hw9W-CAlfAzRA");'></div>
+</div>
+</div>
+<!-- Content Section -->
+<div class="flex-grow flex flex-col justify-center px-4">
+<!-- HeadlineText -->
+<h1 class="text-text-light dark:text-text-dark tracking-tight text-[32px] font-bold leading-tight text-center pb-3 pt-6">Ready to cook something amazing?</h1>
+<!-- BodyText -->
+<p class="text-text-light-secondary dark:text-text-dark-secondary text-base font-normal leading-normal pb-3 pt-1 text-center">
+                    See what you can make with what you have. Point your camera at your ingredients to get started.
+                </p>
+</div>
+</div>
+<!-- Sticky Footer for Actions -->
+<div class="sticky bottom-0 bg-background-light dark:bg-background-dark pb-4 pt-2">
+<!-- SingleButton -->
+<div class="flex px-4 py-3">
+<button class="flex min-w-[84px] max-w-[480px] cursor-pointer items-center justify-center overflow-hidden rounded-xl h-12 px-5 flex-1 bg-primary text-primary-text gap-2 pl-5 text-base font-bold leading-normal tracking-[0.015em] shadow-lg shadow-primary/20">
+<span class="material-symbols-outlined">photo_camera</span>
+<span class="truncate">Scan My Ingredients</span>
+</button>
+</div>
+<!-- MetaText -->
+<p class="text-primary/80 dark:text-primary/90 text-sm font-normal leading-normal pb-3 pt-1 px-4 text-center underline cursor-pointer">Or, browse recipes</p>
+</div>
+</div>
+</body></html>

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Take a Photo (Web)</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 2rem;
+    }
+
+    #preview {
+      width: 100%;
+      max-width: 400px;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Take a Photo (Web)</h2>
+
+  <input type="file" accept="image/*" capture="environment" id="photoInput">
+  <button id="uploadBtn">Upload</button>
+  <div id="result"></div>
+
+  <img id="preview" />
+
+  <script>
+    const input = document.getElementById('photoInput');
+    const preview = document.getElementById('preview');
+    const result = document.getElementById('result');
+
+    input.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (file) preview.src = URL.createObjectURL(file);
+    });
+
+    document.getElementById('uploadBtn').addEventListener('click', async () => {
+      const file = input.files[0];
+      if (!file) return alert('Please take or select a photo first!');
+      const form = new FormData();
+      form.append('photo', file);
+      const res = await fetch('http://localhost:8000/upload-photo', {
+        method: 'POST',
+        body: form,
+      });
+      const data = await res.json();
+      result.textContent = 'Uploaded as: ' + data.filename;
+    });
+  </script>
+</body>
+
+</html>

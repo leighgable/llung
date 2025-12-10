@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Food Recognition Camera</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Epilogue:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "primary": "#2bee79",
+              "background-light": "#f6f8f7",
+              "background-dark": "#102217",
+            },
+            fontFamily: {
+              "display": ["Epilogue", "sans-serif"]
+            },
+            borderRadius: {"DEFAULT": "0.5rem", "lg": "1rem", "xl": "1.5rem", "full": "9999px"},
+          },
+        },
+      }
+    </script>
+<style>
+      .material-symbols-outlined {
+        font-variation-settings:
+        'FILL' 0,
+        'wght' 400,
+        'GRAD' 0,
+        'opsz' 24
+      }
+      .material-symbols-outlined.fill {
+        font-variation-settings: 'FILL' 1;
+      }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background-dark font-display">
+<div class="relative mx-auto flex h-screen max-h-[960px] w-full max-w-[480px] flex-col overflow-hidden bg-background-light dark:bg-background-dark group/design-root">
+<div class="relative flex-grow bg-black/80 dark:bg-black/90 flex flex-col items-center justify-center">
+<img alt="A healthy bowl of salad with quinoa, avocado, and cherry tomatoes" class="absolute inset-0 h-full w-full object-cover opacity-70" data-alt="A healthy bowl of salad with quinoa, avocado, and cherry tomatoes" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBrf7Kc_-hEc7n27xliYTJpGrKF6OgVLO-3PmrSx1Ol0GmXK0U0vu2nXo2tSNmutESzvsozdeqyFC_W72RxFk88SmB5kjdYf8QFgSeHvk_Tv9EK7duEMWPUoyQ19gjj20juNBxLujoMyfgki4rH8zN1DAXZ_nEP5uBs_OtK4l_DCTR-laCX5lVtsun0W3Ag7tzNajMKZLcjwvfDaExHxYd_PXV-N2oXQVEbRWSIBoRuwInNUNqypAmmoRWP6xwYXhjlRcDrSrS38g"/>
+<div class="absolute inset-0 bg-gradient-to-t from-background-light/50 via-transparent to-transparent dark:from-background-dark/50"></div>
+<p class="text-white text-base font-normal leading-normal pb-3 pt-1 px-4 text-center z-10 font-display">Center your dish here</p>
+</div>
+<div class="absolute bottom-[100px] sm:bottom-32 left-0 right-0 z-10 flex w-full flex-col items-center gap-4 bg-gradient-to-t from-background-light/90 via-background-light/40 to-transparent dark:from-background-dark/90 dark:via-background-dark/40">
+<div class="flex items-center justify-center gap-6 p-4">
+<button class="flex shrink-0 items-center justify-center rounded-full size-12 bg-black/30 text-white backdrop-blur-sm">
+<span class="material-symbols-outlined text-2xl">imagesmode</span>
+</button>
+<button class="flex shrink-0 items-center justify-center rounded-full size-20 bg-primary text-background-dark border-4 border-background-light dark:border-background-dark shadow-lg">
+<span class="material-symbols-outlined fill text-5xl">photo_camera</span>
+</button>
+<button class="flex shrink-0 items-center justify-center rounded-full size-12 bg-black/30 text-white backdrop-blur-sm">
+<span class="material-symbols-outlined text-2xl">flip_camera_android</span>
+</button>
+</div>
+</div>
+<div class="flex-shrink-0">
+<div class="flex gap-2 border-t border-primary/20 bg-background-light dark:bg-background-dark px-4 pb-3 pt-2">
+<a class="flex flex-1 flex-col items-center justify-end gap-1 text-primary" href="#">
+<div class="flex h-8 items-center justify-center">
+<span class="material-symbols-outlined fill text-2xl">photo_camera</span>
+</div>
+<p class="text-xs font-medium leading-normal tracking-[0.015em]">Camera</p>
+</a>
+<a class="flex flex-1 flex-col items-center justify-end gap-1 text-black/60 dark:text-white/60" href="#">
+<div class="flex h-8 items-center justify-center">
+<span class="material-symbols-outlined text-2xl">photo_library</span>
+</div>
+<p class="text-xs font-medium leading-normal tracking-[0.015em]">Library</p>
+</a>
+<a class="flex flex-1 flex-col items-center justify-end gap-1 text-black/60 dark:text-white/60" href="#">
+<div class="flex h-8 items-center justify-center">
+<span class="material-symbols-outlined text-2xl">menu_book</span>
+</div>
+<p class="text-xs font-medium leading-normal tracking-[0.015em]">Recipes</p>
+</a>
+<a class="flex flex-1 flex-col items-center justify-end gap-1 text-black/60 dark:text-white/60" href="#">
+<div class="flex h-8 items-center justify-center">
+<span class="material-symbols-outlined text-2xl">account_circle</span>
+</div>
+<p class="text-xs font-medium leading-normal tracking-[0.015em]">Profile</p>
+</a>
+</div>
+</div>
+</div>
+</body></html>
