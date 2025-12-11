@@ -1,6 +1,0 @@
-mcp
-websockets
-fastapi[standard]
-sqlalchemy
-openai
-jinja2

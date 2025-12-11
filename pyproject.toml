@@ -1,0 +1,28 @@
+[project]
+name = "kitchen"
+version = "0.0.0"
+description = "everything but"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "FastAPI[standard]"
+  "openai"
+  "websockets"
+]
+
+[project.optional-dependencies]
+test = ["mypy", "nox", "pytest", "ruff"]
+
+# select = [
+#  "AIR",   ## Airflow
+#  "ERA",   ## eradicate
+# "FAST",  ## FastAPI
+#  "YTT",   ## flake8-2020
+  ## ... TRUNCATED FOR BREVITY ...
+#  "UP",    ## pyupgrade
+#  "FURB",  ## refurb
+#  "RUF",   ## Ruff-specific rules
+#  "TRY",   ## tryceratops
+#]
+#ignore = ["COM812"]

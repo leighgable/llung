@@ -3,109 +3,59 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
+    pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, pyproject-nix, ... }:
     let
-      inherit (nixpkgs) lib;
-      forAllSystems = lib.genAttrs lib.systems.flakeExposed;
 
-      systemConfigurations = system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          pythonEnv = pkgs.python3.withPackages (p: [
-            p.ipython
-          ]);
-
-          kitchen = pkgs.stdenv.mkDerivation {
-            pname = "kitchen_sink";
-            version = "0.1.0";
-            src = ./.;
-            buildInputs = with pkgs; [
-              pythonEnv
-              uv
-            ];
-
-            # installPhase = ''
-            #   mkdir -p $out/bin
-            #   PYTHON_EXEC=${pythonEnv}/bin/python
-
-            #   APP_ROOT_PATH="$out"
-            #   # Pre-create destination directories to guarantee they exist
-            #   mkdir -p $out/src
-
-            #   # This pattern ($src/dir/., $out/dir/) is the most robust copy method.
-            #   cp -r $src/src/. $out/src/
-            #   # ------------------------------------------
-            #   # ls -la $src
-            #   # echo "_________________"
-            #   # ls -la $out
-            #   # create a startup script
-            #   cat > $out/bin/start-server << EOF
-            #   #!${pkgs.stdenv.shell}
-
-            #   echo "Starting llama-server backend on port 8080..."
-
-            #   exec $PYTHON_EXEC $APP_ROOT_PATH/src/main.py \
-            #   EOF
-            #   chmod +x $out/bin/start-server
-
-            # '';
-          };
-          dockerImage = pkgs.dockerTools.buildLayeredImage {
-            name = "kitchen-sink";
-            tag = "latest";
-
-            contents = [ pkgs.glibc pkgs.bash pkgs.coreutils kitchen ];
-            
-            config.ExposedPorts = {
-              "8080/tcp" = {};
-            };
-            config.Cmd = [
-              "uvicorn"
-              "src.main:app"
-              "--host" "0.0.0.0"
-              "--port" "8080"
-            ];
-            config.User = "0";
-            config.WorkingDir = "/app";
-            config.Env = [
-              "APP_ROOT_PATH=/app"
-            ];
-          };
-        in
-        {
-          inherit pkgs kitchen dockerImage pythonEnv;
-        };
-      allConfigs = forAllSystems systemConfigurations;
-
-      in
-      {
-        devShells = forAllSystems (system: {
-          default = allConfigs.${system}.pkgs.mkShell {
-            packages = [
-              allConfigs.${system}.pythonEnv
-              allConfigs.${system}.pkgs.uv
-              allConfigs.${system}.pkgs.nodejs_22
-            ];
-            shellHook = ''
-              unset PYTHONPATH
-              uv sync --upgrade
-              . .venv/bin/activate
-              uv pip install -r requirements.txt --quiet
-              E2B_API_KEY=$(cat key.txt)
-              export E2B_API_KEY
-              alias npm='nix run .#npm --'
-              alias npx='nix run .#npx --'              
-            '';
-          };
-        });
-
-        packages = forAllSystems (system: {
-          default = allConfigs.${system}.kitchen;
-          docker = allConfigs.${system}.dockerImage;
-        });
+      project = pyproject-nix.lib.project.loadPyproject {
+        # Read & unmarshal pyproject.toml relative to this project root.
+        # projectRoot is also used to set `src` for renderers such as buildPythonPackage.
+        projectRoot = ./.;
       };
-  }
 
+      # This example is only using x86_64-linux
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+
+      # We are using the default nixpkgs Python3 interpreter & package set.
+      #
+      # This means that you are purposefully ignoring:
+      # - Version bounds
+      # - Dependency sources (meaning local path dependencies won't resolve to the local path)
+      #
+      # To use packages from local sources see "Overriding Python packages" in the nixpkgs manual:
+      # https://nixos.org/manual/nixpkgs/stable/#reference
+      #
+      # Or use an overlay generator such as uv2nix:
+      # https://github.com/pyproject-nix/uv2nix
+      python = pkgs.python3;
+
+    in
+    {
+      # Create a development shell containing dependencies from `pyproject.toml`
+      devShells.x86_64-linux.default =
+        let
+          # Returns a function that can be passed to `python.withPackages`
+          arg = project.renderers.withPackages { inherit python; };
+
+          # Returns a wrapped environment (virtualenv like) with all our packages
+          pythonEnv = python.withPackages arg;
+
+        in
+        # Create a devShell like normal.
+        pkgs.mkShell { packages = [ pythonEnv ]; };
+
+      # Build our package using `buildPythonPackage
+      packages.x86_64-linux.default =
+        let
+          # Returns an attribute set that can be passed to `buildPythonPackage`.
+          attrs = project.renderers.buildPythonPackage { inherit python; };
+        in
+        # Pass attributes to buildPythonPackage.
+        # Here is a good spot to add on any missing or custom attributes.
+        python.pkgs.buildPythonPackage (attrs // { env.CUSTOM_ENVVAR = "API_KEY"; });
+    };
+}
