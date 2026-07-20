@@ -3,12 +3,9 @@ name = "kitchen"
 version = "0.0.0"
 description = "everything but"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = "MIT"
 dependencies = [
-  "FastAPI[standard]"
-  "openai"
-  "websockets"
 ]
 
 [project.optional-dependencies]

@@ -1,61 +1,165 @@
 {
-  description = "Kitchen Sink POC";
+  description = "uv2nix and rust for the kitchen";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    pyproject-nix.url = "github:pyproject-nix/pyproject.nix";
-    pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { nixpkgs, pyproject-nix, ... }:
+    {
+      nixpkgs,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+      ...
+    }:
     let
+      inherit (nixpkgs) lib;
+      forAllSystems = lib.genAttrs lib.systems.flakeExposed;
 
-      project = pyproject-nix.lib.project.loadPyproject {
-        # Read & unmarshal pyproject.toml relative to this project root.
-        # projectRoot is also used to set `src` for renderers such as buildPythonPackage.
-        projectRoot = ./.;
+      workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
+
+      overlay = workspace.mkPyprojectOverlay {
+        sourcePreference = "wheel";
       };
 
-      # This example is only using x86_64-linux
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      editableOverlay = workspace.mkEditablePyprojectOverlay {
+        root = "$REPO_ROOT";
+      };
 
-      # We are using the default nixpkgs Python3 interpreter & package set.
-      #
-      # This means that you are purposefully ignoring:
-      # - Version bounds
-      # - Dependency sources (meaning local path dependencies won't resolve to the local path)
-      #
-      # To use packages from local sources see "Overriding Python packages" in the nixpkgs manual:
-      # https://nixos.org/manual/nixpkgs/stable/#reference
-      #
-      # Or use an overlay generator such as uv2nix:
-      # https://github.com/pyproject-nix/uv2nix
-      python = pkgs.python3;
+      pythonSets = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          python = pkgs.python314;
+          hacks = pkgs.callPackage pyproject-nix.build.hacks { };
 
+          projectOverlay = final: prev: {
+            torch =
+              (hacks.nixpkgsPrebuilt {
+                from = python.pkgs.torchWithRocm;
+                prev = prev.torch;
+              }).overrideAttrs
+                (old: {
+                  passthru = (old.passthru or { }) // {
+                    dependencies = lib.filterAttrs (
+                      name: _: !(lib.hasPrefix "nvidia-" name || lib.hasPrefix "cuda-" name)
+                    ) (old.passthru.dependencies or { });
+                  };
+                });
+            torchvision =
+              (hacks.nixpkgsPrebuilt {
+                from = python.pkgs.torchvision;
+                prev = prev.torch;
+              }).overrideAttrs
+                (old: {
+                  passthru = (old.passthru or { }) // {
+                    dependencies = lib.filterAttrs (
+                      name: _: !(lib.hasPrefix "nvidia-" name || lib.hasPrefix "cuda-" name)
+                    ) (old.passthru.dependencies or { });
+                  };
+                });
+            #   antlr4-python3-runtime = prev.antlr4-python3-runtime.overrideAttrs (old: {
+            #     nativeBuildInputs =
+            #       (old.nativeBuildInputs or [ ])
+            #       ++ final.resolveBuildSystem {
+            #         setuptools = [ ];
+            #       };
+            #   });
+            #   pylatexenc = prev.pylatexenc.overrideAttrs (old: {
+            #     nativeBuildInputs =
+            #       (old.nativeBuildInputs or [ ])
+            #       ++ final.resolveBuildSystem {
+            #         setuptools = [ ];
+            #       };
+            #   });
+          };
+        in
+        (pkgs.callPackage pyproject-nix.build.packages {
+          inherit python;
+        }).overrideScope
+          (
+            lib.composeManyExtensions [
+              pyproject-build-systems.overlays.wheel
+              overlay
+              projectOverlay
+            ]
+          )
+      );
     in
     {
-      # Create a development shell containing dependencies from `pyproject.toml`
-      devShells.x86_64-linux.default =
+      devShells = forAllSystems (
+        system:
         let
-          # Returns a function that can be passed to `python.withPackages`
-          arg = project.renderers.withPackages { inherit python; };
-
-          # Returns a wrapped environment (virtualenv like) with all our packages
-          pythonEnv = python.withPackages arg;
-
+          pkgs = nixpkgs.legacyPackages.${system};
+          pythonSet = pythonSets.${system}.overrideScope editableOverlay;
+          virtualenv = pythonSet.mkVirtualEnv "kitch-dev-env" workspace.deps.all;
+          rocmEnv = pkgs.symlinkJoin {
+            name = "rocm-combined";
+            paths = with pkgs.rocmPackages; [
+              rocblas
+              hipblas
+              clr # Contains hipcc and the HIP runtime
+              clr.icd # Contains the OpenCL ICD
+              rocminfo # Useful for verifying ROCm detection
+            ];
+          };
         in
-        # Create a devShell like normal.
-        pkgs.mkShell { packages = [ pythonEnv ]; };
+        {
+          default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
+            buildInputs = [
+              rocmEnv
+              pkgs.vulkan-tools
+              pkgs.clinfo # Useful for verifying GPU detection
+              pkgs.ocl-icd # OpenCL loader
+              pkgs.perf
+            ];
+            packages = [
+              virtualenv
+              pkgs.uv
+            ];
+            env = {
+              UV_NO_SYNC = "1";
+              UV_PYTHON = pythonSet.python.interpreter;
+              UV_PYTHON_DOWNLOADS = "never";
+            };
+            shellHook = ''
+              unset PYTHONPATH
+              export REPO_ROOT=$(git rev-parse --show-toplevel)
+              # Ensure HIP can find the ROCm path if you use the HIP backend
+              export HIP_PATH=${pkgs.rocmPackages.clr}
+              # Tell the OpenCL loader where to find the AMD ICD
+              export OCL_ICD_VENDORS=${pkgs.rocmPackages.clr.icd}/etc/OpenCL/vendors
+              # Ensure libraries can find OpenCL and ROCm at runtime
+              export LD_LIBRARY_PATH=${pkgs.ocl-icd}/lib:${rocmEnv}/lib:$LD_LIBRARY_PATH
+              export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1             
+            '';
+          };
+        }
+      );
 
-      # Build our package using `buildPythonPackage
-      packages.x86_64-linux.default =
-        let
-          # Returns an attribute set that can be passed to `buildPythonPackage`.
-          attrs = project.renderers.buildPythonPackage { inherit python; };
-        in
-        # Pass attributes to buildPythonPackage.
-        # Here is a good spot to add on any missing or custom attributes.
-        python.pkgs.buildPythonPackage (attrs // { env.CUSTOM_ENVVAR = "API_KEY"; });
+      packages = forAllSystems (system: {
+        default = pythonSets.${system}.mkVirtualEnv "kitch-env" workspace.deps.default;
+      });
     };
 }
+
+# export PYTHONPATH="$REPO_ROOT/external/nanochat''${PYTHONPATH:+:$PYTHONPATH}"
