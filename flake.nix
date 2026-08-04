@@ -21,6 +21,12 @@
       inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
   };
 
   outputs =
@@ -29,6 +35,7 @@
       pyproject-nix,
       uv2nix,
       pyproject-build-systems,
+      rust-overlay,
       ...
     }:
     let
@@ -48,7 +55,10 @@
       pythonSets = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
           python = pkgs.python314;
           hacks = pkgs.callPackage pyproject-nix.build.hacks { };
 
@@ -109,7 +119,10 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          }; # nixpkgs.legacyPackages.${system};
           pythonSet = pythonSets.${system}.overrideScope editableOverlay;
           virtualenv = pythonSet.mkVirtualEnv "kitch-dev-env" workspace.deps.all;
           rocmEnv = pkgs.symlinkJoin {
@@ -126,11 +139,25 @@
         {
           default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
             buildInputs = [
+              (pkgs.rust-bin.selectLatestNightlyWith (
+                toolchain:
+                toolchain.default.override {
+                  extensions = [
+                    "rust-src"
+                    "rustfmt"
+                    "clippy"
+                  ];
+                }
+              ))
+              pkgs.openssl
+              pkgs.pkg-config
               rocmEnv
               pkgs.vulkan-tools
               pkgs.clinfo # Useful for verifying GPU detection
               pkgs.ocl-icd # OpenCL loader
               pkgs.perf
+              pkgs.rust-analyzer
+              pkgs.rustfmt
             ];
             packages = [
               virtualenv

@@ -1,3 +1,5 @@
 key.txt
 *.png
 archive/
+.direnv/
+target/
