@@ -9,3 +9,5 @@ serde = { version = "1.0", default-features = false, features = ["std", "derive"
 libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "quic", "kad", "relay", "dcutr", "identify", "dns"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde_json = "1.0.151"

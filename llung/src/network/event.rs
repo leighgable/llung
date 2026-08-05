@@ -1,6 +1,7 @@
 use libp2p::PeerId;
 
-use crate::identity::being::Being;
+use crate::identity::being::{Being, BeingStatus};
+use crate::media::status::DownloadStatus;
 
 pub enum NetworkEvent {
     MessageReceived {
@@ -18,5 +19,13 @@ pub enum NetworkEvent {
     MediaCidFound {
         cid: String,
         providers: Vec<PeerId>,
+    },
+    StatusChanged {
+        peer_id: PeerId,
+        status: BeingStatus,
+    },
+    MediaProgress {
+        cid: String,
+        status: DownloadStatus,
     },
 }
