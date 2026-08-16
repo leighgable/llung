@@ -21,4 +21,7 @@ pub enum NetworkCommand {
     ProvideMediaCid {
         cid: String,
     },
+    GetMediaProviders {
+        cid: String,
+    },
 }

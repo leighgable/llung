@@ -1,13 +1,25 @@
-[package]
-name = "llung"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+  "crates/llung-core",
+  "crates/cli",
+  "crates/tui",
+  "crates/relay",
+  "crates/ios-bridge",
+]
 
-[dependencies]
+resolver = "1"
+
+[workspace.dependencies]
+dirs = "5"
 futures = "0.3.33"
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
-libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "quic", "kad", "relay", "dcutr", "identify", "dns"] }
+libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "quic", "kad", "relay", "dcutr", "identify", "dns", "ping"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0.151"
+cid = "0.11.3"
+sha2 = "0.11.0"
+multihash = "0.19.5"
+image = "0.25.10"

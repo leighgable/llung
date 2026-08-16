@@ -47,7 +47,9 @@ impl LlungBehaviour {
                 data: message.data,
             }),
 
-            // Ignore unused internal protocol events (DCUtR, Relay, Kad queries)
+            // Ignore unused internal protocol events (DCUtR, Relay).
+            // Kademlia OutboundQueryProgressed events are intercepted by
+            // NetworkEngine, which owns the pending-query map.
             _ => None,
         }
     }

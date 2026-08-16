@@ -1,0 +1,10 @@
+[package]
+name = "ios-bridge"
+version = "0.1.0"
+edition = "2024"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+llung-core = { path = "../llung-core" }
+tokio = {version = "1", features = ["full"] }
+uniffi = "0.28"
