@@ -133,4 +133,18 @@ impl TaffyUi {
             layout.size.height as u16,
         )
     }
+    pub fn set_sidebar_visible(&mut self, visible: bool) {
+        let style = taffy::Style {
+            size: Size {
+                width: if visible {
+                    Dimension::length(30.0)
+                } else {
+                    Dimension::length(0.0)
+                },
+                height: Dimension::percent(1.0),
+            },
+            ..Default::default()
+        };
+        let _ = self.taffy.set_style(self.sidebar, style);
+    }
 }

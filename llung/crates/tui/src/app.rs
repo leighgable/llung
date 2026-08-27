@@ -30,6 +30,14 @@ pub enum AppScreen {
     // ProfilePicker,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum SidebarMode {
+    Hidden,
+    Peers,
+    Chats,
+    Media,
+}
+
 pub struct App {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -43,6 +51,11 @@ pub struct App {
     registration: RegistrationPanel,
     input_text: String,
     last_size: (u16, u16),
+
+    sidebar_mode: SidebarMode,
+    peers: Vec<String>,
+    chats: Vec<String>,
+    media: Vec<String>,
 }
 
 impl App {
@@ -65,6 +78,10 @@ impl App {
             registration: RegistrationPanel::new(),
             input_text: String::new(),
             last_size: (0, 0),
+            sidebar_mode: SidebarMode::Hidden,
+            peers: Vec::new(),
+            chats: Vec::new(),
+            media: Vec::new(),
         }
     }
 
@@ -139,26 +156,21 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.input_text.push('\n');
                 } else {
-                    let trimmed = self.input_text.trim();
-
-                    if trimmed == "/quit" || trimmed == "/q" {
-                        disable_raw_mode().ok();
-                        let _ = std::io::stdout().execute(LeaveAlternateScreen);
-                        std::process::exit(0);
-                    }
-
-                    if !trimmed.is_empty() {
+                    let is_command = self.input_text.trim().starts_with('/');
+                    if is_command {
+                        let cmd = std::mem::take(&mut self.input_text);
+                        self.handle_command(cmd.trim()).await?;
+                    } else if !self.input_text.trim().is_empty() {
                         let text = std::mem::take(&mut self.input_text);
                         self.chat_panel.push(self.my_name.clone(), text.clone());
-                        let cmd = NetworkCommand::PublishMessage {
-                            topic: IdentTopic::new("introductions"),
+                        let cmd = llung_core::network::NetworkCommand::PublishMessage {
+                            topic: libp2p::gossipsub::IdentTopic::new("introductions"),
                             contents: text.into_bytes(),
                         };
                         self.cmd_tx.send(cmd).await?;
                     }
                 }
             }
-
             // Scroll history
             KeyCode::Up => self.chat_panel.scroll_up(1),
             KeyCode::Down => self.chat_panel.scroll_down(1),
@@ -210,6 +222,11 @@ impl App {
                 topic,
             } => {
                 let text = String::from_utf8_lossy(&data).into_owned();
+                let sender_str = sender.to_string();
+
+                if !self.peers.contains(&sender_str) {
+                    self.peers.push(sender_str.clone());
+                }
                 self.chat_panel.push(sender.to_string(), text);
             }
             _ => {}
@@ -222,6 +239,8 @@ impl App {
         let registration = &mut self.registration;
         let input_text = &self.input_text;
         let screen = self.screen;
+        let sidebar_mode = self.sidebar_mode;
+        let peers = &self.peers;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -239,7 +258,7 @@ impl App {
                 AppScreen::Chat => {
                     chat_panel.render(buf, chat_rect);
                     Self::render_input_buf(buf, input_rect, input_text);
-                    Self::render_sidebar_buf(buf, sidebar_rect);
+                    Self::render_sidebar_buf(buf, sidebar_rect, sidebar_mode, peers);
                 }
             }
         })?;
@@ -293,23 +312,92 @@ impl App {
         }
     }
 
-    fn render_sidebar_buf(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    fn render_sidebar_buf(
+        buf: &mut ratatui::buffer::Buffer,
+        area: Rect,
+        mode: SidebarMode,
+        peers: &[String],
+    ) {
         let buf_area = buf.area().clone();
         let x0 = area.x.min(buf_area.width);
         let y0 = area.y.min(buf_area.height);
         let x1 = (area.x + area.width).min(buf_area.width);
         let y1 = (area.y + area.height).min(buf_area.height);
 
+        let bg = if mode == SidebarMode::Hidden {
+            Color::Black
+        } else {
+            Color::DarkGray
+        };
+
         // Fill background
         for y in y0..y1 {
             for x in x0..x1 {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(ratatui::style::Color::DarkGray);
+                    cell.set_bg(bg);
                 }
             }
         }
-        // Draw title
-        buf.set_string(x0 + 1, y0, " Peers ", Style::default().fg(Color::White));
+
+        match mode {
+            SidebarMode::Hidden => {}
+            SidebarMode::Peers => {
+                buf.set_string(x0 + 1, y0, " Peers ", Style::default().fg(Color::White));
+                for (i, peer) in peers.iter().enumerate() {
+                    let y = y0 + 2 + i as u16;
+                    if y >= y1 {
+                        break;
+                    }
+                    buf.set_string(x0 + 1, y, peer, Style::default().fg(Color::Cyan));
+                }
+            }
+            SidebarMode::Chats => {
+                buf.set_string(x0 + 1, y0, " Chats ", Style::default().fg(Color::White));
+                buf.set_string(
+                    x0 + 1,
+                    y0 + 2,
+                    "#introductions",
+                    Style::default().fg(Color::Green),
+                );
+            }
+            SidebarMode::Media => {
+                buf.set_string(x0 + 1, y0, " Media ", Style::default().fg(Color::White));
+                buf.set_string(
+                    x0 + 1,
+                    y0 + 2,
+                    "(empty)",
+                    Style::default().fg(Color::DarkGray),
+                );
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match cmd {
+            "/quit" | "/q" => {
+                crossterm::terminal::disable_raw_mode().ok();
+                let _ = std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen);
+                std::process::exit(0);
+            }
+            "/peers" => self.toggle_sidebar(SidebarMode::Peers),
+            "/chats" => self.toggle_sidebar(SidebarMode::Chats),
+            "/media" => self.toggle_sidebar(SidebarMode::Media),
+            _ => {
+                self.chat_panel
+                    .push("system".to_string(), format!("Unknown command: {}", cmd));
+            }
+        }
+        Ok(())
+    }
+
+    fn toggle_sidebar(&mut self, mode: SidebarMode) {
+        if self.sidebar_mode == mode {
+            self.sidebar_mode = SidebarMode::Hidden;
+            self.taffy_ui.set_sidebar_visible(false);
+        } else {
+            self.sidebar_mode = mode;
+            self.taffy_ui.set_sidebar_visible(true);
+        }
     }
 }
