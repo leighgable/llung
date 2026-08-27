@@ -14,13 +14,27 @@ pub enum SessionChoice {
     Register { db_path: PathBuf },
 }
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("llung")
 }
 
-fn list_identities() -> Vec<LocalIdentity> {
+pub fn profiles_dir() -> PathBuf {
+    data_dir().join("profiles")
+}
+
+pub fn profile_db_path(name: &str) -> PathBuf {
+    profiles_dir().join(name).join("node.db")
+}
+
+pub fn ensure_profile_dir(name: &str) -> std::io::Result<PathBuf> {
+    let path = profiles_dir().join(name);
+    std::fs::create_dir_all(&path)?;
+    Ok(path.join("node.db"))
+}
+
+pub fn list_identities() -> Vec<LocalIdentity> {
     let profiles_dir = data_dir().join("profiles");
     let mut identities = Vec::new();
 

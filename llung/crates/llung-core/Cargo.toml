@@ -9,3 +9,10 @@ libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns
 tokio = { version = "1.53.1", features = ["full"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+reqwest.workspace = true
+image.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+cid.workspace = true
+sha2.workspace = true
+tracing = "0.1.44"

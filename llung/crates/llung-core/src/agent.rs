@@ -6,6 +6,7 @@ use libp2p::{PeerId, gossipsub::IdentTopic};
 use tokio::sync::mpsc;
 
 use crate::identity::being::{Being, BeingKind, create_local_being};
+use crate::identity::machine::MachineIdentity;
 use crate::network::{NetworkCommand, NetworkEvent};
 use crate::storage::db::Database;
 
@@ -31,13 +32,13 @@ impl Default for AgentConfig {
 /// (kind = Agent, no avatar) on first run.
 pub fn get_or_create_agent_being(
     db: &Database,
-    agent_peer_id: PeerId,
+    agent_being_id: &str,
     name: &str,
 ) -> Result<Being, Box<dyn std::error::Error>> {
-    if let Some(existing) = db.get_being(&agent_peer_id)? {
+    if let Some(existing) = db.get_being(&agent_being_id)? {
         return Ok(existing);
     }
-    create_local_being(db, agent_peer_id, name.to_string(), None, BeingKind::Agent)
+    create_local_being(db, name.to_string(), None, BeingKind::Agent)
 }
 
 fn is_mentioned(text: &str, name: &str) -> bool {
@@ -58,9 +59,10 @@ pub async fn run_agent_loop(
     cmd_tx: mpsc::Sender<NetworkCommand>,
     mut event_rx: mpsc::Receiver<NetworkEvent>,
     topic: IdentTopic,
-    self_peer_id: PeerId,
+    machine: MachineIdentity,
 ) {
     let topic_str = topic.to_string();
+    let self_peer_id = machine.peer_id;
     let mut transcript: VecDeque<ChatMessage> = VecDeque::with_capacity(config.max_history + 1);
 
     // Agent-to-agent chatter limit: we may respond to an agent-authored
@@ -83,9 +85,11 @@ pub async fn run_agent_loop(
 
         let text = String::from_utf8_lossy(&data).into_owned();
 
-        let sender_being = db.get_being(&sender).ok().flatten();
-        let sender_is_agent =
-            matches!(sender_being.as_ref().map(|b| &b.kind), Some(BeingKind::Agent));
+        let sender_being = db.get_being_by_peer_id(&sender).ok().flatten();
+        let sender_is_agent = matches!(
+            sender_being.as_ref().map(|b| &b.kind),
+            Some(BeingKind::Agent)
+        );
         let sender_name = sender_being
             .map(|b| b.human_name)
             .unwrap_or_else(|| sender.to_base58().chars().take(8).collect());
@@ -128,14 +132,14 @@ pub async fn run_agent_loop(
                     contents: reply.into_bytes(),
                 };
                 if cmd_tx.send(cmd).await.is_err() {
-                    eprintln!("Agent: network engine went away, shutting down");
+                    tracing::info!("Agent: network engine went away, shutting down");
                     return;
                 }
                 if sender_is_agent {
                     responded_to_agent = true;
                 }
             }
-            Err(e) => eprintln!("Agent: LLM backend error: {e}"),
+            Err(e) => tracing::info!("Agent: LLM backend error: {e}"),
         }
     }
 }

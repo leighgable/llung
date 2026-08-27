@@ -1,5 +1,5 @@
-use crate::storage::db::Database;
 use crate::utils::{generate_cid_from_bytes, process_avatar_thumbnail};
+use crate::{identity::machine::MachineIdentity, storage::db::Database};
 use libp2p::{
     PeerId,
     gossipsub::{IdentTopic, PublishError},
@@ -12,7 +12,7 @@ use std::{
     str::FromStr,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeingKind {
     Human,
@@ -101,10 +101,11 @@ impl FromSql for BeingStatus {
 
 pub fn broadcast_presence(
     swarm: &mut libp2p::Swarm<crate::network::LlungBehaviour>,
-    local_being: &Being,
+    being: &Being,
+    machine: &MachineIdentity,
     topic: &IdentTopic,
 ) -> Result<(), Box<dyn Error>> {
-    let payload = PresenceMessage::from(local_being);
+    let payload = PresenceMessage::from_local_identities(being, machine);
     let bytes = serde_json::to_vec(&payload)?;
 
     // Publish message to the Gossipsub topic
@@ -116,14 +117,14 @@ pub fn broadcast_presence(
         Ok(msg_id) => {
             println!(
                 "Broadcasted presence for {} (id: {})",
-                local_being.human_name, msg_id
+                being.human_name, msg_id
             );
         }
         Err(PublishError::Duplicate) => {
             // Silently ignore if this exact presence message was already published
         }
         Err(e) => {
-            eprintln!("Failed to publish presence: {e:?}");
+            tracing::info!("Failed to publish presence: {e:?}");
         }
     }
 
@@ -132,19 +133,22 @@ pub fn broadcast_presence(
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PresenceMessage {
-    pub peer_id: String,
+    pub being_id: String,
+    #[serde(with = "peer_id_serde")]
+    pub machine_id: PeerId,
     pub human_name: String,
     pub kind: BeingKind,
     pub status: BeingStatus,
     pub avatar_cid: Option<String>,
 }
 
-impl From<&Being> for PresenceMessage {
-    fn from(being: &Being) -> Self {
+impl PresenceMessage {
+    fn from_local_identities(being: &Being, machine: &MachineIdentity) -> Self {
         Self {
-            peer_id: being.peer_id.to_base58(),
+            being_id: being.being_id.clone(),
+            machine_id: machine.peer_id,
             human_name: being.human_name.clone(),
-            kind: being.kind.clone(),
+            kind: being.kind,
             status: being.status.clone(),
             avatar_cid: being.avatar_cid.clone(),
         }
@@ -153,8 +157,7 @@ impl From<&Being> for PresenceMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Being {
-    #[serde(with = "peer_id_serde")]
-    pub being_id: PeerId,
+    pub being_id: String,
     pub human_name: String,
     pub kind: BeingKind,
     pub status: BeingStatus,
@@ -188,46 +191,37 @@ mod peer_id_serde {
 /// `NetworkCommand::ProvideMediaCid` once the engine is running).
 pub fn create_local_being(
     db: &Database,
-    local_peer_id: PeerId,
     human_name: String,
     avatar_path: Option<&str>,
     kind: BeingKind,
-) -> Result<Being, Box<dyn std::error::Error>> {
-    let mut avatar_cid = None;
-
-    if let Some(path) = avatar_path {
+) -> Result<Being, Box<dyn Error>> {
+    let avatar_cid = if let Some(path) = avatar_path {
         let thumbnail_bytes = process_avatar_thumbnail(path, 128)?;
         let cid = generate_cid_from_bytes(&thumbnail_bytes)?;
 
         // Keep the actual bytes local; peers will fetch them by CID.
         db.save_avatar_cache(&cid, &thumbnail_bytes)?;
-        println!("Avatar staged with CID: {cid}");
+        tracing::info!("Avatar staged with CID: {cid}");
 
-        avatar_cid = Some(cid);
-    }
-
-    let being = Being {
-        peer_id: local_peer_id,
-        human_name,
-        kind,
-        status: BeingStatus::Available,
-        avatar_cid,
+        Some(cid)
+    } else {
+        None
     };
 
-    db.save_being(&being)?;
-    println!("Saved.\n");
+    let being = db.create_being(&human_name, kind, avatar_cid.as_deref())?;
+    tracing::info!("Avatar CID saved.\n");
 
     Ok(being)
 }
 
 pub fn load_local_being(
     db: &Database,
-    local_peer_id: PeerId,
+    local_being_id: &str,
 ) -> Result<Being, Box<dyn std::error::Error>> {
-    match db.get_being(&local_peer_id)? {
+    match db.get_being(&local_being_id)? {
         Some(being) => {
-            println!("Loading {}...", being.human_name);
-            println!("Peer Id: {}", being.peer_id);
+            tracing::info!("Loading {}...", being.human_name);
+            tracing::info!("Peer Id: {}", being.being_id);
             Ok(being)
         }
         None => {
@@ -238,13 +232,8 @@ pub fn load_local_being(
 
 pub fn create_local_being_interactive(
     db: &Database,
-    local_peer_id: PeerId,
     kind: BeingKind,
 ) -> Result<Being, Box<dyn std::error::Error>> {
-    println!("\n==========================================");
-    println!("  -------- Welcome to Llung —--------     ");
-    println!("==========================================");
-
     print!("Enter your Display Name: ");
     io::stdout().flush()?;
     let mut human_name = String::new();
@@ -260,17 +249,17 @@ pub fn create_local_being_interactive(
         path => Some(path),
     };
 
-    create_local_being(db, local_peer_id, human_name, avatar_path, kind)
+    create_local_being(db, human_name, avatar_path, kind)
 }
 
 pub fn get_or_create_local_being(
     db: &Database,
-    local_peer_id: PeerId,
+    local_being_id: String,
 ) -> Result<Being, Box<dyn std::error::Error>> {
-    if let Some(existing) = db.get_being(&local_peer_id)? {
+    if let Some(existing) = db.get_being(&local_being_id)? {
         println!("Welcome, {}.", existing.human_name);
-        println!("Peer Id: {}", existing.peer_id);
+        println!("Peer Id: {}", existing.being_id);
         return Ok(existing);
     }
-    create_local_being_interactive(db, local_peer_id, BeingKind::Human)
+    create_local_being_interactive(db, BeingKind::Human)
 }

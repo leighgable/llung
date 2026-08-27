@@ -1,7 +1,6 @@
 use crate::{
-    agent,
     config::CoreConfig,
-    identity::being::{Being, load_local_being},
+    identity::{being::Being, machine::MachineIdentity},
     network::{NetworkCommand, NetworkEngine, NetworkEvent, behaviour::LlungBehaviour},
     storage::db::Database,
 };
@@ -9,7 +8,12 @@ use libp2p::{
     PeerId, dcutr, gossipsub, gossipsub::IdentTopic, identify, identity::Keypair, kad, mdns, noise,
     swarm::Swarm, tcp, yamux,
 };
-use std::{collections::hash_map::DefaultHasher, error::Error, time::Duration};
+use std::{
+    collections::hash_map::DefaultHasher,
+    error::Error,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
 use tokio::{io, sync::mpsc};
 
 pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Error>> {
@@ -83,15 +87,13 @@ impl LlungApp {
     /// The UI layer is responsible for login/registration before calling this.
     pub async fn init(
         config: CoreConfig,
+        machine: MachineIdentity,
+        being: Being,
     ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), Box<dyn std::error::Error>> {
-        let db_path = config.db_path.to_str().ok_or("invalid db path")?;
-        let (db, keypair) = Database::new(db_path)?;
-        let local_peer_id = keypair.public().to_peer_id();
+        let local_peer_id = machine.peer_id;
+        let local_being = being;
 
-        let local_being = load_local_being(&db, local_peer_id)
-            .map_err(|_| "No identity found in database. Register first.")?;
-
-        let mut swarm = build_swarm(keypair)?;
+        let mut swarm = build_swarm(machine.keypair)?;
         swarm
             .behaviour_mut()
             .kademlia

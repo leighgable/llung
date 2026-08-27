@@ -7,3 +7,4 @@ edition = "2024"
 llung-core = { path = "../llung-core" }
 libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "quic", "kad", "relay", "dcutr", "identify", "dns"] }
 tokio = { version = "1.53.1", features = ["full"] }
+dirs.workspace = true

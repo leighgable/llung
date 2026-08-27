@@ -1,0 +1,11 @@
+2026-08-27T17:33:31.466175Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-27T17:33:31.468475Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
+2026-08-27T17:33:31.468795Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-08-27T17:33:31.469550Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/39829
+2026-08-27T17:33:31.469760Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/39829
+2026-08-27T17:33:31.469908Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/39829
+2026-08-27T17:33:31.470317Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/43495/quic-v1
+2026-08-27T17:33:31.470544Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/udp/43495/quic-v1
+2026-08-27T17:33:31.472094Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/43495/quic-v1
+2026-08-27T17:33:31.472187Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-08-27T17:33:31.472307Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX2026-08-27T17:33:31.472337Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D32026-08-27T17:33:31.472451Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX2026-08-27T17:33:31.473061Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-08-27T17:33:31.478207Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/tcp/39829/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-27T17:33:31.478412Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/udp/43495/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX

@@ -31,7 +31,7 @@ pub const CREATE_BEINGS_TABLE: &str = "
 pub const CREATE_MACHINES_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS machines (
         peer_id TEXT PRIMARY KEY,
-        being_id TEXT NOT NULL REFERENCES users(user_id),
+        being_id TEXT REFERENCES beings(being_id),
         machine_name TEXT NOT NULL DEFAULT 'mystery',
         secret_key BLOB NOT NULL,
         created_at INTEGER DEFAULT (unixepoch())
@@ -83,21 +83,13 @@ pub const BRANCH_SELECT: &str = "
     SELECT * FROM branch_path ORDER BY timestamp ASC;
 ";
 
-pub const CREATE_NODE_IDENTITY_TABLE: &str = "
-    CREATE TABLE IF NOT EXISTS node_identity (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        secret_bytes BLOB NOT NULL
-    );
-";
-
 pub fn run_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute(CREATE_BEINGS_TABLE, [])?;
     conn.execute(CREATE_MESSAGES_TABLE, [])?;
     conn.execute(CREATE_MEDIA_TABLE, [])?;
     conn.execute(CREATE_MESSAGE_ATTACHMENTS_TABLE, [])?;
-    conn.execute(CREATE_NODE_IDENTITY_TABLE, [])?;
+    conn.execute(CREATE_MACHINES_TABLE, [])?;
     conn.execute(CREATE_AVATAR_CACHE_TABLE, [])?;
-    conn.execute(CREATE_AGENT_IDENTITY_TABLE, [])?;
 
     // Older databases have a `beings` table without the `kind` column.
     let mut stmt = conn.prepare("PRAGMA table_info(beings)")?;

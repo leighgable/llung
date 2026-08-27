@@ -3,6 +3,7 @@ use libp2p::PeerId;
 use crate::identity::being::{Being, BeingStatus};
 use crate::media::status::DownloadStatus;
 
+#[derive(Debug)]
 pub enum NetworkEvent {
     MessageReceived {
         topic: String,

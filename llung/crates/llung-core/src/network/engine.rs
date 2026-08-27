@@ -63,7 +63,7 @@ impl NetworkEngine {
                     .gossipsub
                     .publish(topic, contents)
                 {
-                    eprintln!("Failed to publish message: {e:?}");
+                    tracing::info!("Failed to publish message: {e:?}");
                 }
             }
             NetworkCommand::SendDirectMessage { target, message } => {
@@ -82,7 +82,7 @@ impl NetworkEngine {
                         self.pending_queries
                             .insert(id, PendingQuery::StartProviding { cid });
                     }
-                    Err(e) => eprintln!("Failed to start providing {cid}: {e:?}"),
+                    Err(e) => tracing::info!("Failed to start providing {cid}: {e:?}"),
                 }
             }
             NetworkCommand::GetMediaProviders { cid } => {
@@ -112,7 +112,7 @@ impl NetworkEngine {
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!("Node listening on: {address}");
+                tracing::info!("Node listening on: {address}");
             }
             _ => {}
         }
@@ -125,18 +125,16 @@ impl NetworkEngine {
     ) -> Option<NetworkEvent> {
         match result {
             kad::QueryResult::StartProviding(Ok(_)) => {
-                if let Some(PendingQuery::StartProviding { cid }) =
-                    self.pending_queries.remove(&id)
+                if let Some(PendingQuery::StartProviding { cid }) = self.pending_queries.remove(&id)
                 {
-                    println!("DHT: now providing media cid {cid}");
+                    tracing::info!("DHT: now providing media cid {cid}");
                 }
                 None
             }
             kad::QueryResult::StartProviding(Err(e)) => {
-                if let Some(PendingQuery::StartProviding { cid }) =
-                    self.pending_queries.remove(&id)
+                if let Some(PendingQuery::StartProviding { cid }) = self.pending_queries.remove(&id)
                 {
-                    eprintln!("DHT: failed to provide {cid}: {e:?}");
+                    tracing::info!("DHT: failed to provide {cid}: {e:?}");
                 }
                 None
             }
@@ -157,10 +155,8 @@ impl NetworkEngine {
                 None
             }
             kad::QueryResult::GetProviders(Err(e)) => {
-                if let Some(PendingQuery::GetProviders { cid }) =
-                    self.pending_queries.remove(&id)
-                {
-                    eprintln!("DHT: provider lookup for {cid} failed: {e:?}");
+                if let Some(PendingQuery::GetProviders { cid }) = self.pending_queries.remove(&id) {
+                    tracing::info!("DHT: provider lookup for {cid} failed: {e:?}");
                 }
                 None
             }

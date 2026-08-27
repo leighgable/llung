@@ -162,6 +162,7 @@
             packages = [
               virtualenv
               pkgs.uv
+              pkgs.nodejs
             ];
             env = {
               UV_NO_SYNC = "1";

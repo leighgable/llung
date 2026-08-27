@@ -55,7 +55,7 @@ pub fn process_avatar_thumbnail<P: AsRef<Path>>(
 }
 
 use cid::Cid;
-use multihash::Multihash;
+use libp2p::multihash::Multihash;
 use sha2::{Digest, Sha256};
 
 pub fn generate_cid_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {

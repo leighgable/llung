@@ -4,8 +4,8 @@ use std::time::Duration;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, ping, relay,
-    swarm::SwarmEvent,
+    Multiaddr, PeerId, StreamProtocol, SwarmBuilder, futures::StreamExt, identify,
+    identity::Keypair, kad, ping, relay, swarm::SwarmEvent,
 };
 
 #[derive(NetworkBehaviour)]
@@ -37,8 +37,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_behaviour(|key| {
             // Configure Kademlia in Server Mode (essential for DHT caching)
             let store = MemoryStore::new(local_peer_id);
-            let mut kad_config = kad::Config::default();
-            kad_config.set_protocol_names(vec![std::borrow::Cow::Borrowed(b"/llung/kad/1.0.0")]);
+            let protocol = StreamProtocol::new("/ipfs/kad/1.0.0");
+            let mut kad_config = kad::Config::new(protocol);
+            // kad_config.set_protocol_names(vec![std::borrow::Cow::Borrowed(b"/llung/kad/1.0.0")]);
 
             let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
@@ -85,7 +86,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(
-                identify::Event::Received { peer_id, info },
+                identify::Event::Received {
+                    peer_id,
+                    info,
+                    connection_id,
+                },
             )) => {
                 // Add peer's listening addresses to Kademlia routing table
                 for addr in info.listen_addrs {

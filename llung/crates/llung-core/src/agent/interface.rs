@@ -34,10 +34,7 @@ impl ChatMessage {
 /// A pluggable LLM backend. Implementations must be safe to call from
 /// the agent bridge task.
 pub trait LlmBackend: Send + Sync {
-    fn chat(
-        &self,
-        messages: &[ChatMessage],
-    ) -> impl Future<Output = AgentResult<String>> + Send;
+    fn chat(&self, messages: &[ChatMessage]) -> impl Future<Output = AgentResult<String>> + Send;
 }
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` endpoint.
