@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 pub type AgentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatMessage {
+pub struct AgentMessage {
     pub role: String,
     pub content: String,
 }
 
-impl ChatMessage {
+impl AgentMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),

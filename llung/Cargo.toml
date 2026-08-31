@@ -5,6 +5,10 @@ members = [
   "crates/tui",
   "crates/relay",
   "crates/ios-bridge",
+  "crates/agent",
+  "crates/runtime-tools",
+  "crates/llung-rt",
+  "crates/agent-rt"
 ]
 
 resolver = "1"

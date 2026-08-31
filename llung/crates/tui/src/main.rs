@@ -76,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. Start network core ──
     let my_name = being.human_name.clone();
+    let my_peer_id = machine.peer_id.to_base58();
     let (llung_app, event_rx) = LlungApp::init(
         CoreConfig {
             db_path,
@@ -90,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd_tx = llung_app.command_tx();
 
     // ── 5. Hand terminal to App and run chat ──
-    let mut app = App::new(terminal, cmd_tx, my_name);
+    let mut app = App::new(terminal, cmd_tx, my_name, my_peer_id.clone());
 
     let (term_tx, term_rx) = mpsc::channel::<crossterm::event::Event>(32);
     events::spawn_terminal_reader(term_tx);

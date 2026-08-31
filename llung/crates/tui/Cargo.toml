@@ -13,3 +13,5 @@ unicode-width = "0.2.2"
 futures.workspace = true
 libp2p.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
+image = { workspace = true, features = ["jpeg", "png"] }

@@ -8,7 +8,7 @@ use crossterm::{
 };
 use libp2p::gossipsub::IdentTopic;
 use llung_core::{
-    identity::being::{BeingKind, create_local_being},
+    identity::being::{BeingKind, PresenceMessage, create_local_being},
     network::{NetworkCommand, NetworkEvent},
     storage::db::Database,
 };
@@ -18,6 +18,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
 };
+use std::collections::HashMap;
 use std::io;
 use std::result::Result;
 // use taffy::{Dimension, Display, FlexDirection, NodeId, Size, TaffyTree};
@@ -56,6 +57,9 @@ pub struct App {
     peers: Vec<String>,
     chats: Vec<String>,
     media: Vec<String>,
+
+    peer_id: String,
+    known_peers: HashMap<String, String>,
 }
 
 impl App {
@@ -63,10 +67,16 @@ impl App {
         terminal: Terminal<CrosstermBackend<io::Stdout>>,
         cmd_tx: mpsc::Sender<NetworkCommand>,
         my_name: String,
+        peer_id: String,
     ) -> Self {
         let size = terminal
             .size()
             .unwrap_or(ratatui::layout::Size::new(80, 24));
+        let mut known_peers = HashMap::new();
+        known_peers.insert(peer_id.clone(), my_name.clone());
+        let sidebar_mode = SidebarMode::Hidden;
+        let mut taffy_ui = TaffyUi::new_chat_layout(size.width, size.height);
+        taffy_ui.set_sidebar_visible(sidebar_mode != SidebarMode::Hidden);
 
         Self {
             terminal,
@@ -78,10 +88,12 @@ impl App {
             registration: RegistrationPanel::new(),
             input_text: String::new(),
             last_size: (0, 0),
-            sidebar_mode: SidebarMode::Hidden,
+            sidebar_mode: sidebar_mode,
             peers: Vec::new(),
             chats: Vec::new(),
             media: Vec::new(),
+            peer_id: peer_id,
+            known_peers: known_peers,
         }
     }
 
@@ -162,6 +174,7 @@ impl App {
                         self.handle_command(cmd.trim()).await?;
                     } else if !self.input_text.trim().is_empty() {
                         let text = std::mem::take(&mut self.input_text);
+                        let text = text.trim().to_string();
                         self.chat_panel.push(self.my_name.clone(), text.clone());
                         let cmd = llung_core::network::NetworkCommand::PublishMessage {
                             topic: libp2p::gossipsub::IdentTopic::new("introductions"),
@@ -221,13 +234,21 @@ impl App {
                 data,
                 topic,
             } => {
-                let text = String::from_utf8_lossy(&data).into_owned();
                 let sender_str = sender.to_string();
 
-                if !self.peers.contains(&sender_str) {
-                    self.peers.push(sender_str.clone());
+                if let Ok(presence) = serde_json::from_slice::<PresenceMessage>(&data) {
+                    self.known_peers.insert(sender_str, presence.human_name);
+                    return;
                 }
-                self.chat_panel.push(sender.to_string(), text);
+
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let display_name = self
+                    .known_peers
+                    .get(&sender_str)
+                    .cloned()
+                    .unwrap_or_else(|| sender_str.chars().take(8).collect());
+
+                self.chat_panel.push(display_name, text);
             }
             _ => {}
         }
@@ -240,7 +261,7 @@ impl App {
         let input_text = &self.input_text;
         let screen = self.screen;
         let sidebar_mode = self.sidebar_mode;
-        let peers = &self.peers;
+        let peers = &self.known_peers;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -316,7 +337,7 @@ impl App {
         buf: &mut ratatui::buffer::Buffer,
         area: Rect,
         mode: SidebarMode,
-        peers: &[String],
+        peers: &HashMap<String, String>,
     ) {
         let buf_area = buf.area().clone();
         let x0 = area.x.min(buf_area.width);
@@ -344,12 +365,18 @@ impl App {
             SidebarMode::Hidden => {}
             SidebarMode::Peers => {
                 buf.set_string(x0 + 1, y0, " Peers ", Style::default().fg(Color::White));
-                for (i, peer) in peers.iter().enumerate() {
+                for (i, (peer_id, name)) in peers.iter().enumerate() {
                     let y = y0 + 2 + i as u16;
                     if y >= y1 {
                         break;
                     }
-                    buf.set_string(x0 + 1, y, peer, Style::default().fg(Color::Cyan));
+                    let avail = (x1.saturating_sub(x0 + 1)) as usize;
+                    let display = if name.is_empty() {
+                        &peer_id[..peer_id.len().min(16)]
+                    } else {
+                        name
+                    };
+                    buf.set_stringn(x0 + 1, y, display, avail, Style::default().fg(Color::Cyan));
                 }
             }
             SidebarMode::Chats => {

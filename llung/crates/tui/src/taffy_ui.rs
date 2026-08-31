@@ -46,8 +46,9 @@ impl TaffyUi {
             .new_leaf(TaffyStyle {
                 size: Size {
                     width: Dimension::percent(1.0),
-                    height: Dimension::percent(1.0),
+                    height: Dimension::auto(),
                 },
+                flex_grow: 1.0,
                 ..Default::default()
             })
             .unwrap();
@@ -69,9 +70,10 @@ impl TaffyUi {
                     display: Display::Flex,
                     flex_direction: FlexDirection::Column,
                     size: Size {
-                        width: Dimension::percent(1.0),
+                        width: Dimension::auto(),
                         height: Dimension::percent(1.0),
                     },
+                    flex_grow: 1.0,
                     ..Default::default()
                 },
                 &[chat, input],

@@ -57,6 +57,7 @@ impl ChatPanel {
         self.cache.clear();
         self.cached_width = width;
 
+        let max_block_width = (width as u32 * 80 / 100) as u16;
         let mut last_was_me = false;
 
         for msg in &self.messages {
@@ -74,7 +75,7 @@ impl ChatPanel {
             if msg.is_me {
                 // ── MY MESSAGES: right-aligned, bright yellow, dark bg ──
                 let right_margin = 2u16;
-                let max_content = width.saturating_sub(right_margin + 4);
+                let max_content = max_block_width.saturating_sub(right_margin + 2);
 
                 for line in msg.content.wrap_lines(max_content) {
                     let line_width = line.width() as u16;
@@ -95,7 +96,7 @@ impl ChatPanel {
                 let left_margin = 2u16;
                 let header = format!("{} ", msg.sender); // sender + space
                 let header_width = header.width() as u16;
-                let max_content = width.saturating_sub(left_margin + 2);
+                let max_content = max_block_width.saturating_sub(left_margin + 2);
 
                 if header_width >= max_content {
                     // Sender name too long: put on its own line

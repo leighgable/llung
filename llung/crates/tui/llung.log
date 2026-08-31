@@ -1,13 +1,16 @@
-2026-08-27T19:30:42.064747Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-08-27T19:30:42.067903Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
-2026-08-27T19:30:42.068256Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
-2026-08-27T19:30:42.069233Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/36339
-2026-08-27T19:30:42.069468Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/36339
-2026-08-27T19:30:42.069645Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/36339
-2026-08-27T19:30:42.070497Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/51149/quic-v1
-2026-08-27T19:30:42.070847Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/udp/51149/quic-v1
-2026-08-27T19:30:42.071077Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/51149/quic-v1
-2026-08-27T19:30:42.073961Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-08-27T19:30:42.080882Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/tcp/36339/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-08-27T19:30:42.081084Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.69/tcp/36339/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-08-27T19:30:42.081210Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.69/udp/51149/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-08-27T19:30:42.081321Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/udp/51149/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-28T09:22:15.352785Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-28T09:22:15.356294Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.77
+2026-08-28T09:22:15.356607Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-08-28T09:22:15.357403Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/33373
+2026-08-28T09:22:15.357615Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.77/tcp/33373
+2026-08-28T09:22:15.357783Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/33373
+2026-08-28T09:22:15.358291Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/48226/quic-v1
+2026-08-28T09:22:15.358515Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.77/udp/48226/quic-v1
+2026-08-28T09:22:15.358911Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/48226/quic-v1
+2026-08-28T09:22:15.363632Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-08-28T09:22:15.386070Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.77/tcp/33373/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-28T09:22:15.386495Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.77/udp/48226/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-28T09:22:15.386765Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/udp/48226/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-08-28T09:22:15.390584Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g852026-08-28T09:38:15.393327Z  INFO libp2p_mdns::behaviour: expired peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/192.168.1.77/udp/34361/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-08-28T09:38:15.393465Z  INFO libp2p_mdns::behaviour: expired peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/192.168.1.77/tcp/46229/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-08-28T09:38:15.395844Z  INFO libp2p_mdns::behaviour: expired peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/udp/34361/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-08-28T09:38:15.395934Z  INFO libp2p_mdns::behaviour: expired peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/tcp/46229/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa

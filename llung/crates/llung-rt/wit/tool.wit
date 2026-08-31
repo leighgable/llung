@@ -1,0 +1,17 @@
+package local:agent-core;
+
+world universal-tool {
+    // tool must be able to describe itself to the host and the LLM
+    record tool-metadata {
+        name: string,
+        description: string,
+        input-schema: string, 
+    }
+
+    // host calls to discover what tool does
+    export get-metadata: func() -> tool-metadata;
+
+    // universal execution gateway
+    // arguments serialized as json, returns output serialized as json
+    export execute: func(arguments-json: string) -> result<string, string>;
+}
