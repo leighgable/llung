@@ -1,3 +1,4 @@
+use crate::avatar::{fallback_avatar, render_avatar};
 use crate::prefix_text::PrefixText;
 use crate::registration_panel::RegistrationPanel;
 use crate::{chat_panel::ChatPanel, taffy_ui::TaffyUi};
@@ -39,6 +40,13 @@ pub enum SidebarMode {
     Media,
 }
 
+#[derive(Clone)]
+pub struct PeerInfo {
+    pub name: String,
+    pub avatar_cid: Option<String>,
+    pub avatar: Option<crate::avatar::AvatarThumbnail>,
+}
+
 pub struct App {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -59,7 +67,7 @@ pub struct App {
     media: Vec<String>,
 
     peer_id: String,
-    known_peers: HashMap<String, String>,
+    known_peers: HashMap<String, PeerInfo>,
 }
 
 impl App {
@@ -73,7 +81,14 @@ impl App {
             .size()
             .unwrap_or(ratatui::layout::Size::new(80, 24));
         let mut known_peers = HashMap::new();
-        known_peers.insert(peer_id.clone(), my_name.clone());
+        known_peers.insert(
+            peer_id.clone(),
+            PeerInfo {
+                name: my_name.clone(),
+                avatar_cid: None,
+                avatar: None,
+            },
+        );
         let sidebar_mode = SidebarMode::Hidden;
         let mut taffy_ui = TaffyUi::new_chat_layout(size.width, size.height);
         taffy_ui.set_sidebar_visible(sidebar_mode != SidebarMode::Hidden);
@@ -143,8 +158,21 @@ impl App {
                     self.handle_network_event(net_ev);
                 }
                 _ = tick.tick() => {}
-            }
+            };
+            self.load_missing_avatars(db);
             self.draw()?;
+        }
+    }
+
+    fn load_missing_avatars(&mut self, db: &Database) {
+        for info in self.known_peers.values_mut() {
+            if info.avatar.is_some() || info.avatar_cid.is_none() {
+                continue;
+            }
+            let cid = info.avatar_cid.as_ref().unwrap();
+            if let Ok(Some(bytes)) = db.get_avatar_cache(cid) {
+                info.avatar = crate::avatar::decode_avatar(&bytes, 4);
+            }
         }
     }
 
@@ -175,7 +203,10 @@ impl App {
                     } else if !self.input_text.trim().is_empty() {
                         let text = std::mem::take(&mut self.input_text);
                         let text = text.trim().to_string();
-                        self.chat_panel.push(self.my_name.clone(), text.clone());
+                        let my_info = self.known_peers.get(&self.peer_id).cloned();
+                        let my_avatar = my_info.and_then(|i| i.avatar);
+                        self.chat_panel
+                            .push(self.my_name.clone(), text.clone(), my_avatar);
                         let cmd = llung_core::network::NetworkCommand::PublishMessage {
                             topic: libp2p::gossipsub::IdentTopic::new("introductions"),
                             contents: text.into_bytes(),
@@ -237,18 +268,26 @@ impl App {
                 let sender_str = sender.to_string();
 
                 if let Ok(presence) = serde_json::from_slice::<PresenceMessage>(&data) {
-                    self.known_peers.insert(sender_str, presence.human_name);
+                    self.known_peers.insert(
+                        sender_str,
+                        PeerInfo {
+                            name: presence.human_name,
+                            avatar_cid: presence.avatar_cid,
+                            avatar: None,
+                        },
+                    );
                     return;
                 }
 
                 let text = String::from_utf8_lossy(&data).into_owned();
-                let display_name = self
-                    .known_peers
-                    .get(&sender_str)
-                    .cloned()
+                let info = self.known_peers.get(&sender_str).cloned();
+                let display_name = info
+                    .as_ref()
+                    .map(|i| i.name.clone())
                     .unwrap_or_else(|| sender_str.chars().take(8).collect());
 
-                self.chat_panel.push(display_name, text);
+                self.chat_panel
+                    .push(display_name, text, info.and_then(|i| i.avatar));
             }
             _ => {}
         }
@@ -337,7 +376,7 @@ impl App {
         buf: &mut ratatui::buffer::Buffer,
         area: Rect,
         mode: SidebarMode,
-        peers: &HashMap<String, String>,
+        peers: &HashMap<String, PeerInfo>,
     ) {
         let buf_area = buf.area().clone();
         let x0 = area.x.min(buf_area.width);
@@ -345,18 +384,12 @@ impl App {
         let x1 = (area.x + area.width).min(buf_area.width);
         let y1 = (area.y + area.height).min(buf_area.height);
 
-        let bg = if mode == SidebarMode::Hidden {
-            Color::Black
-        } else {
-            Color::DarkGray
-        };
-
         // Fill background
         for y in y0..y1 {
             for x in x0..x1 {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(bg);
+                    cell.set_bg(Color::DarkGray);
                 }
             }
         }
@@ -365,18 +398,29 @@ impl App {
             SidebarMode::Hidden => {}
             SidebarMode::Peers => {
                 buf.set_string(x0 + 1, y0, " Peers ", Style::default().fg(Color::White));
-                for (i, (peer_id, name)) in peers.iter().enumerate() {
-                    let y = y0 + 2 + i as u16;
-                    if y >= y1 {
+                let mut y = y0 + 2;
+                for (peer_id, info) in peers.iter() {
+                    if y + 2 >= y1 {
                         break;
                     }
-                    let avail = (x1.saturating_sub(x0 + 1)) as usize;
-                    let display = if name.is_empty() {
-                        &peer_id[..peer_id.len().min(16)]
+
+                    // Draw avatar (4x2 cells)
+                    if let Some(ref thumb) = info.avatar {
+                        render_avatar(buf, x0 + 1, y, thumb);
                     } else {
-                        name
+                        let initial = info.name.chars().next().unwrap_or('?');
+                        let hash = peer_id.bytes().fold(0u8, |a, b| a.wrapping_mul(b));
+                        let bg = Color::Rgb(hash, hash.wrapping_mul(7), hash.wrapping_mul(13));
+                        fallback_avatar(buf, x0 + 1, y, initial, bg);
+                    }
+
+                    let name = if info.name.is_empty() {
+                        &peer_id[..8.min(peer_id.len())]
+                    } else {
+                        &info.name
                     };
-                    buf.set_stringn(x0 + 1, y, display, avail, Style::default().fg(Color::Cyan));
+                    let avail = (x1.saturating_sub(x0 + 1)) as usize;
+                    buf.set_stringn(x0 + 1, y + 2, name, avail, Style::default().fg(Color::Cyan));
                 }
             }
             SidebarMode::Chats => {
@@ -411,8 +455,11 @@ impl App {
             "/chats" => self.toggle_sidebar(SidebarMode::Chats),
             "/media" => self.toggle_sidebar(SidebarMode::Media),
             _ => {
-                self.chat_panel
-                    .push("system".to_string(), format!("Unknown command: {}", cmd));
+                self.chat_panel.push(
+                    "system".to_string(),
+                    format!("Unknown command: {}", cmd),
+                    None,
+                );
             }
         }
         Ok(())

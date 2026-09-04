@@ -1,14 +1,26 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+pub mod config;
+pub mod interface;
+pub mod orchestrator;
+pub mod tools;
+
+use llung_core::{
+    identity::being::{Being, BeingKind},
+    identity::machine::MachineIdentity,
+    storage::db::Database,
+};
+
+pub struct AgentIdentity {
+    pub machine: MachineIdentity,
+    pub being: Being,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn provision_agent(
+    db: &Database,
+    name: &str,
+) -> Result<AgentIdentity, Box<dyn std::error::Error>> {
+    let machine = db.create_machine(name)?;
+    let being =
+        db.create_being_for_machine(&machine.peer_id.to_base58(), name, BeingKind::Agent)?;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+    Ok(AgentIdentity { machine, being })
 }

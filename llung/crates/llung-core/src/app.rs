@@ -117,11 +117,6 @@ impl LlungApp {
                 .await;
         }
 
-        // Optional agent co-host
-        if let Some(agent_cfg) = config.agent {
-            // ... spawn agent task (moved from main.rs)
-        }
-
         Ok((
             LlungApp {
                 local_being,

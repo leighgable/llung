@@ -55,6 +55,11 @@ dependencies = [
 [[package]]
 name = "agent"
 version = "0.1.0"
+dependencies = [
+ "llung-core",
+ "reqwest",
+ "serde",
+]
 
 [[package]]
 name = "agent-rt"

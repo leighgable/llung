@@ -5,10 +5,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::prefix_text::PrefixText;
 
-pub struct ChatMessage {
+pub struct ChatLine {
     pub sender: String,
     pub content: PrefixText,
     pub is_me: bool,
+    pub avatar: Option<crate::avatar::AvatarThumbnail>,
 }
 
 struct VisualLine {
@@ -19,7 +20,7 @@ struct VisualLine {
 }
 
 pub struct ChatPanel {
-    messages: Vec<ChatMessage>,
+    messages: Vec<ChatLine>,
     my_name: String,
     scroll_offset: usize,
     auto_scroll: bool,
@@ -39,12 +40,18 @@ impl ChatPanel {
         }
     }
 
-    pub fn push(&mut self, sender: String, text: String) {
+    pub fn push(
+        &mut self,
+        sender: String,
+        text: String,
+        avatar: Option<crate::avatar::AvatarThumbnail>,
+    ) {
         let is_me = sender.trim() == self.my_name.trim();
-        self.messages.push(ChatMessage {
+        self.messages.push(ChatLine {
             sender,
             content: PrefixText::new(text),
             is_me,
+            avatar,
         });
         self.cache.clear();
         self.cached_width = 0;
@@ -93,7 +100,8 @@ impl ChatPanel {
                 }
             } else {
                 // ── OTHERS: left-aligned, cyan, no bg ──
-                let left_margin = 2u16;
+                let avatar_width = if msg.avatar.is_some() { 3 } else { 0 };
+                let left_margin = 2 + avatar_width;
                 let header = format!("{} ", msg.sender); // sender + space
                 let header_width = header.width() as u16;
                 let max_content = max_block_width.saturating_sub(left_margin + 2);

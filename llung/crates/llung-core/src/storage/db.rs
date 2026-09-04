@@ -30,6 +30,55 @@ impl Database {
         Ok((Self { conn }, machine))
     }
 
+    pub fn create_machine(&self, device_name: &str) -> Result<MachineIdentity, Box<dyn Error>> {
+        let keypair = Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id();
+        let secret = keypair.to_protobuf_encoding()?;
+
+        self.conn.execute(
+            "INSERT INTO machines (peer_id, being_id, device_name, secret_key)
+            VALUES (?1, NULL, ?2, ?3)",
+            (&peer_id.to_base58(), device_name, &secret),
+        )?;
+
+        Ok(MachineIdentity {
+            keypair,
+            peer_id,
+            device_name: device_name.to_string(),
+            being_id: String::new(), // filled later
+        })
+    }
+
+    pub fn create_being_for_machine(
+        &self,
+        peer_id: &str,
+        human_name: &str,
+        kind: BeingKind,
+    ) -> Result<Being, Box<dyn Error>> {
+        let keypair = Keypair::generate_ed25519();
+        let being_id = keypair.public().to_peer_id().to_base58();
+        let secret = keypair.to_protobuf_encoding()?;
+
+        self.conn.execute(
+            "INSERT INTO beings (being_id, human_name, kind, status, avatar_cid, secret_key)
+            VALUES (1?, 2?, 3?, 4?, NULL, 75)",
+            (&being_id, human_name, kind, BeingStatus::Available, &secret),
+        )?;
+
+        self.conn.execute(
+            "UPDATE machines SET being_id = ?1 WHERE peer_id = ?2",
+            (&being_id, peer_id),
+        )?;
+
+        Ok(Being {
+            being_id,
+            human_name: human_name.to_string(),
+            kind,
+            status: BeingStatus::Available,
+            avatar_cid: None,
+        })
+    }
+
     fn get_or_create_machine_identity(
         conn: &Connection,
     ) -> Result<MachineIdentity, Box<dyn Error>> {
@@ -359,5 +408,16 @@ impl Database {
             params![cid, bytes, now],
         )?;
         Ok(())
+    }
+
+    pub fn get_avatar_cache(
+        &self,
+        cid: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bytes FROM avatar_cache WHERE cid = ?1")?;
+        let mut rows = stmt.query_map([cid], |row| row.get::<_, Vec<u8>>(0))?;
+        Ok(rows.next().transpose()?)
     }
 }

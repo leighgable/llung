@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use llung_core::network::message::ChatMessage;
+
 pub type AgentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

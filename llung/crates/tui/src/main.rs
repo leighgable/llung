@@ -19,6 +19,7 @@ use std::io::{self, Write, stdout};
 use tokio::sync::mpsc;
 
 mod app;
+mod avatar;
 mod chat_panel;
 mod events;
 mod prefix_text;
@@ -80,7 +81,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (llung_app, event_rx) = LlungApp::init(
         CoreConfig {
             db_path,
-            agent: None,
             chat_topic: "introductions".into(),
         },
         machine,
