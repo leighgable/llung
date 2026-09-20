@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use futures::StreamExt;
-use libp2p::{Swarm, kad, swarm::SwarmEvent};
+use libp2p::{Swarm, kad, request_response, swarm::SwarmEvent};
 use tokio::sync::mpsc;
 
 use crate::network::{
     behaviour::{LlungBehaviour, LlungBehaviourEvent},
     command::NetworkCommand,
     event::NetworkEvent,
+    message::{DirectMessage, DirectMessageResponse},
 };
 
 /// Tracks in-flight Kademlia queries so results can be correlated
@@ -66,8 +67,13 @@ impl NetworkEngine {
                     tracing::info!("Failed to publish message: {e:?}");
                 }
             }
-            NetworkCommand::SendDirectMessage { target, message } => {
-                // TODO: Route via request_response behaviour
+            NetworkCommand::SendDirectMessage { target, payload } => {
+                let request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .direct_message
+                    .send_request(&target, DirectMessage(payload));
+                tracing::debug!("Send direct message {request_id} to {target}");
             }
             NetworkCommand::PutProfile { profile } => {
                 // TODO: Insert profile into Kademlia DHT
@@ -105,6 +111,35 @@ impl NetworkEngine {
                     let _ = self.event_tx.send(app_event).await;
                 }
             }
+            SwarmEvent::Behaviour(LlungBehaviourEvent::DirectMessage(event)) => match event {
+                request_response::Event::Message { peer, message, .. } => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        let _ = self
+                            .event_tx
+                            .send(NetworkEvent::DirectMessageRecieved {
+                                sender: peer,
+                                payload: request.0,
+                            })
+                            .await;
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .direct_message
+                            .send_response(channel, DirectMessageResponse);
+                    }
+                    request_response::Message::Response { .. } => {}
+                },
+                request_response::Event::OutboundFailure { peer, error, .. } => {
+                    tracing::warn!("Direct message to {peer} failed: {error}");
+                }
+                request_response::Event::InboundFailure { peer, error, .. } => {
+                    tracing::warn!("Direct message from {peer} failed: {error}");
+                }
+                _ => {}
+            },
+
             SwarmEvent::Behaviour(behaviour_event) => {
                 // Delegate protocol routing to LlungBehaviour
                 if let Some(app_event) = self.swarm.behaviour_mut().handle_event(behaviour_event) {

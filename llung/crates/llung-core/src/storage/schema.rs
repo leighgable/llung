@@ -1,13 +1,19 @@
-pub const CREATE_MESSAGES_TABLE: &str = "
+pub const CREATE_MESSAGES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,      
         topic TEXT NOT NULL,
-        sender_peer_id TEXT NOT NULL,
         parent_id TEXT,           
+        sender_id TEXT NOT NULL,
+        sender_name TEXT NOT NULL,
         content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
+        timestamp INTEGER DEFAULT (unixepoch())
     );
-";
+
+CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic);
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
+
+
+"#;
 
 pub const CREATE_AVATAR_CACHE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS avatar_cache (

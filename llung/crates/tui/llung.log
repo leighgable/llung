@@ -1,13 +1,13 @@
-2026-09-04T20:29:45.909077Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-09-04T20:29:45.911023Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
-2026-09-04T20:29:45.911319Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
-2026-09-04T20:29:45.912209Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/44935
-2026-09-04T20:29:45.912406Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/44935
-2026-09-04T20:29:45.912568Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/44935
-2026-09-04T20:29:45.913634Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/46024/quic-v1
-2026-09-04T20:29:45.913957Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/udp/46024/quic-v1
-2026-09-04T20:29:45.914151Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/46024/quic-v1
-2026-09-04T20:29:45.915159Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-09-04T20:29:45.922135Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/tcp/44935/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-09-04T20:29:45.922285Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.69/tcp/44935/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/udp/39329/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
-2026-09-04T20:29:45.918125Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/tcp/42301/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-09-16T19:33:31.878920Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-09-16T19:33:31.881207Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
+2026-09-16T19:33:31.881580Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-09-16T19:33:31.882189Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/43295
+2026-09-16T19:33:31.882437Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/43295
+2026-09-16T19:33:31.882580Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/43295
+2026-09-16T19:33:31.882963Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/37218/quic-v1
+2026-09-16T19:33:31.883138Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/udp/37218/quic-v1
+2026-09-16T19:33:31.883873Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/37218/quic-v1
+2026-09-16T19:33:31.889210Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXK2026-09-16T19:33:31.897221Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.69/tcp/43295/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-09-16T19:33:31.902066Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/192.168.1.69/udp/37218/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-09-16T19:33:31.902269Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/tcp/43295/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
+2026-09-16T19:33:31.902431Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/udp/37218/quic-v1/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX

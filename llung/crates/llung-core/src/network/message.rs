@@ -1,9 +1,9 @@
-use ::serde;
+use ::serde::{Deserialize, Serialize};
 use libp2p::PeerId;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attachment {
     pub cid: String,       // IPFS CID or SHA256 content hash
     pub filename: String,  // e.g., "diagram.png"
@@ -11,18 +11,25 @@ pub struct Attachment {
     pub size_bytes: u64,   // Enables "Click to download (X MB)" UX
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String, // SHA256 of the message contents
     pub topic: String,
     pub sender_id: String, // base58 PeerId of the author
+    pub sender_name: String,
     pub parent_id: Option<String>, // <--- creates branches
     pub content: String,
     pub timestamp: u64,
 }
 
 impl ChatMessage {
-    pub fn new(topic: &str, sender: PeerId, parent_id: Option<String>, content: String) -> Self {
+    pub fn new(
+        topic: String,
+        sender: PeerId,
+        parent_id: Option<String>,
+        sender_name: String,
+        content: String,
+    ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -30,8 +37,9 @@ impl ChatMessage {
 
         let mut msg = Self {
             id: String::new(),
-            topic: topic.to_string(),
+            topic: topic,
             sender_id: sender.to_base58(),
+            sender_name,
             parent_id,
             content,
             timestamp,
@@ -57,3 +65,9 @@ impl ChatMessage {
             .collect()
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectMessage(pub Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectMessageResponse;

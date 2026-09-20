@@ -9,7 +9,7 @@ pub enum NetworkCommand {
     },
     SendDirectMessage {
         target: PeerId,
-        message: Vec<u8>,
+        payload: Vec<u8>,
     },
     PutProfile {
         profile: Being,

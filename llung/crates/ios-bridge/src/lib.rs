@@ -1,7 +1,4 @@
-use llung_core::{
-    app::{CoreConfig, LlungApp},
-    network::{NetworkCommand, NetworkEvent},
-};
+use llung_core::{app::LlungApp, config::CoreConfig, network::NetworkCommand};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 

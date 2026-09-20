@@ -28,14 +28,18 @@ pub struct TaffyUi {
 
 impl TaffyUi {
     /// Build a simple chat layout: sidebar | main area
-    pub fn new_chat_layout(term_w: u16, term_h: u16) -> Self {
+    pub fn new_chat_layout(term_w: u16, term_h: u16, sidebar_visible: bool) -> Self {
         let mut taffy = TaffyTree::new();
 
         // Sidebar: fixed 30 columns, full height
         let sidebar = taffy
             .new_leaf(TaffyStyle {
                 size: Size {
-                    width: Dimension::length(30.0),
+                    width: if sidebar_visible {
+                        Dimension::length(30.0)
+                    } else {
+                        Dimension::length(0.0)
+                    },
                     height: Dimension::percent(1.0),
                 },
                 ..Default::default()

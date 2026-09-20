@@ -8,9 +8,10 @@ use crossterm::{
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
 use libp2p::gossipsub::IdentTopic;
+use llung_core::utils::generate_cid_from_bytes;
 use llung_core::{
     identity::being::{BeingKind, PresenceMessage, create_local_being},
-    network::{NetworkCommand, NetworkEvent},
+    network::{NetworkCommand, NetworkEvent, message::ChatMessage},
     storage::db::Database,
 };
 use ratatui::{
@@ -90,14 +91,14 @@ impl App {
             },
         );
         let sidebar_mode = SidebarMode::Hidden;
-        let mut taffy_ui = TaffyUi::new_chat_layout(size.width, size.height);
-        taffy_ui.set_sidebar_visible(sidebar_mode != SidebarMode::Hidden);
+        let mut taffy_ui = TaffyUi::new_chat_layout(size.width, size.height, false);
+        // taffy_ui.set_sidebar_visible(sidebar_mode != SidebarMode::Hidden);
 
         Self {
             terminal,
             cmd_tx,
             my_name: my_name.clone(),
-            taffy_ui: TaffyUi::new_chat_layout(size.width, size.height),
+            taffy_ui: TaffyUi::new_chat_layout(size.width, size.height, false),
             screen: AppScreen::Chat,
             chat_panel: ChatPanel::new(my_name),
             registration: RegistrationPanel::new(),
@@ -171,7 +172,7 @@ impl App {
             }
             let cid = info.avatar_cid.as_ref().unwrap();
             if let Ok(Some(bytes)) = db.get_avatar_cache(cid) {
-                info.avatar = crate::avatar::decode_avatar(&bytes, 4);
+                info.avatar = crate::avatar::decode_avatar_hex(&bytes, 4);
             }
         }
     }
@@ -203,12 +204,29 @@ impl App {
                     } else if !self.input_text.trim().is_empty() {
                         let text = std::mem::take(&mut self.input_text);
                         let text = text.trim().to_string();
-                        let my_info = self.known_peers.get(&self.peer_id).cloned();
-                        let my_avatar = my_info.and_then(|i| i.avatar);
+                        let timestamp = chrono::Utc::now().timestamp();
+                        let msg = ChatMessage {
+                            id: generate_cid_from_bytes(
+                                &(self.peer_id.clone() + &text + &timestamp.to_string()).as_bytes(),
+                            )
+                            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+                            topic: None,
+                            parent_id: None,
+                            sender_id: self.peer_id.clone(),
+                            sender_name: self.my_name.clone(),
+                            content: text.clone(),
+                            timestamp,
+                        };
+
+                        let _ = db.save_message(&msg);
+                        let my_avatar = self
+                            .known_peers
+                            .get(&self.peer_id)
+                            .and_then(|i| i.avatar.clone());
                         self.chat_panel
                             .push(self.my_name.clone(), text.clone(), my_avatar);
-                        let cmd = llung_core::network::NetworkCommand::PublishMessage {
-                            topic: libp2p::gossipsub::IdentTopic::new("introductions"),
+                        let cmd = NetworkCommand::PublishMessage {
+                            topic: IdentTopic::new("introductions"),
                             contents: text.into_bytes(),
                         };
                         self.cmd_tx.send(cmd).await?;
@@ -265,29 +283,56 @@ impl App {
                 data,
                 topic,
             } => {
-                let sender_str = sender.to_string();
+                let sender_id = sender.to_base58();
 
                 if let Ok(presence) = serde_json::from_slice::<PresenceMessage>(&data) {
                     self.known_peers.insert(
-                        sender_str,
+                        sender_id,
                         PeerInfo {
                             name: presence.human_name,
                             avatar_cid: presence.avatar_cid,
-                            avatar: None,
+                            avatar: None, // lazy loaded
                         },
                     );
                     return;
                 }
 
                 let text = String::from_utf8_lossy(&data).into_owned();
-                let info = self.known_peers.get(&sender_str).cloned();
-                let display_name = info
-                    .as_ref()
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| sender_str.chars().take(8).collect());
 
-                self.chat_panel
-                    .push(display_name, text, info.and_then(|i| i.avatar));
+                let sender_name = self
+                    .known_peers
+                    .get(&sender_id)
+                    .map(|info| info.name.clone())
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                let timestamp = chrono::Utc::now().timestamp();
+                let msg = ChatMessage {
+                    id: generate_cid_from_bytes(
+                        &(sender.to_base58() + &text + &timestamp.to_string()).into_bytes(),
+                    )
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+                    topic: topic.clone(),
+                    parent_id: None, // Todo reply threading
+                    sender_id: sender.to_base58(),
+                    sender_name: self.my_name,
+                    content: text.clone(),
+                    timestamp: timestamp as u64,
+                };
+
+                let _ = db.save_message(&msg);
+
+                if topic == self.current_topic {
+                    let avatar = self
+                        .known_peers
+                        .get(&sender_id)
+                        .and_then(|info| info.avatar.clone());
+
+                    self.chat_panel.push(msg.sender_name, text, avatar);
+                }
+            }
+
+            NetworkEvent::DirectMessageReceived { sender, payload } => {
+                self.handle_direct_message(sender, payload);
             }
             _ => {}
         }
@@ -324,6 +369,25 @@ impl App {
         })?;
 
         Ok(())
+    }
+
+    fn handle_direct_message(&mut self, sender: PeerId, payload: Vec<u8>) {
+        let plaintext = match decrypt_with_identity_key(&payload) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("Failed to decrypt DM from {sender}: {e}");
+                return;
+            }
+        };
+
+        if let Ok(invite) = serde_json::from_slice::<InvitePayload>(&plaintext) {
+            self.handle_invite(sender, invite);
+            return;
+        }
+
+        let text = String::from_utf8_lossy(&plaintext).into_owned();
+        self.chat_panel
+            .push(format!("[DM] {}", self.resolve_name(&sender)), text)
     }
 
     fn render_input_buf(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {

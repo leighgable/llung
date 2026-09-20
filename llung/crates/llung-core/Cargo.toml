@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dirs = "5"
-libp2p = { version = "0.56.0", features = ["macros", "tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "quic", "kad", "relay", "dcutr", "identify", "dns"] }
-tokio = { version = "1.53.1", features = ["full"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+dirs.workspace = true
+libp2p = { workspace = true, features = ["request-response", "cbor"] }
+tokio.workspace = true
+rusqlite.workspace = true 
+serde.workspace = true
 reqwest.workspace = true
 image.workspace = true
 serde_json.workspace = true

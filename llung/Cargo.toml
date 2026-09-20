@@ -7,10 +7,10 @@ members = [
   "crates/ios-bridge",
   "crates/agent",
   "crates/runtime-tools",
-  "crates/agent-rt"
+  "crates/agent-rt",
 ]
 
-resolver = "1"
+resolver = "2"
 
 [workspace.dependencies]
 dirs = "5"

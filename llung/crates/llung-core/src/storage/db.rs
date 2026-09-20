@@ -341,14 +341,15 @@ impl Database {
     /// (e.g. both the UI task and the agent task saving the same gossip).
     pub fn save_message(&self, msg: &ChatMessage) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO messages (id, topic, sender_peer_id, parent_id, content, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO messages (id, topic,  parent_id, sender_id, sender_name, content, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                msg.id,
-                msg.topic,
-                msg.sender_id,
-                msg.parent_id,
-                msg.content,
+                &msg.id,
+                &msg.topic,
+                &msg.parent_id,
+                &msg.sender_id,
+                &msg.sender_name,
+                &msg.content,
                 msg.timestamp as i64
             ],
         )?;
@@ -357,13 +358,26 @@ impl Database {
 
     /// All messages for a topic, oldest first — feed into
     /// `ChatTree::build_from_flat_list`.
-    pub fn get_messages(&self, topic: &str) -> Result<Vec<ChatMessage>> {
+    pub fn load_messages_for_topic(
+        &self,
+        topic: &str,
+    ) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, topic, sender_peer_id, parent_id, content, timestamp
+            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp
              FROM messages WHERE topic = ?1 ORDER BY timestamp ASC",
         )?;
-        let rows = stmt.query_map(params![topic], Self::row_to_message)?;
-        rows.collect()
+        let rows = stmt.query_map([topic], |row| {
+            Ok(ChatMessage {
+                id: row.get(0)?,
+                topic: row.get(1)?,
+                parent_id: row.get(2)?,
+                sender_id: row.get(3)?,
+                sender_name: row.get(4)?,
+                content: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
     }
 
     /// The path from a message up to its root (i.e. one branch of the
@@ -379,10 +393,19 @@ impl Database {
             id: row.get(0)?,
             topic: row.get(1)?,
             sender_id: row.get(2)?,
-            parent_id: row.get(3)?,
-            content: row.get(4)?,
-            timestamp: row.get::<_, i64>(5)? as u64,
+            sender_name: row.get(3)?,
+            parent_id: row.get(4)?,
+            content: row.get(5)?,
+            timestamp: row.get::<_, i64>(6)? as u64,
         })
+    }
+
+    pub fn list_topics(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT topic FROM messages ORDER BY topic")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
     }
 
     pub fn get_or_create_keypair(&self) -> rusqlite::Result<libp2p::identity::Keypair> {

@@ -1,6 +1,14 @@
-use libp2p::{dcutr, gossipsub, identify, kad, mdns, relay, swarm::NetworkBehaviour};
+use libp2p::{
+    dcutr, gossipsub, identify, kad, mdns, relay,
+    request_response::cbor::Behaviour as CborBehaviour, swarm::NetworkBehaviour,
+};
 
-use crate::network::event::NetworkEvent;
+use crate::network::{
+    event::NetworkEvent,
+    message::{DirectMessage, DirectMessageResponse},
+};
+
+pub type DirectMessageBehaviour = CborBehaviour<DirectMessage, DirectMessageResponse>;
 
 #[derive(NetworkBehaviour)]
 pub struct LlungBehaviour {
@@ -10,6 +18,7 @@ pub struct LlungBehaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
+    pub direct_message: DirectMessageBehaviour,
 }
 
 impl LlungBehaviour {

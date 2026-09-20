@@ -1,12 +1,20 @@
 use crate::{
     config::CoreConfig,
     identity::{being::Being, machine::MachineIdentity},
-    network::{NetworkCommand, NetworkEngine, NetworkEvent, behaviour::LlungBehaviour},
-    storage::db::Database,
+    network::{
+        NetworkCommand, NetworkEngine, NetworkEvent,
+        behaviour::{DirectMessageBehaviour, LlungBehaviour},
+    },
 };
 use libp2p::{
-    PeerId, dcutr, gossipsub, gossipsub::IdentTopic, identify, identity::Keypair, kad, mdns, noise,
-    swarm::Swarm, tcp, yamux,
+    PeerId, StreamProtocol, dcutr, gossipsub,
+    gossipsub::IdentTopic,
+    identify,
+    identity::Keypair,
+    kad, mdns, noise,
+    request_response::{Config as ReqResConfig, ProtocolSupport},
+    swarm::Swarm,
+    tcp, yamux,
 };
 use std::{
     collections::hash_map::DefaultHasher,
@@ -61,6 +69,13 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Er
                 "/llung/1.0.0".to_string(),
                 key.public(),
             ));
+            let direct_message = DirectMessageBehaviour::new(
+                [(
+                    StreamProtocol::new("/llung/direct/1.0.0"),
+                    ProtocolSupport::Full,
+                )],
+                ReqResConfig::default(),
+            );
 
             Ok(LlungBehaviour {
                 gossipsub,
@@ -69,6 +84,7 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Er
                 relay_client,
                 dcutr,
                 identify,
+                direct_message,
             })
         })?
         .build();

@@ -15,3 +15,5 @@ libp2p.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 image = { workspace = true, features = ["jpeg", "png"] }
+chrono = "0.4.45"
+uuid = "1.26.1"
