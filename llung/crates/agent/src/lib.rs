@@ -1,4 +1,6 @@
+pub mod aukora;
 pub mod config;
+pub mod history;
 pub mod interface;
 pub mod orchestrator;
 pub mod tools;

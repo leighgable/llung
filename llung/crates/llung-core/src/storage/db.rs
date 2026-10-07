@@ -1,16 +1,22 @@
 use crate::identity::{
     being::{Being, BeingKind, BeingStatus},
+    crypto::decrypt_with_secret_key,
     machine::MachineIdentity,
 };
 use crate::network::message::ChatMessage;
+use crate::storage::dag::ChatDag;
 use crate::storage::schema;
+// use crypto_box::Nonce;
 use libp2p::{PeerId, identity::Keypair};
+// use rand_core::os_rng;
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
 use rusqlite::{Connection, Result, params};
 use std::{
     error::Error,
     time::{SystemTime, UNIX_EPOCH},
 };
-
+use x25519_dalek::{self, PublicKey, StaticSecret};
 pub struct Database {
     conn: Connection,
 }
@@ -55,14 +61,25 @@ impl Database {
         human_name: &str,
         kind: BeingKind,
     ) -> Result<Being, Box<dyn Error>> {
+        let mut rng = UnwrapErr(SysRng);
         let keypair = Keypair::generate_ed25519();
         let being_id = keypair.public().to_peer_id().to_base58();
         let secret = keypair.to_protobuf_encoding()?;
+        let enc_secret = StaticSecret::random_from_rng(&mut rng);
+        let enc_public = PublicKey::from(&enc_secret);
 
         self.conn.execute(
-            "INSERT INTO beings (being_id, human_name, kind, status, avatar_cid, secret_key)
-            VALUES (1?, 2?, 3?, 4?, NULL, 75)",
-            (&being_id, human_name, kind, BeingStatus::Available, &secret),
+            "INSERT INTO beings (being_id, human_name, kind, status, avatar_cid, secret_key, enc_secret_key, enc_public_key)
+            VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            (
+                &being_id,
+                human_name,
+                kind,
+                BeingStatus::Available,
+                &secret,
+                &enc_secret.to_bytes().to_vec(),
+                &enc_public.to_bytes().to_vec(),
+            ),
         )?;
 
         self.conn.execute(
@@ -127,13 +144,16 @@ impl Database {
         kind: BeingKind,
         avatar_cid: Option<&str>,
     ) -> Result<Being, Box<dyn Error>> {
+        let mut rng = UnwrapErr(SysRng);
         let keypair: Keypair = Keypair::generate_ed25519();
         let being_id: String = keypair.public().to_peer_id().to_base58();
         let secret = keypair.to_protobuf_encoding()?;
+        let enc_secret = StaticSecret::random_from_rng(&mut rng);
+        let enc_public = PublicKey::from(&enc_secret);
 
         self.conn.execute(
-            "INSERT INTO beings (being_id, human_name, kind, status, avatar_cid, secret_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO beings (being_id, human_name, kind, status, avatar_cid, secret_key, enc_secret_key, enc_public_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &being_id,
                 human_name,
@@ -141,6 +161,8 @@ impl Database {
                 BeingStatus::Available,
                 avatar_cid,
                 &secret,
+                &enc_secret.to_bytes().to_vec(),
+                &enc_public.to_bytes().to_vec(),
             ),
         )?;
         self.conn.execute(
@@ -204,6 +226,22 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(Box::new(e)),
         }
+    }
+
+    pub fn decrypt_with_identity_key(
+        &self,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT enc_secret_key FROM beings WHERE kind = 'human' LIMIT 1")?;
+        let secret_key_bytes: Vec<u8> = stmt.query_row([], |row| row.get(0))?;
+
+        let secret_key: [u8; 32] = secret_key_bytes[..32]
+            .try_into()
+            .map_err(|_| "secret key wrong length")?;
+
+        decrypt_with_secret_key(&secret_key, ciphertext)
     }
 
     /// Called once during registration.
@@ -354,6 +392,38 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn load_dag(&self) -> Result<ChatDag, Box<dyn std::error::Error>> {
+        let messages = self.load_all_messages()?;
+        Ok(ChatDag::build_from_flat_list(messages))
+    }
+
+    pub fn save_message_with_root(
+        &self,
+        msg: &ChatMessage,
+    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        self.save_message(msg)?;
+        let dag = self.load_dag()?;
+        Ok(dag.epoch_root())
+    }
+
+    pub fn load_all_messages(&self) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp FROM messages ORDER BY timestep ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ChatMessage {
+                id: row.get(0)?,
+                topic: row.get(1)?,
+                parent_id: row.get(2)?,
+                sender_id: row.get(3)?,
+                sender_name: row.get(4)?,
+                content: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
     }
 
     /// All messages for a topic, oldest first — feed into

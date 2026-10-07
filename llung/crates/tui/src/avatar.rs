@@ -1,4 +1,4 @@
-use image::{GenericImageView, RgbaImage, imageops::FilterType};
+use image::{RgbaImage, imageops::FilterType};
 use ratatui::{buffer::Buffer, style::Color};
 
 #[derive(Clone)]
@@ -28,8 +28,8 @@ pub fn decode_avatar_hex(bytes: &[u8], cell_width: u16) -> Option<AvatarThumbnai
             let py_top = ty as u32 * 2;
             let py_bot = py_top + 1;
 
-            let top = sample_hex(&rbga, px, py_top, cx, cy, radius);
-            let bot = sample_hex(&rbga, px, py_bot, cx, cy, radius);
+            let top = sample_hex(&rgba, px, py_top, cx, cy, radius);
+            let bot = sample_hex(&rgba, px, py_bot, cx, cy, radius);
 
             pixels.push((top, bot));
         }
@@ -41,7 +41,7 @@ pub fn decode_avatar_hex(bytes: &[u8], cell_width: u16) -> Option<AvatarThumbnai
     })
 }
 
-pub fn sample_hex(img: &RbgaImage, x: u32, y: u32, cx: f32, cy: f32, radius: f32) -> Color {
+pub fn sample_hex(img: &RgbaImage, x: u32, y: u32, cx: f32, cy: f32, radius: f32) -> Color {
     let dx = (x as f32 + 0.5 - cx).abs();
     let dy = (y as f32 + 0.5 - cy).abs();
 

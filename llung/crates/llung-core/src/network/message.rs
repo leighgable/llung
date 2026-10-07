@@ -11,6 +11,22 @@ pub struct Attachment {
     pub size_bytes: u64,   // Enables "Click to download (X MB)" UX
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageKind {
+    Human,
+    Agent,
+    ToolCall {
+        tool_name: String,
+        arguments: String,
+    },
+    ToolResponse {
+        tool_name: String,
+        result_summary: String,
+    },
+    System, // joins, leaves, topic changes
+    Notes,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String, // SHA256 of the message contents
@@ -18,6 +34,7 @@ pub struct ChatMessage {
     pub sender_id: String, // base58 PeerId of the author
     pub sender_name: String,
     pub parent_id: Option<String>, // <--- creates branches
+    pub kind: MessageKind,
     pub content: String,
     pub timestamp: u64,
 }

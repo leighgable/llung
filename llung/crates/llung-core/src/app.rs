@@ -1,6 +1,9 @@
 use crate::{
     config::CoreConfig,
-    identity::{being::Being, machine::MachineIdentity},
+    identity::{
+        being::{Being, PresenceMessage},
+        machine::MachineIdentity,
+    },
     network::{
         NetworkCommand, NetworkEngine, NetworkEvent,
         behaviour::{DirectMessageBehaviour, LlungBehaviour},
@@ -107,7 +110,14 @@ impl LlungApp {
         being: Being,
     ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), Box<dyn std::error::Error>> {
         let local_peer_id = machine.peer_id;
-        let local_being = being;
+        let local_presence = PresenceMessage {
+            being_id: being.being_id.clone(),
+            machine_id: machine.peer_id,
+            human_name: being.human_name.clone(),
+            kind: being.kind,
+            status: being.status.clone(),
+            avatar_cid: being.avatar_cid.clone(),
+        };
 
         let mut swarm = build_swarm(machine.keypair)?;
         swarm
@@ -123,11 +133,11 @@ impl LlungApp {
         let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(32);
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
 
-        let engine = NetworkEngine::new(swarm, cmd_rx, event_tx);
+        let engine = NetworkEngine::new(swarm, cmd_rx, event_tx, local_presence);
         tokio::spawn(async move { engine.run().await });
 
         // Re-announce avatar on startup
-        if let Some(cid) = &local_being.avatar_cid {
+        if let Some(cid) = &being.avatar_cid {
             let _ = cmd_tx
                 .send(NetworkCommand::ProvideMediaCid { cid: cid.clone() })
                 .await;
@@ -135,7 +145,7 @@ impl LlungApp {
 
         Ok((
             LlungApp {
-                local_being,
+                local_being: being,
                 local_peer_id,
                 cmd_tx,
             },

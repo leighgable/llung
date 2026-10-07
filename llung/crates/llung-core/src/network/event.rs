@@ -10,7 +10,7 @@ pub enum NetworkEvent {
         sender: PeerId,
         data: Vec<u8>,
     },
-    DirectMessageRecieved {
+    DirectMessageReceived {
         sender: PeerId,
         payload: Vec<u8>,
     },

@@ -4,6 +4,10 @@ use futures::StreamExt;
 use libp2p::{Swarm, kad, request_response, swarm::SwarmEvent};
 use tokio::sync::mpsc;
 
+use crate::identity::{
+    being::{Being, PresenceMessage, broadcast_presence},
+    machine::MachineIdentity,
+};
 use crate::network::{
     behaviour::{LlungBehaviour, LlungBehaviourEvent},
     command::NetworkCommand,
@@ -23,6 +27,7 @@ pub struct NetworkEngine {
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
     pending_queries: HashMap<kad::QueryId, PendingQuery>,
+    local_presence: PresenceMessage,
 }
 
 impl NetworkEngine {
@@ -30,12 +35,14 @@ impl NetworkEngine {
         swarm: Swarm<LlungBehaviour>,
         command_rx: mpsc::Receiver<NetworkCommand>,
         event_tx: mpsc::Sender<NetworkEvent>,
+        local_presence: PresenceMessage,
     ) -> Self {
         Self {
             swarm,
             command_rx,
             event_tx,
             pending_queries: HashMap::new(),
+            local_presence,
         }
     }
 
@@ -55,7 +62,10 @@ impl NetworkEngine {
         }
     }
 
-    async fn handle_command(&mut self, cmd: NetworkCommand) {
+    async fn handle_command(
+        &mut self,
+        cmd: NetworkCommand,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match cmd {
             NetworkCommand::PublishMessage { topic, contents } => {
                 if let Err(e) = self
@@ -65,6 +75,18 @@ impl NetworkEngine {
                     .publish(topic, contents)
                 {
                     tracing::info!("Failed to publish message: {e:?}");
+                }
+            }
+            NetworkCommand::SubscribeTopic { topic } => {
+                let is_new = self.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+
+                if is_new {
+                    tracing::info!("Subscribed to topic: {}", topic);
+                    let payload = serde_json::to_vec(&self.local_presence)?;
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(topic, payload)?;
                 }
             }
             NetworkCommand::SendDirectMessage { target, payload } => {
@@ -98,6 +120,7 @@ impl NetworkEngine {
                     .insert(id, PendingQuery::GetProviders { cid });
             }
         }
+        Ok(())
     }
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<LlungBehaviourEvent>) {
@@ -118,7 +141,7 @@ impl NetworkEngine {
                     } => {
                         let _ = self
                             .event_tx
-                            .send(NetworkEvent::DirectMessageRecieved {
+                            .send(NetworkEvent::DirectMessageReceived {
                                 sender: peer,
                                 payload: request.0,
                             })

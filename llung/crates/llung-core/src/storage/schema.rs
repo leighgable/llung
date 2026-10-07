@@ -1,3 +1,8 @@
+use crate::identity::crypto::LegacyRng;
+use rand::{Rng, rngs::SysRng};
+use rand_core::UnwrapErr;
+use x25519_dalek::{self, PublicKey, StaticSecret};
+
 pub const CREATE_MESSAGES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,      
@@ -30,7 +35,9 @@ pub const CREATE_BEINGS_TABLE: &str = "
         kind TEXT NOT NULL DEFAULT 'human',
         status TEXT NOT NULL,
         avatar_cid TEXT,
-        secret_key BLOB NOT NULL
+        secret_key BLOB NOT NULL,
+        enc_secret_key BLOB NOT NULL,
+        enc_public_key BLOB NOT NULL
     );
 ";
 
@@ -90,23 +97,43 @@ pub const BRANCH_SELECT: &str = "
 ";
 
 pub fn run_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.execute(CREATE_BEINGS_TABLE, [])?;
-    conn.execute(CREATE_MESSAGES_TABLE, [])?;
-    conn.execute(CREATE_MEDIA_TABLE, [])?;
-    conn.execute(CREATE_MESSAGE_ATTACHMENTS_TABLE, [])?;
-    conn.execute(CREATE_MACHINES_TABLE, [])?;
-    conn.execute(CREATE_AVATAR_CACHE_TABLE, [])?;
+    // execute_batch (not execute) is required for CREATE_MESSAGES_TABLE,
+    // which contains multiple statements.
+    conn.execute_batch(CREATE_BEINGS_TABLE)?;
+    conn.execute_batch(CREATE_MESSAGES_TABLE)?;
+    conn.execute_batch(CREATE_MEDIA_TABLE)?;
+    conn.execute_batch(CREATE_MESSAGE_ATTACHMENTS_TABLE)?;
+    conn.execute_batch(CREATE_MACHINES_TABLE)?;
+    conn.execute_batch(CREATE_AVATAR_CACHE_TABLE)?;
 
     // Older databases have a `beings` table without the `kind` column.
     let mut stmt = conn.prepare("PRAGMA table_info(beings)")?;
     let columns: Vec<String> = stmt
         .query_map([], |row| row.get(1))?
         .collect::<rusqlite::Result<_>>()?;
-    if !columns.iter().any(|c| c == "kind") {
-        conn.execute(
-            "ALTER TABLE beings ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'",
-            [],
-        )?;
+    if !columns.iter().any(|c| c == "enc_secret_key") {
+        conn.execute("ALTER TABLE beings ADD COLUMN enc_secret_key BLOB", [])?;
+        conn.execute("ALTER TABLE beings ADD COLUMN enc_public_key BLOB", [])?;
+
+        let mut stmt = conn.prepare("SELECT being_id FROM beings WHERE enc_secret_key IS NULL")?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        for id in ids {
+            let mut rng = UnwrapErr(SysRng);
+            let secret = StaticSecret::random_from_rng(&mut rng);
+            let public = PublicKey::from(&secret);
+
+            conn.execute(
+                "UPDATE beings SET enc_secret_key = ?1, enc_public_key = ?2 WHERE being_id = ?3",
+                (
+                    &secret.as_bytes().to_vec(),
+                    &public.as_bytes().to_vec(),
+                    &id,
+                ),
+            )?;
+        }
     }
 
     Ok(())

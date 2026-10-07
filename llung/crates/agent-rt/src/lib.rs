@@ -3,6 +3,10 @@ use tokio::sync::{mpsc, oneshot};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 
+mod kernel;
+mod security;
+mod verification;
+
 // host bindings
 wasmtime::component::bindgen!({
     path: "wit/tool.wit",

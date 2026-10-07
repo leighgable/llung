@@ -11,6 +11,9 @@ pub enum NetworkCommand {
         target: PeerId,
         payload: Vec<u8>,
     },
+    SubscribeTopic {
+        topic: IdentTopic,
+    },
     PutProfile {
         profile: Being,
     },
