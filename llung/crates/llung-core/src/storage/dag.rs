@@ -283,8 +283,16 @@ mod tests {
         dag2.insert(a);
         dag2.insert(b);
 
-        let order1: Vec<&str> = dag1.topic_linear("t").iter().map(|m| m.id.as_str()).collect();
-        let order2: Vec<&str> = dag2.topic_linear("t").iter().map(|m| m.id.as_str()).collect();
+        let order1: Vec<&str> = dag1
+            .topic_linear("t")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        let order2: Vec<&str> = dag2
+            .topic_linear("t")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         assert_eq!(order1, order2);
         assert_eq!(order1.len(), 3);
         assert_eq!(order1[0], "a"); // parent always precedes children
@@ -302,7 +310,11 @@ mod tests {
         dag.insert(m1);
         dag.insert(m2);
 
-        let order: Vec<&str> = dag.topic_linear("t").iter().map(|m| m.id.as_str()).collect();
+        let order: Vec<&str> = dag
+            .topic_linear("t")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         assert_eq!(order, vec!["x", "y"]);
     }
 
@@ -317,12 +329,20 @@ mod tests {
 
         // Until the parent arrives it shows as a detached frontier
         // (chat UX: never hide a message), still ordered by hash.
-        let early: Vec<&str> = dag.topic_linear("t").iter().map(|m| m.id.as_str()).collect();
+        let early: Vec<&str> = dag
+            .topic_linear("t")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         assert_eq!(early, vec!["child"]);
 
         dag.insert(msg("parent", "t", None, "the root"));
         assert!(!dag.pending.contains_key("parent"));
-        let order: Vec<&str> = dag.topic_linear("t").iter().map(|m| m.id.as_str()).collect();
+        let order: Vec<&str> = dag
+            .topic_linear("t")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         assert_eq!(order, vec!["parent", "child"]);
     }
 

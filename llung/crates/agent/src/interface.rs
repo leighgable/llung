@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use llung_core::network::message::{AgentResult, Backend, ChatMessage};
+use llung_core::network::message::{AgentResult, Backend as AgentBackend, ChatMessage};
 
 /// A pluggable LLM backend. Implementations must be safe to call from
 /// the agent bridge task. Boxed (not `impl Future`) so the trait stays
 /// dyn-compatible for `Box<dyn LlmBackend>`.
-pub trait LlmBackend: Send + Sync {
+pub trait AgentBackend: Send + Sync {
     fn chat(
         &self,
         messages: &[ChatMessage],
@@ -54,7 +54,7 @@ struct ResponseMessage {
     content: String,
 }
 
-impl LlmBackend for OpenAiCompatible {
+impl AgentBackend for OpenAiCompatible {
     fn chat(
         &self,
         messages: &[ChatMessage],
@@ -86,7 +86,7 @@ impl LlmBackend for OpenAiCompatible {
                 .into_iter()
                 .next()
                 .map(|c| c.message.content)
-                .ok_or_else(|| "LLM backend returned no choices".into())
+                .ok_or_else(|| "Agent backend returned no choices".into())
         })
     }
 }

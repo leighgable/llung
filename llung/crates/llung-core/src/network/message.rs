@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type AgentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub trait Backend: Send + Sync {
+pub trait AgentBackend: Send + Sync {
     fn chat(&self, messages: &[ChatMessage]) -> impl Future<Output = AgentResult<String>> + Send;
 }
 
@@ -48,8 +48,7 @@ impl ToSql for MessageKind {
 
 impl FromSql for MessageKind {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        serde_json::from_str(value.as_str()?)
-            .map_err(|e| FromSqlError::Other(Box::new(e)))
+        serde_json::from_str(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e)))
     }
 }
 

@@ -4,8 +4,7 @@ use crate::identity::{
     machine::MachineIdentity,
 };
 use crate::network::message::ChatMessage;
-use crate::storage::dag::ChatDag;
-use crate::storage::schema;
+use crate::storage::{dag::ChatDag, global_state::GlobalState, schema};
 // use crypto_box::Nonce;
 use libp2p::{PeerId, identity::Keypair};
 // use rand_core::os_rng;
@@ -34,6 +33,34 @@ impl Database {
         tx.commit()?;
 
         Ok((Self { conn }, machine))
+    }
+
+    pub fn load_global_state(&self) -> Result<GlobalState, Box<dyn Error>> {
+        let topics = self.list_topics()?;
+        let mut state = GlobalState::default();
+
+        for topic in topics {
+            let messages = self.load_messages_for_topic(&topic)?;
+            let dag = ChatDag::build_from_flat_list(messages);
+            state.update_topic(topic, dag.epoch_root());
+        }
+        Ok(state)
+    }
+
+    pub fn save_message_and_update_state(
+        &self,
+        msg: &ChatMessage,
+    ) -> Result<[u8; 32], Box<dyn Error>> {
+        self.save_message(msg)?;
+
+        let topic_messages = self.load_messages_for_topic(&msg.topic)?;
+        let dag = ChatDag::build_from_flat_list(topic_messages);
+        let topic_root = dag.epoch_root();
+
+        let mut global = self.load_global_state()?;
+        global.update_topic(msg.topic.clone(), topic_root);
+
+        Ok(global.global_root())
     }
 
     pub fn create_machine(&self, device_name: &str) -> Result<MachineIdentity, Box<dyn Error>> {
@@ -433,7 +460,7 @@ impl Database {
     pub fn load_all_messages(&self) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp, kind
-             FROM messages ORDER BY timestamp ASC"
+             FROM messages ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ChatMessage {

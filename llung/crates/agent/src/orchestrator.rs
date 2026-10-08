@@ -3,7 +3,7 @@ use crate::aukora::kernel::{Grant, KernelState, Manifest, Receipt};
 use crate::aukora::security::secure_execute_agent_tool;
 use crate::config::AgentConfig;
 use crate::history::HistoryCompressor;
-use crate::interface::LlmBackend;
+use crate::interface::AgentBackend;
 use agent_rt::ToolRequest;
 use libp2p::gossipsub::IdentTopic;
 use llung_core::{
@@ -14,11 +14,12 @@ use llung_core::{
     storage::db::Database,
 };
 use rand::Rng;
+use std::error::Error;
 use tokio::sync::mpsc;
 
 pub struct AgentLoopContext {
     pub config: AgentConfig,
-    pub backend: Box<dyn LlmBackend>,
+    pub backend: Box<dyn AgentBackend>,
     pub compressor: HistoryCompressor,
     pub db: Database,
     pub cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -51,21 +52,79 @@ pub async fn run_agent_loop(mut ctx: AgentLoopContext, mut event_rx: mpsc::Recei
         // decide: respond, use tool, or ignore
         match decide_action(&text, &ctx.config.name).await {
             AgentAction::Ignore => continue,
-            AgentAction::Reply => {
-                if let Err(e) = generate_reply(&mut ctx, &text).await {
-                    tracing::error!("Agent reply failed: {e}");
+            AgentAction::Reply => match run_agent_turn(&ctx, &text).await {
+                Ok(reply) => {
+                    let cmd = NetworkCommand::PublishMessage {
+                        topic: IdentTopic::new(&ctx.topic),
+                        contents: reply.clone().into_bytes(),
+                    };
+                    if let Err(e) = ctx.cmd_tx.send(cmd).await {
+                        tracing::error!("Failed to publish reply: {e}");
+                        continue;
+                    }
+                    let self_peer: PeerId = match ctx.self_being_id.parse() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!("Invalid self_being_id: {e}");
+                            continue;
+                        }
+                    };
+                    let reply_msg = ChatMessage::new(
+                        ctx.topic.clone(),
+                        self_peer,
+                        None,
+                        MessageKind::Agent,
+                        ctx.self_name.clone(),
+                        reply,
+                    );
+                    if let Err(e) = ctx.db.save_message(&reply_msg) {
+                        tracing::warn!("Failed to save reply to DB: {e}");
+                    }
                 }
-            }
+                Err(e) => {
+                    tracing::error!("Agent turn failed: {e}");
+                }
+            },
             AgentAction::UseTool {
                 tool_name,
                 arguments,
             } => {
                 if let Err(e) = execute_secured_tool(&mut ctx, tool_name, arguments).await {
-                    tracing::error!("Secured tool execution failed: {e}");
+                    tracing::error!("Tool execution failed: {e}");
                 }
             }
         }
     }
+}
+
+async fn run_agent_turn(
+    ctx: &AgentLoopContext,
+    trigger_text: &str,
+) -> Result<String, Box<dyn Error>> {
+    let dag = ctx.db.load_dag()?;
+    let messages: Vec<ChatMessage> = dag.topic_linear(&ctx.topic).into_iter().cloned().collect();
+    let mut summary_tree = ctx.compressor.compress(&messages);
+    while summary_tree.size_bytes > ctx.compressor.context_budget {
+        if !ctx.compressor.merge_adjacent(&mut summary_tree) {
+            break;
+        }
+    }
+    let recent = 5usize;
+    if messages.len() > recent {
+        let start = messages.len() - recent;
+        zoom_range(&mut summary_tree, &messages, start, messages.len());
+    }
+    let context = ctx.compressor.flatten(&summary_tree);
+
+    let prompt = vec![
+        ChatMessage::system(format!("You are in a peer-to-peer chat.", ctx.self_name)),
+        ChatMessage::user(context),
+        ChatMessage::user(format!("New message: {}", trigger_text)),
+    ];
+    ctx.backend
+        .chat(&prompt)
+        .await
+        .map_err(|e| -> Box<dyn Error> { e.into() })
 }
 
 // build manifest, get grant, run through aukora
@@ -104,68 +163,6 @@ async fn execute_secured_tool(
         contents: result_text.into_bytes(),
     };
     ctx.cmd_tx.send(cmd).await?;
-
-    Ok(())
-}
-
-// compressed history + agent reply
-async fn generate_reply(
-    ctx: &mut AgentLoopContext,
-    trigger_text: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let dag = ctx.db.load_dag()?;
-    // DAG gives the canonical OptChat order; the compressor wants owned
-    // messages for the flat history indexing.
-    let messages: Vec<ChatMessage> = dag
-        .topic_linear(&ctx.topic)
-        .into_iter()
-        .cloned()
-        .collect();
-
-    // Compress history, then fit the view under the byte budget.
-    let mut summary_tree = ctx.compressor.compress(&messages);
-    while summary_tree.size_bytes > ctx.compressor.context_budget {
-        if !ctx.compressor.merge_adjacent(&mut summary_tree) {
-            break;
-        }
-    }
-
-    let context = ctx.compressor.flatten(&summary_tree);
-
-    let prompt = vec![
-        ChatMessage::system(format!(
-            "You are {}, a helpful agent in a peer-to-peer chat. \
-             History is compressed. Respond concisely.",
-            ctx.self_name
-        )),
-        ChatMessage::user(context),
-        ChatMessage::user(format!("New message: {}", trigger_text)),
-    ];
-
-    let reply = ctx
-        .backend
-        .chat(&prompt)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-
-    let cmd = NetworkCommand::PublishMessage {
-        topic: IdentTopic::new(&ctx.topic),
-        contents: reply.clone().into_bytes(),
-    };
-    ctx.cmd_tx.send(cmd).await?;
-
-    // Log our own reply so it joins the DAG history.
-    // (The being_id is the base58 PeerId of the agent's ed25519 key.)
-    let self_peer: libp2p::PeerId = ctx.self_being_id.parse()?;
-    let reply_msg = ChatMessage::new(
-        ctx.topic.clone(),
-        self_peer,
-        None,
-        MessageKind::Agent,
-        ctx.self_name.clone(),
-        reply.clone(),
-    );
-    let _ = ctx.db.save_message(&reply_msg);
 
     Ok(())
 }
