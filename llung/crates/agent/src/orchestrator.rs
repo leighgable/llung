@@ -1,11 +1,19 @@
 // crates/agent/src/orchestrator.rs
-use crate::aukora::{Grant, KernelState, Manifest, Receipt, secure_execute_agent_tool};
-use crate::backend::{ChatMessage, LlmBackend};
-use crate::history::{HistoryCompressor, merge_adjacent, zoom_range};
+use crate::aukora::kernel::{Grant, KernelState, Manifest, Receipt};
+use crate::aukora::security::secure_execute_agent_tool;
+use crate::config::AgentConfig;
+use crate::history::HistoryCompressor;
+use crate::interface::LlmBackend;
+use agent_rt::ToolRequest;
+use libp2p::gossipsub::IdentTopic;
 use llung_core::{
-    network::{NetworkCommand, NetworkEvent, message::IdentTopic},
-    storage::{dag::ChatDag, db::Database},
+    network::{
+        NetworkCommand, NetworkEvent,
+        message::{ChatMessage, MessageKind},
+    },
+    storage::db::Database,
 };
+use rand::Rng;
 use tokio::sync::mpsc;
 
 pub struct AgentLoopContext {
@@ -17,9 +25,9 @@ pub struct AgentLoopContext {
     pub topic: String,
     pub self_being_id: String,
     pub self_name: String,
-    // ── NEW: Aukora kernel for this agent instance ──
+    // aukora kernel for agent instance
     pub kernel: KernelState,
-    // ── NEW: channel to agent-rt wasm worker ──
+    // channel to agent-rt wasm worker
     pub wasm_tx: mpsc::Sender<ToolRequest>,
 }
 
@@ -40,7 +48,7 @@ pub async fn run_agent_loop(mut ctx: AgentLoopContext, mut event_rx: mpsc::Recei
 
         let text = String::from_utf8_lossy(&data).into_owned();
 
-        // ── DECIDE: respond, use tool, or ignore ──
+        // decide: respond, use tool, or ignore
         match decide_action(&text, &ctx.config.name).await {
             AgentAction::Ignore => continue,
             AgentAction::Reply => {
@@ -60,7 +68,7 @@ pub async fn run_agent_loop(mut ctx: AgentLoopContext, mut event_rx: mpsc::Recei
     }
 }
 
-// ── INTERNAL: build manifest, get grant, run through Aukora ──
+// build manifest, get grant, run through aukora
 async fn execute_secured_tool(
     ctx: &mut AgentLoopContext,
     tool_name: String,
@@ -70,10 +78,13 @@ async fn execute_secured_tool(
         agent_id: ctx.self_being_id.clone(),
         target_effect: tool_name,
         arguments,
-        nonce: rand::random(), // or atomic counter
+        nonce: {
+            let mut rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
+            rng.next_u64() // or atomic counter
+        },
     };
 
-    // Self-grant: the user who spawned this agent is the supervisor
+    // self-grant: the user who spawned this agent is the supervisor
     // In production, this would be a real signature from the user's pinned key
     let grant = create_self_grant(&manifest, &ctx.config);
 
@@ -86,7 +97,7 @@ async fn execute_secured_tool(
     )
     .await?;
 
-    // Feed tool result back into chat as the agent's response
+    // tool result back into chat as the agent's response
     let result_text = String::from_utf8_lossy(&receipt.output_commitment).into_owned();
     let cmd = NetworkCommand::PublishMessage {
         topic: IdentTopic::new(&ctx.topic),
@@ -97,18 +108,24 @@ async fn execute_secured_tool(
     Ok(())
 }
 
-// ── INTERNAL: compressed history + LLM reply ──
+// compressed history + agent reply
 async fn generate_reply(
     ctx: &mut AgentLoopContext,
     trigger_text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dag = ctx.db.load_dag()?;
-    let messages = dag.topic_linear(&ctx.topic);
+    // DAG gives the canonical OptChat order; the compressor wants owned
+    // messages for the flat history indexing.
+    let messages: Vec<ChatMessage> = dag
+        .topic_linear(&ctx.topic)
+        .into_iter()
+        .cloned()
+        .collect();
 
-    // Compress history
+    // Compress history, then fit the view under the byte budget.
     let mut summary_tree = ctx.compressor.compress(&messages);
-    while summary_tree.token_count > ctx.compressor.context_budget {
-        if !merge_adjacent(&mut summary_tree) {
+    while summary_tree.size_bytes > ctx.compressor.context_budget {
+        if !ctx.compressor.merge_adjacent(&mut summary_tree) {
             break;
         }
     }
@@ -125,23 +142,39 @@ async fn generate_reply(
         ChatMessage::user(format!("New message: {}", trigger_text)),
     ];
 
-    let reply = ctx.backend.chat(&prompt).await?;
+    let reply = ctx
+        .backend
+        .chat(&prompt)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     let cmd = NetworkCommand::PublishMessage {
         topic: IdentTopic::new(&ctx.topic),
-        contents: reply.into_bytes(),
+        contents: reply.clone().into_bytes(),
     };
     ctx.cmd_tx.send(cmd).await?;
+
+    // Log our own reply so it joins the DAG history.
+    // (The being_id is the base58 PeerId of the agent's ed25519 key.)
+    let self_peer: libp2p::PeerId = ctx.self_being_id.parse()?;
+    let reply_msg = ChatMessage::new(
+        ctx.topic.clone(),
+        self_peer,
+        None,
+        MessageKind::Agent,
+        ctx.self_name.clone(),
+        reply.clone(),
+    );
+    let _ = ctx.db.save_message(&reply_msg);
 
     Ok(())
 }
 
 // ── SELF-GRANT (placeholder until real supervisor signing) ──
 fn create_self_grant(manifest: &Manifest, config: &AgentConfig) -> Grant {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&bincode::serialize(manifest).unwrap());
-    let manifest_hash: [u8; 32] = hasher.finalize().into();
+    // Use the kernel's canonical hash path so the integrity check in
+    // consume_manifest_use_core recomputes the SAME hash.
+    let manifest_hash = crate::aukora::kernel::compute_sha256(manifest);
 
     Grant {
         manifest_hash,

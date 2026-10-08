@@ -9,5 +9,5 @@ tokio.workspace = true
 serde.workspace = true
 tracing.workspace = true
 textplots = "0.8.7"
+llung-core = { path = "../llung-core" }
 wasmtime = { version = "48.0.1", features = ["pooling-allocator"] }
-bincode = "3.0.0"

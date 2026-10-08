@@ -1,7 +1,6 @@
-use crate::identity::crypto::LegacyRng;
-use rand::{Rng, rngs::SysRng};
+use rand::rngs::SysRng;
 use rand_core::UnwrapErr;
-use x25519_dalek::{self, PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const CREATE_MESSAGES_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS messages (
@@ -11,6 +10,7 @@ pub const CREATE_MESSAGES_TABLE: &str = r#"
         sender_id TEXT NOT NULL,
         sender_name TEXT NOT NULL,
         content TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT '"Human"',
         timestamp INTEGER DEFAULT (unixepoch())
     );
 
@@ -82,14 +82,14 @@ pub const CREATE_MESSAGE_ATTACHMENTS_TABLE: &str = "
 pub const BRANCH_SELECT: &str = "
     WITH RECURSIVE branch_path AS (
         -- Base case: start with the specific message
-        SELECT id, topic, sender_peer_id, parent_id, content, timestamp
+        SELECT id, topic, sender_id, sender_name, parent_id, content, timestamp, kind
         FROM messages
         WHERE id = ?
 
         UNION ALL
 
         -- Recursive step: join with the parent message
-        SELECT m.id, m.topic, m.sender_peer_id, m.parent_id, m.content, m.timestamp
+        SELECT m.id, m.topic, m.sender_id, m.sender_name, m.parent_id, m.content, m.timestamp, m.kind
         FROM messages m
         JOIN branch_path bp ON m.id = bp.parent_id
     )
@@ -134,6 +134,18 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
                 ),
             )?;
         }
+    }
+
+    // Older databases have a `messages` table without the `kind` column.
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "kind") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT '\"Human\"'",
+            [],
+        )?;
     }
 
     Ok(())

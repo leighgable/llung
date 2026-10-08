@@ -104,8 +104,9 @@ pub fn broadcast_presence(
     being: &Being,
     machine: &MachineIdentity,
     topic: &IdentTopic,
+    enc_public_key: Option<[u8; 32]>,
 ) -> Result<(), Box<dyn Error>> {
-    let payload = PresenceMessage::from_local_identities(being, machine);
+    let payload = PresenceMessage::from_local_identities(being, machine, enc_public_key);
     let bytes = serde_json::to_vec(&payload)?;
 
     // Publish message to the Gossipsub topic
@@ -140,10 +141,17 @@ pub struct PresenceMessage {
     pub kind: BeingKind,
     pub status: BeingStatus,
     pub avatar_cid: Option<String>,
+    /// X25519 public key for encrypted direct messages (invites, etc.).
+    /// Learned from presence since gossipsub messages only carry a PeerId.
+    pub enc_public_key: Option<[u8; 32]>,
 }
 
 impl PresenceMessage {
-    fn from_local_identities(being: &Being, machine: &MachineIdentity) -> Self {
+    fn from_local_identities(
+        being: &Being,
+        machine: &MachineIdentity,
+        enc_public_key: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             being_id: being.being_id.clone(),
             machine_id: machine.peer_id,
@@ -151,6 +159,7 @@ impl PresenceMessage {
             kind: being.kind,
             status: being.status.clone(),
             avatar_cid: being.avatar_cid.clone(),
+            enc_public_key,
         }
     }
 }

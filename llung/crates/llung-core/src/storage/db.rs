@@ -228,6 +228,27 @@ impl Database {
         }
     }
 
+    /// X25519 public key of the local human Being, published via presence
+    /// so peers can encrypt direct messages (invites) to us.
+    pub fn get_human_enc_public_key(&self) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT enc_public_key FROM beings WHERE kind = 'human' LIMIT 1")?;
+        let result = stmt.query_row([], |row| row.get::<_, Vec<u8>>(0));
+
+        match result {
+            Ok(bytes) => {
+                let key: [u8; 32] = bytes
+                    .get(..32)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or("enc public key wrong length")?;
+                Ok(Some(key))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
     pub fn decrypt_with_identity_key(
         &self,
         ciphertext: &[u8],
@@ -379,8 +400,8 @@ impl Database {
     /// (e.g. both the UI task and the agent task saving the same gossip).
     pub fn save_message(&self, msg: &ChatMessage) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO messages (id, topic,  parent_id, sender_id, sender_name, content, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO messages (id, topic, parent_id, sender_id, sender_name, content, timestamp, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 &msg.id,
                 &msg.topic,
@@ -388,7 +409,8 @@ impl Database {
                 &msg.sender_id,
                 &msg.sender_name,
                 &msg.content,
-                msg.timestamp as i64
+                msg.timestamp as i64,
+                &msg.kind,
             ],
         )?;
         Ok(())
@@ -410,7 +432,8 @@ impl Database {
 
     pub fn load_all_messages(&self) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp FROM messages ORDER BY timestep ASC"
+            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp, kind
+             FROM messages ORDER BY timestamp ASC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ChatMessage {
@@ -421,6 +444,7 @@ impl Database {
                 sender_name: row.get(4)?,
                 content: row.get(5)?,
                 timestamp: row.get::<_, i64>(6)? as u64,
+                kind: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
@@ -433,7 +457,7 @@ impl Database {
         topic: &str,
     ) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp
+            "SELECT id, topic, parent_id, sender_id, sender_name, content, timestamp, kind
              FROM messages WHERE topic = ?1 ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map([topic], |row| {
@@ -445,6 +469,7 @@ impl Database {
                 sender_name: row.get(4)?,
                 content: row.get(5)?,
                 timestamp: row.get::<_, i64>(6)? as u64,
+                kind: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
@@ -467,6 +492,7 @@ impl Database {
             parent_id: row.get(4)?,
             content: row.get(5)?,
             timestamp: row.get::<_, i64>(6)? as u64,
+            kind: row.get(7)?,
         })
     }
 
@@ -509,7 +535,7 @@ impl Database {
     ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT bytes FROM avatar_cache WHERE cid = ?1")?;
+            .prepare("SELECT image_bytes FROM avatar_cache WHERE cid = ?1")?;
         let mut rows = stmt.query_map([cid], |row| row.get::<_, Vec<u8>>(0))?;
         Ok(rows.next().transpose()?)
     }

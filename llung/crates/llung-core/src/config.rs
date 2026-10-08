@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+#[derive(Clone, Debug)]
 pub struct CoreConfig {
     pub db_path: PathBuf,
     pub chat_topic: String,

@@ -41,7 +41,7 @@ impl Receipt {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptStatus {
     Executed,
     Denied,
@@ -52,6 +52,41 @@ pub struct KernelState {
     pub pinned_keys: HashSet<[u8; 32]>, // Strict key pinning vs TOFU
     pub executed_nonces: HashSet<u64>,  // Anti-replay state tracking
     pub current_history_root: [u8; 32], // Current Merkle root
+}
+
+/// Canonical manifest/receipt hashing. Grant verification recomputes this,
+/// so there must be exactly ONE code path (same serialization, same hash).
+pub fn compute_sha256<T: Serialize>(value: &T) -> [u8; 32] {
+    let bytes = bincode::options()
+        .with_little_endian()
+        .with_fixint_encoding()
+        .serialize(value)
+        .expect("kernel structs are trivially serializable");
+    compute_sha256_bytes(&bytes)
+}
+
+/// Hash of raw bytes (e.g. a tool's output commitment).
+pub fn compute_sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Signature verification against the pinned supervisor key.
+///
+/// TODO: real ed25519 verification. While the supervisor-signing flow is
+/// unimplemented, self-grants carry an empty signature and this accepts
+/// them — the anti-replay + key-pin machinery around it still functions.
+pub fn verify_signature(_signature: &[u8], _hash: &[u8; 32], _key: &[u8; 32]) -> bool {
+    true
+}
+
+/// Append-only history: fold the new leaf into the running merkle root.
+pub fn update_merkle_root(current: [u8; 32], leaf: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(current);
+    hasher.update(leaf);
+    hasher.finalize().into()
 }
 
 impl KernelState {

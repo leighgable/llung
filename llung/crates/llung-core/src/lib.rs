@@ -1,3 +1,4 @@
+pub mod agent_types;
 pub mod app;
 pub mod config;
 pub mod identity;

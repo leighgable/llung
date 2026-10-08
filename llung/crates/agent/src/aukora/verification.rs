@@ -1,4 +1,4 @@
-use crate::kernel::{Receipt, ReceiptStatus};
+use crate::aukora::kernel::{Receipt, ReceiptStatus};
 use sha2::{Digest, Sha256};
 
 pub struct PeerStateVerifier;

@@ -6,6 +6,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::prefix_text::PrefixText;
 
 pub struct ChatLine {
+    /// Stable identity (base58 PeerId) used to re-resolve the display
+    /// name when presence arrives after the message did.
+    pub sender_id: String,
     pub sender: String,
     pub content: PrefixText,
     pub is_me: bool,
@@ -42,12 +45,14 @@ impl ChatPanel {
 
     pub fn push(
         &mut self,
+        sender_id: String,
         sender: String,
         text: String,
         avatar: Option<crate::avatar::AvatarThumbnail>,
     ) {
         let is_me = sender.trim() == self.my_name.trim();
         self.messages.push(ChatLine {
+            sender_id,
             sender,
             content: PrefixText::new(text),
             is_me,
@@ -55,6 +60,22 @@ impl ChatPanel {
         });
         self.cache.clear();
         self.cached_width = 0;
+    }
+
+    /// Update the display name on every line from `peer_id`. Called when a
+    /// presence message arrives after that peer's chat messages did.
+    pub fn update_peer_name(&mut self, peer_id: &str, name: &str) {
+        let mut changed = false;
+        for msg in &mut self.messages {
+            if msg.sender_id == peer_id && msg.sender != name {
+                msg.sender = name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.cache.clear();
+            self.cached_width = 0;
+        }
     }
 
     fn rewrap(&mut self, width: u16) {

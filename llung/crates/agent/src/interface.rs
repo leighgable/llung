@@ -1,42 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use llung_core::network::message::ChatMessage;
-
-pub type AgentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentMessage {
-    pub role: String,
-    pub content: String,
-}
-
-impl AgentMessage {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".into(),
-            content: content.into(),
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".into(),
-            content: content.into(),
-        }
-    }
-
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: content.into(),
-        }
-    }
-}
+use llung_core::network::message::{AgentResult, Backend, ChatMessage};
 
 /// A pluggable LLM backend. Implementations must be safe to call from
-/// the agent bridge task.
+/// the agent bridge task. Boxed (not `impl Future`) so the trait stays
+/// dyn-compatible for `Box<dyn LlmBackend>`.
 pub trait LlmBackend: Send + Sync {
-    fn chat(&self, messages: &[ChatMessage]) -> impl Future<Output = AgentResult<String>> + Send;
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+    ) -> std::pin::Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>>;
 }
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` endpoint.
@@ -82,27 +55,38 @@ struct ResponseMessage {
 }
 
 impl LlmBackend for OpenAiCompatible {
-    async fn chat(&self, messages: &[ChatMessage]) -> AgentResult<String> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+    ) -> std::pin::Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>> {
+        // Clone what the request needs so the future owns its data and
+        // no borrowed lifetimes leak into the boxed type.
+        let model = self.model.clone();
+        let base_url = self.base_url.clone();
+        let client = self.client.clone();
+        let messages = messages.to_vec();
 
-        let response = self
-            .client
-            .post(url)
-            .json(&ChatRequest {
-                model: &self.model,
-                messages,
-                stream: false,
-            })
-            .send()
-            .await?
-            .error_for_status()?;
+        Box::pin(async move {
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        let body: ChatResponse = response.json().await?;
+            let response = client
+                .post(url)
+                .json(&ChatRequest {
+                    model: &model,
+                    messages: &messages,
+                    stream: false,
+                })
+                .send()
+                .await?
+                .error_for_status()?;
 
-        body.choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| "LLM backend returned no choices".into())
+            let body: ChatResponse = response.json().await?;
+
+            body.choices
+                .into_iter()
+                .next()
+                .map(|c| c.message.content)
+                .ok_or_else(|| "LLM backend returned no choices".into())
+        })
     }
 }

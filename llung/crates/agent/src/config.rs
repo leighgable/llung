@@ -2,7 +2,7 @@
 pub struct AgentConfig {
     pub model: String,
     pub name: String,
-    pub model_url: Optional<String>,
+    pub model_url: Option<String>,
     pub max_history: usize,
 }
 

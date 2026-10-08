@@ -1,13 +1,13 @@
-2026-10-04T20:17:03.430911Z  INFO libp2p_swarm: local_peer_id=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-2026-10-04T20:17:03.437361Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
-2026-10-04T20:17:03.438076Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
-2026-10-04T20:17:03.439264Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/46197
-2026-10-04T20:17:03.441091Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/46197
-2026-10-04T20:17:03.441716Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/46197
-2026-10-04T20:17:03.441879Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/192.168.1.69/tcp/32863/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
-2026-10-04T20:17:03.443529Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/192.168.1.69/udp/33459/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
-2026-10-04T20:17:03.449104Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/tcp/32863/p2p/12D3KooWDeXKBMHM8a7MRYV3cn2026-10-04T20:17:03.452923Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX address=/ip4/172.17.0.1/tcp/46197/p2p/12D3KooWGUGCbL2rTCnDMC3x19QQ7LNTahAT3V2g85JkWviktMgX
-7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
-2026-10-04T20:17:03.450933Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/38042/quic-v1
-2026-10-04T20:17:03.451287Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/udp/38042/quic-v1
-2026-10-04T20:17:03.451587Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/38042/quic-v1
+2026-10-08T16:42:24.743442Z  INFO libp2p_swarm: local_peer_id=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-10-08T16:42:24.747352Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.69
+2026-10-08T16:42:24.747690Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-10-08T16:42:24.748577Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/43901
+2026-10-08T16:42:24.748828Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.69/tcp/43901
+2026-10-08T16:42:24.749024Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/43901
+2026-10-08T16:42:24.750675Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/192.168.1.69/tcp/40743/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-10-08T16:42:24.751005Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/192.168.1.69/udp/53190/quic-v1/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-10-08T16:42:24.752149Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/172.17.0.1/tcp/40743/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-10-08T16:42:24.752316Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX92026-10-08T16:42:24.754988Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm2026-10-08T16:42:24.755127Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/44547/quic-v1
+202026-10-08T16:42:24.758782Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/192.168.1.69/udp/44547/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbB2026-10-08T16:44:28.959244Z  INFO llung_core::network::engine: Subscribed to topic: test-chat
+ss peer=12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa address=/ip4/172.17.0.1/udp/44547/quic-v1/p2p/12D3KooWDeXKBMHM8a7MRYV3cnm9T1kXNxg97vwbBW1az2cvNcZa
+2026-10-08T16:44:28.950744Z  INFO llung_core::network::engine: Subscribed to topic: test-chat

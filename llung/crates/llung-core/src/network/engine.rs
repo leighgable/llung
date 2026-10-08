@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use futures::StreamExt;
-use libp2p::{Swarm, kad, request_response, swarm::SwarmEvent};
+use libp2p::{
+    Swarm, gossipsub::IdentTopic, gossipsub::TopicHash, kad, request_response,
+    swarm::SwarmEvent,
+};
 use tokio::sync::mpsc;
 
-use crate::identity::{
-    being::{Being, PresenceMessage, broadcast_presence},
-    machine::MachineIdentity,
-};
+use crate::identity::being::PresenceMessage;
 use crate::network::{
     behaviour::{LlungBehaviour, LlungBehaviourEvent},
     command::NetworkCommand,
@@ -28,6 +29,9 @@ pub struct NetworkEngine {
     event_tx: mpsc::Sender<NetworkEvent>,
     pending_queries: HashMap<kad::QueryId, PendingQuery>,
     local_presence: PresenceMessage,
+    /// Every topic we have joined — presence heartbeats go to all of them
+    /// so peers in invite-only topics keep working name resolution.
+    subscribed_topics: HashSet<TopicHash>,
 }
 
 impl NetworkEngine {
@@ -36,27 +40,52 @@ impl NetworkEngine {
         command_rx: mpsc::Receiver<NetworkCommand>,
         event_tx: mpsc::Sender<NetworkEvent>,
         local_presence: PresenceMessage,
+        presence_topic: IdentTopic,
     ) -> Self {
+        let mut subscribed_topics = HashSet::new();
+        subscribed_topics.insert(presence_topic.clone().into());
         Self {
             swarm,
             command_rx,
             event_tx,
             pending_queries: HashMap::new(),
             local_presence,
+            subscribed_topics,
         }
     }
 
     /// The main network event loop. Runs on its own spawned Tokio task.
     pub async fn run(mut self) {
+        // Re-announce ourselves so peers that join later can still
+        // resolve our human_name/avatar.
+        let mut presence_tick = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                 Some(cmd) = self.command_rx.recv() => {
-                    self.handle_command(cmd).await;
+                    let _ = self.handle_command(cmd).await;
                 }
 
                 // 2. Process incoming libp2p network events
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
+                }
+
+                // 3. Presence heartbeat on every joined topic
+                _ = presence_tick.tick() => {
+                    if let Ok(payload) = serde_json::to_vec(&self.local_presence) {
+                        let topics: Vec<TopicHash> =
+                            self.subscribed_topics.iter().cloned().collect();
+                        for topic in topics {
+                            if let Err(e) = self
+                                .swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topic, payload.clone())
+                            {
+                                tracing::debug!("Presence heartbeat failed: {e:?}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -79,6 +108,7 @@ impl NetworkEngine {
             }
             NetworkCommand::SubscribeTopic { topic } => {
                 let is_new = self.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                self.subscribed_topics.insert(topic.clone().into());
 
                 if is_new {
                     tracing::info!("Subscribed to topic: {}", topic);

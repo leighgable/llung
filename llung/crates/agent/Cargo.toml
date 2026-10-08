@@ -5,5 +5,12 @@ edition = "2024"
 
 [dependencies]
 llung-core = { path = "../llung-core" }
+agent-rt = { path = "../agent-rt" }
 reqwest.workspace = true
 serde.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+libp2p = { workspace = true }
+bincode = "1.3.3"
+tracing = "0.1.44"
+rand = "0.10.3"

@@ -3,9 +3,7 @@ use tokio::sync::{mpsc, oneshot};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 
-mod kernel;
-mod security;
-mod verification;
+mod onnx;
 
 // host bindings
 wasmtime::component::bindgen!({
@@ -71,16 +69,16 @@ async fn run_tool(
     let component = Component::from_file(engine, &wasm_path)
         .map_err(|e| format!("Failed to load Wasm file: {}", e))?;
 
-    // instantiate inside the isolated store sandbox
-    let (bindings, _) = StandardTool::instantiate_async(&mut store, &component, linker)
+    // instantiate inside the isolated store sandbox.
+    // (bindgen names the world struct after the WIT world: universal-tool.)
+    let bindings = UniversalTool::instantiate_async(&mut store, &component, linker)
         .await
         .map_err(|e| format!("Wasm Sandbox Initialization Failed: {}", e))?;
 
-    // Call the dynamic tool hook safely
+    // Call the dynamic tool hook safely (plain exported func: sync call)
     let output = bindings
         .call_execute(&mut store, &args)
-        .await
         .map_err(|e| format!("Wasm Execution Runtime Error: {}", e))?;
 
-    Ok(output)
+    output.map_err(|e| format!("Tool execution failed: {}", e))
 }

@@ -110,6 +110,14 @@ impl LlungApp {
         being: Being,
     ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), Box<dyn std::error::Error>> {
         let local_peer_id = machine.peer_id;
+
+        // Publish our DM encryption key so peers can send us invites.
+        let enc_public_key = config
+            .db_path
+            .to_str()
+            .and_then(|p| crate::storage::db::Database::open(p).ok())
+            .and_then(|db| db.get_human_enc_public_key().ok().flatten());
+
         let local_presence = PresenceMessage {
             being_id: being.being_id.clone(),
             machine_id: machine.peer_id,
@@ -117,6 +125,7 @@ impl LlungApp {
             kind: being.kind,
             status: being.status.clone(),
             avatar_cid: being.avatar_cid.clone(),
+            enc_public_key,
         };
 
         let mut swarm = build_swarm(machine.keypair)?;
@@ -127,13 +136,21 @@ impl LlungApp {
 
         let topic = IdentTopic::new(&config.chat_topic);
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+
+        // Announce ourselves immediately so peers can resolve our
+        // human_name/avatar. The engine also re-broadcasts on a heartbeat.
+        let presence_bytes = serde_json::to_vec(&local_presence)?;
+        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), presence_bytes) {
+            tracing::debug!("Initial presence publish failed (no mesh yet): {e:?}");
+        }
+
         swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(32);
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
 
-        let engine = NetworkEngine::new(swarm, cmd_rx, event_tx, local_presence);
+        let engine = NetworkEngine::new(swarm, cmd_rx, event_tx, local_presence, topic);
         tokio::spawn(async move { engine.run().await });
 
         // Re-announce avatar on startup
