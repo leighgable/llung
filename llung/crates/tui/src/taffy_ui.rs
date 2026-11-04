@@ -1,18 +1,16 @@
-use ratatui::{
-    layout::Rect,
-    style::{Color, Style},
-};
+use crate::theme::Role;
+use ratatui::layout::Rect;
 use taffy::{
     AvailableSpace, Dimension, Display, FlexDirection, NodeId, Size, Style as TaffyStyle, TaffyTree,
 };
 
 pub enum NodeContent {
-    /// Just a background color fill (e.g., sidebar panel)
-    Block { bg: Color },
+    /// Just a background fill (e.g., sidebar panel); `bg` is a fill role.
+    Block { bg: Role },
     /// Wrapped text rendered with prefix sums
     Text {
         content: crate::prefix_text::PrefixText,
-        style: Style,
+        role: Role,
     },
     /// Bordered box, optionally titled
     Container { title: Option<String>, border: bool },

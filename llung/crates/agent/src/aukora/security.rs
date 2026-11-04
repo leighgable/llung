@@ -3,12 +3,23 @@ use crate::aukora::kernel::{Grant, KernelState, Manifest, Receipt, compute_sha25
 use agent_rt::ToolRequest;
 use tokio::sync::mpsc;
 
+/// Runs the effect through the Aukora guard and the wasm worker.
+/// Returns the signed receipt *and* the tool's raw output — the caller
+/// decides what to publish (chat wants the output, audit wants the
+/// receipt).
+/// Where wasm tools live. `LLUNG_TOOLS_DIR` overrides the default
+/// `runtime-tools/` directory (resolved against the process cwd).
+fn tool_wasm_path(effect: &str) -> std::path::PathBuf {
+    let dir = std::env::var("LLUNG_TOOLS_DIR").unwrap_or_else(|_| "runtime-tools".into());
+    std::path::PathBuf::from(dir).join(format!("{effect}.wasm"))
+}
+
 pub async fn secure_execute_agent_tool(
     state: &mut KernelState,
     wasm_tx: &mpsc::Sender<ToolRequest>,
     manifest: Manifest,
     grant: Grant,
-) -> Result<Receipt, String> {
+) -> Result<(Receipt, String), String> {
     // through the Aukora logic first
     // checks anti-replay (nonces) and verifies key pins
     let mut receipt = state
@@ -17,7 +28,7 @@ pub async fn secure_execute_agent_tool(
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     let request = ToolRequest {
-        wasm_path: format!("runtime-tools/{}.wasm", manifest.target_effect).into(),
+        wasm_path: tool_wasm_path(&manifest.target_effect),
         arguments_json: String::from_utf8_lossy(&manifest.arguments).into_owned(),
         response_tx: resp_tx,
     };
@@ -38,5 +49,5 @@ pub async fn secure_execute_agent_tool(
     // internal merkle state now that the output is committed
     state.advance_history_root(&receipt);
 
-    Ok(receipt)
+    Ok((receipt, wasm_output))
 }

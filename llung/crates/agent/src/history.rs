@@ -19,7 +19,12 @@
 //   * The view's cache breakpoints (MARKS) — only matters with a
 //     prompt-caching provider.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use llung_core::network::message::{ChatMessage, MessageKind};
+
+use crate::interface::Backend;
 
 /// Target size of one summary line (OptChat NODE).
 pub const NODE_BYTES: usize = 512;
@@ -33,6 +38,7 @@ fn kind_tag(kind: &MessageKind) -> &'static str {
         MessageKind::ToolResponse { .. } => "echo",
         // System / Notes carry imported memories and meta announcements.
         MessageKind::System | MessageKind::Notes => "note",
+        MessageKind::Media(_) => "media",
     }
 }
 
@@ -90,37 +96,44 @@ impl HistoryCompressor {
 
     /// Build a binary summary tree from a flat slice of messages.
     /// Purely binary: every parent covers exactly its two children.
-    pub fn compress(&self, messages: &[ChatMessage]) -> SummaryNode {
+    pub async fn compress(&self, messages: &[ChatMessage]) -> SummaryNode {
         if messages.is_empty() {
             return SummaryNode::leaf("(no history)".into(), (0, 0), true);
         }
-        self.compress_range(messages, 0)
+        self.compress_range(messages, 0).await
     }
 
-    fn compress_range(&self, messages: &[ChatMessage], offset: usize) -> SummaryNode {
-        if messages.len() == 1 {
-            return self.leaf_for(&messages[0], offset);
-        }
+    /// Boxed because it recurses (async fn recursion is not allowed).
+    fn compress_range<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        offset: usize,
+    ) -> Pin<Box<dyn Future<Output = SummaryNode> + Send + 'a>> {
+        Box::pin(async move {
+            if messages.len() == 1 {
+                return self.leaf_for(&messages[0], offset).await;
+            }
 
-        // split in half, recurse
-        let mid = messages.len() / 2;
-        let left = self.compress_range(&messages[..mid], offset);
-        let right = self.compress_range(&messages[mid..], offset + mid);
+            // split in half, recurse
+            let mid = messages.len() / 2;
+            let left = self.compress_range(&messages[..mid], offset).await;
+            let right = self.compress_range(&messages[mid..], offset + mid).await;
 
-        let (summary, verbatim) = self.merge_pair(&left, &right);
-        let mut node = SummaryNode::leaf(
-            summary,
-            (left.source_range.0, right.source_range.1),
-            verbatim,
-        );
-        node.left = Some(Box::new(left));
-        node.right = Some(Box::new(right));
-        node
+            let (summary, verbatim) = self.merge_pair(&left, &right).await;
+            let mut node = SummaryNode::leaf(
+                summary,
+                (left.source_range.0, right.source_range.1),
+                verbatim,
+            );
+            node.left = Some(Box::new(left));
+            node.right = Some(Box::new(right));
+            node
+        })
     }
 
     /// Level-0 node for one message. Free node when it fits: verbatim,
     /// no model call, full text kept so zoom is free too.
-    fn leaf_for(&self, msg: &ChatMessage, offset: usize) -> SummaryNode {
+    async fn leaf_for(&self, msg: &ChatMessage, offset: usize) -> SummaryNode {
         let line = format!(
             "{}: {}",
             kind_tag(&msg.kind),
@@ -133,14 +146,14 @@ impl HistoryCompressor {
             return node;
         }
 
-        let summary = self.summarize_one(msg);
+        let summary = self.summarize_one(msg).await;
         let mut node = SummaryNode::leaf(summary, (offset, offset + 1), false);
         node.full_text = Some(msg.content.clone());
         node
     }
 
     /// Level-0 summary for one message that doesn't fit verbatim.
-    fn summarize_one(&self, msg: &ChatMessage) -> String {
+    async fn summarize_one(&self, msg: &ChatMessage) -> String {
         match msg.kind {
             MessageKind::ToolCall {
                 ref tool_name,
@@ -153,18 +166,18 @@ impl HistoryCompressor {
             MessageKind::ToolResponse { ref tool_name, .. } => {
                 format!("Tool '{}' returned result.", tool_name)
             }
-            _ => self.backend.summarize(&msg.content),
+            _ => self.backend.summarize(&msg.content).await,
         }
     }
 
     /// Merge two sibling nodes into one line. Free merge when the join
     /// fits in NODE bytes — no model call (OptChat §3 "free nodes").
-    fn merge_pair(&self, left: &SummaryNode, right: &SummaryNode) -> (String, bool) {
+    async fn merge_pair(&self, left: &SummaryNode, right: &SummaryNode) -> (String, bool) {
         let joined = format!("{}\n{}", left.summary, right.summary);
         if joined.len() <= NODE_BYTES {
             (joined, true)
         } else {
-            (self.backend.merge(&left.summary, &right.summary), false)
+            (self.backend.merge(&left.summary, &right.summary).await, false)
         }
     }
 
@@ -172,7 +185,7 @@ impl HistoryCompressor {
     /// Each call merges the cheapest adjacent sibling pair into its parent
     /// (fewer view lines, coarser summaries). Returns false when nothing
     /// more can be merged.
-    pub fn merge_adjacent(&self, root: &mut SummaryNode) -> bool {
+    pub async fn merge_adjacent(&self, root: &mut SummaryNode) -> bool {
         // Locate the parent of the mergeable pair with the smallest
         // combined size; `path` records the right/left turns taken.
         fn find<'a>(
@@ -213,7 +226,7 @@ impl HistoryCompressor {
 
         let left = cur.left.take().expect("found pair");
         let right = cur.right.take().expect("found pair");
-        let (summary, verbatim) = self.merge_pair(&left, &right);
+        let (summary, verbatim) = self.merge_pair(&left, &right).await;
         cur.summary = summary;
         cur.size_bytes = cur.summary.len();
         cur.source_range = (left.source_range.0, right.source_range.1);
@@ -286,10 +299,149 @@ fn flatten_newlines(text: &str) -> String {
     text.replace('\n', " ")
 }
 
-/// Summarizer trait: a cheap model or a rule-based fallback.
+/// Summarizer trait: the model compressing history, or a rule-based
+/// fallback. Async because a model-backed summarizer calls the same chat
+/// backend as the agent (with a different system prompt); the rule-based
+/// fallback just resolves immediately. Output is plain `String` — any
+/// failure must be handled inside the implementation by falling back to
+/// rule-based truncation, so compression can never break a turn.
 pub trait Summarizer: Send + Sync {
-    fn summarize(&self, text: &str) -> String;
-    fn merge(&self, left: &str, right: &str) -> String;
+    fn summarize<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+    fn merge<'a>(
+        &'a self,
+        left: &'a str,
+        right: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+}
+
+/// Model-backed Summarizer: asks the agent's chat backend (e.g. SmolVLM
+/// on llama-server) to compress history with a dedicated system prompt.
+/// Suspicious output (empty, rambling, prompt-echo) and backend errors
+/// fall back to rule-based truncation via `head`.
+pub struct ModelSummarizer {
+    backend: Box<dyn Backend>,
+    /// Target byte size for one summary line.
+    budget: usize,
+}
+
+impl ModelSummarizer {
+    pub fn new(backend: Box<dyn Backend>) -> Self {
+        Self {
+            backend,
+            budget: NODE_BYTES,
+        }
+    }
+
+    /// One compression request; None means "fall back to rules".
+    async fn ask(&self, system: String, user: String) -> Option<String> {
+        let prompt = vec![ChatMessage::system(system), ChatMessage::user(user)];
+        let out = self.backend.chat(&prompt).await.ok()?;
+        let out = out.trim().replace('\n', " ");
+        if out.is_empty() || out.len() > self.budget * 2 {
+            return None; // empty or rambling/echoing — let the caller fall back
+        }
+        Some(head(&out, self.budget))
+    }
+}
+
+impl Summarizer for ModelSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+        Box::pin(async move {
+            let system = format!(
+                "You are a history compressor inside a chat agent. Compress the \
+                 given text into ONE line of at most {} bytes, keeping who did \
+                 what and the key facts. Reply with ONLY that line — no \
+                 commentary, no quotes.",
+                self.budget
+            );
+            self.ask(system, text.to_string())
+                .await
+                .unwrap_or_else(|| head(text, self.budget))
+        })
+    }
+
+    fn merge<'a>(
+        &'a self,
+        left: &'a str,
+        right: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+        Box::pin(async move {
+            let system = format!(
+                "You are a history compressor inside a chat agent. Merge the two \
+                 given history lines into ONE line of at most {} bytes, keeping \
+                 the key facts of both. Reply with ONLY the merged line — no \
+                 commentary, no quotes.",
+                self.budget
+            );
+            let user = format!("Line 1: {left}\nLine 2: {right}");
+            match self.ask(system, user).await {
+                Some(merged) => merged,
+                None => format!(
+                    "{}\n{}",
+                    head(left, self.budget / 2),
+                    head(right, self.budget - self.budget / 2)
+                ),
+            }
+        })
+    }
+}
+
+/// Rule-based Summarizer fallback: no model, just keeps the head of the
+/// text within the node budget. Only invoked for messages or joins that
+/// exceed NODE_BYTES — shorter ones are free nodes and never reach this.
+pub struct HeadlineSummarizer;
+
+impl HeadlineSummarizer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for HeadlineSummarizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Summarizer for HeadlineSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+        Box::pin(async move { head(text, NODE_BYTES) })
+    }
+    fn merge<'a>(
+        &'a self,
+        left: &'a str,
+        right: &'a str,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+        Box::pin(async move {
+            // Keep the head of each side, split roughly in half.
+            let half = NODE_BYTES / 2;
+            format!("{}\n{}", head(left, half), head(right, NODE_BYTES - half))
+        })
+    }
+}
+
+/// First `budget` UTF-8 bytes of `text` (cut on a char boundary), with a
+/// marker when anything was dropped.
+fn head(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let cut = text
+        .char_indices()
+        .take_while(|(i, _)| *i < budget.saturating_sub(1)) // room for the ellipsis
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}…", &text[..cut])
 }
 
 #[cfg(test)]
@@ -307,13 +459,26 @@ mod tests {
         }
     }
     impl Summarizer for FakeBackend {
-        fn summarize(&self, text: &str) -> String {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            text.chars().take(NODE_BYTES).collect()
+        fn summarize<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                text.chars().take(NODE_BYTES).collect()
+            })
         }
-        fn merge(&self, left: &str, right: &str) -> String {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            format!("{left} + {right}")
+        fn merge<'a>(
+            &'a self,
+            left: &'a str,
+            right: &'a str,
+        ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("{left} + {right}")
+            })
         }
     }
 
@@ -330,8 +495,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn short_messages_are_free_nodes() {
+    #[tokio::test]
+    async fn short_messages_are_free_nodes() {
         // OptChat §3: source that fits in NODE bytes IS the node,
         // verbatim, with no model call.
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -341,7 +506,7 @@ mod tests {
             chat_msg(MessageKind::Human, "hello there"),
             chat_msg(MessageKind::Agent, "hi! how can I help?"),
         ];
-        let tree = c.compress(&messages);
+        let tree = c.compress(&messages).await;
 
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -353,15 +518,15 @@ mod tests {
         assert!(tree.summary.contains("talk: hi! how can I help?"));
     }
 
-    #[test]
-    fn long_messages_cost_model_calls() {
+    #[tokio::test]
+    async fn long_messages_cost_model_calls() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_clone = std::sync::Arc::clone(&calls);
         let c = HistoryCompressor::new(Box::new(FakeBackend::new(calls)), 128_000);
 
         let long = "x".repeat(NODE_BYTES * 2);
         let messages = vec![chat_msg(MessageKind::Human, &long)];
-        let tree = c.compress(&messages);
+        let tree = c.compress(&messages).await;
 
         assert_eq!(
             std::sync::Arc::clone(&calls_clone).load(std::sync::atomic::Ordering::SeqCst),
@@ -370,20 +535,20 @@ mod tests {
         assert!(!tree.verbatim);
     }
 
-    #[test]
-    fn sizes_are_bytes_not_tokens() {
+    #[tokio::test]
+    async fn sizes_are_bytes_not_tokens() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = HistoryCompressor::new(Box::new(FakeBackend::new(calls)), 128_000);
         let messages = vec![chat_msg(
             MessageKind::Human,
             "héllo wörld", // multibyte chars
         )];
-        let tree = c.compress(&messages);
+        let tree = c.compress(&messages).await;
         assert_eq!(tree.size_bytes, tree.summary.len());
     }
 
-    #[test]
-    fn merge_adjacent_reduces_flatten_size() {
+    #[tokio::test]
+    async fn merge_adjacent_reduces_flatten_size() {
         let c = HistoryCompressor::new(
             Box::new(FakeBackend::new(std::sync::Arc::new(
                 std::sync::atomic::AtomicUsize::new(0),
@@ -398,10 +563,10 @@ mod tests {
             chat_msg(MessageKind::Human, &long),
             chat_msg(MessageKind::Human, &long),
         ];
-        let mut tree = c.compress(&messages);
+        let mut tree = c.compress(&messages).await;
         let before = c.flatten(&tree).len();
 
-        assert!(c.merge_adjacent(&mut tree));
+        assert!(c.merge_adjacent(&mut tree).await);
         let after = c.flatten(&tree).len();
         assert!(
             after < before,
@@ -409,12 +574,12 @@ mod tests {
         );
 
         // Eventually nothing left to merge.
-        while c.merge_adjacent(&mut tree) {}
+        while c.merge_adjacent(&mut tree).await {}
         assert!(tree.left.is_none() && tree.right.is_none());
     }
 
-    #[test]
-    fn zoom_range_loads_full_text() {
+    #[tokio::test]
+    async fn zoom_range_loads_full_text() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut c = HistoryCompressor::new(Box::new(FakeBackend::new(calls)), 128_000);
         let long = "z".repeat(NODE_BYTES * 2);
@@ -422,7 +587,7 @@ mod tests {
             chat_msg(MessageKind::Human, &long),
             chat_msg(MessageKind::Human, &long),
         ];
-        let mut tree = c.compress(&messages);
+        let mut tree = c.compress(&messages).await;
 
         zoom_range(&mut tree, &messages, 0, 2);
         let flat = c.flatten(&tree);

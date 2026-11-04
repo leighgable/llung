@@ -19,6 +19,7 @@ mod events;
 mod prefix_text;
 mod registration_panel;
 mod taffy_ui;
+mod theme;
 
 use app::App;
 

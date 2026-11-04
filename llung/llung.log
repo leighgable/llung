@@ -1,0 +1,29 @@
+2026-11-03T19:07:18.700887Z  INFO libp2p_swarm: local_peer_id=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-11-03T19:07:18.704109Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.20.10.2
+2026-11-03T19:07:18.704396Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-11-03T19:07:18.704704Z  INFO llung_core::network::engine: DHT: now providing media cid bafkreiemihk7tn37ed2rw62rcosrhlxwj7mrtskdz3rljqw3xix3s43bwq
+2026-11-03T19:07:18.705069Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/33851
+2026-11-03T19:07:18.705230Z  INFO llung_core::network::engine: Node listening on: /ip4/172.20.10.2/tcp/33851
+2026-11-03T19:07:18.705364Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/33851
+2026-11-03T19:07:18.705821Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/42141/quic-v1
+2026-11-03T19:07:18.706985Z  INFO llung_core::network::engine: Node listening on: /ip4/172.20.10.2/udp/42141/quic-v1
+2026-11-03T19:07:18.707153Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/42141/quic-v1
+2026-11-03T19:07:19.209290Z  WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
+2026-11-03T19:07:29.812097Z  INFO libp2p_swarm: local_peer_id=12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt
+2026-11-03T19:07:29.815990Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.20.10.2
+2026-11-03T19:07:29.816270Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-11-03T19:07:29.816925Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/37187
+2026-11-03T19:07:29.817149Z  INFO llung_core::network::engine: Node listening on: /ip4/172.20.10.2/tcp/37187
+2026-11-03T19:07:29.817370Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/37187
+2026-11-03T19:07:29.818225Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/44417/quic-v1
+2026-11-03T19:07:29.818644Z  INFO llung_core::network::engine: Node listening on: /ip4/172.20.10.2/udp/44417/quic-v1
+2026-11-03T19:07:29.818939Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/44417/quic-v1
+2026-11-03T19:07:29.822062Z  INFO agent_rt: Wasm Background Worker Active.
+2026-11-03T19:07:29.824890Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/172.20.10.2/tcp/33851/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-11-03T19:07:29.825054Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/172.20.10.2/udp/42141/quic-v1/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-11-03T19:07:29.825214Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt address=/ip4/172.17.0.1/tcp/37187/p2p/12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt
+2026-11-03T19:07:29.825355Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt address=/ip4/172.17.0.1/udp/44417/quic-v1/p2p/12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt
+2026-11-03T19:07:29.826000Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/172.17.0.1/tcp/33851/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-11-03T19:07:29.826158Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK address=/ip4/172.17.0.1/udp/42141/quic-v1/p2p/12D3KooWEPNXaKRV8jG6Uhni7LHU1G7pLX9gFnPfduudR7XxuvMK
+2026-11-03T19:07:29.827069Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt address=/ip4/172.20.10.2/tcp/37187/p2p/12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt
+2026-11-03T19:07:29.828283Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt address=/ip4/172.20.10.2/udp/44417/quic-v1/p2p/12D3KooWRqvEf6kFmXbwUN9JCneYuZFvHFQbountxTnL8WEB6sUt

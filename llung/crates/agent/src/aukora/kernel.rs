@@ -54,6 +54,16 @@ pub struct KernelState {
     pub current_history_root: [u8; 32], // Current Merkle root
 }
 
+impl Default for KernelState {
+    fn default() -> Self {
+        Self {
+            pinned_keys: HashSet::new(),
+            executed_nonces: HashSet::new(),
+            current_history_root: [0u8; 32],
+        }
+    }
+}
+
 /// Canonical manifest/receipt hashing. Grant verification recomputes this,
 /// so there must be exactly ONE code path (same serialization, same hash).
 pub fn compute_sha256<T: Serialize>(value: &T) -> [u8; 32] {

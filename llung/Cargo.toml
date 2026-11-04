@@ -7,6 +7,7 @@ members = [
   "crates/ios-bridge",
   "crates/agent",
   "crates/agent-rt",
+  "crates/tools/landscape",
 ]
 
 resolver = "2"
@@ -24,5 +25,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde_json = "1.0.151"
 cid = "0.11.3"
 sha2 = "0.11.0"
-multihash = "0.19.5"
 image = "0.25.10"

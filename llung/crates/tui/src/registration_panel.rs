@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use crate::theme::{Role, Theme};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use std::path::PathBuf;
 
@@ -143,37 +144,38 @@ impl RegistrationPanel {
         };
     }
 
-    pub fn render(&self, buf: &mut Buffer, area: Rect) {
+    pub fn render(&self, buf: &mut Buffer, area: Rect, theme: &Theme) {
+        let canvas_bg = theme.bg(Role::Canvas);
         // Clear area
         for y in area.y..(area.y + area.height) {
             for x in area.x..(area.x + area.width) {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(Color::Black);
+                    cell.set_bg(canvas_bg);
                 }
             }
         }
 
         let block = Block::default()
-            .title(" Create Your Identity ")
+            .title(Line::styled(" Create Your Identity ", theme.style(Role::PanelTitle)))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White));
+            .border_style(theme.style(Role::BorderAccent));
 
         let inner = block.inner(area);
         block.render(area, buf);
 
         let name_style = if self.focus == FieldFocus::Name {
-            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+            theme.style(Role::Selected)
         } else {
-            Style::default()
+            theme.style(Role::Text)
         };
         let name_para = Paragraph::new(format!("Name: {}", self.display_name)).style(name_style);
         name_para.render(Rect::new(inner.x, inner.y + 1, inner.width, 1), buf);
 
         let avatar_style = if self.focus == FieldFocus::Avatar {
-            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+            theme.style(Role::Selected)
         } else {
-            Style::default()
+            theme.style(Role::Text)
         };
         let avatar_para =
             Paragraph::new(format!("Avatar (optional): {}", self.avatar_path)).style(avatar_style);
@@ -182,24 +184,24 @@ impl RegistrationPanel {
         // Live resolution status, so the user can see *where* the app is looking.
         if let Some((line, ok)) = self.avatar_status() {
             let status_style = if ok {
-                Style::default().fg(Color::Green)
+                theme.style(Role::Success)
             } else {
-                Style::default().fg(Color::Red)
+                theme.style(Role::Error)
             };
             let status = Paragraph::new(line).style(status_style);
             status.render(Rect::new(inner.x + 2, inner.y + 4, inner.width.saturating_sub(2), 1), buf);
         }
 
         let submit_style = if self.focus == FieldFocus::Submit {
-            Style::default().fg(Color::Black).bg(Color::Green)
+            theme.style(Role::ButtonFocused)
         } else {
-            Style::default().fg(Color::Green)
+            theme.style(Role::Button)
         };
         let submit = Paragraph::new(" [ Submit ] ").style(submit_style);
         submit.render(Rect::new(inner.x, inner.y + 6, inner.width, 1), buf);
 
         if let Some(ref err) = self.error_message {
-            let err_para = Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red));
+            let err_para = Paragraph::new(err.as_str()).style(theme.style(Role::Error));
             err_para.render(Rect::new(inner.x, inner.y + 8, inner.width, 1), buf);
         }
 
@@ -209,7 +211,7 @@ impl RegistrationPanel {
         let hint = Paragraph::new(format!(
             "Tab switches fields · relative paths resolve from {cwd} · ~ is expanded"
         ))
-        .style(Style::default().fg(Color::DarkGray));
+        .style(theme.style(Role::Dim));
         hint.render(
             Rect::new(
                 inner.x,

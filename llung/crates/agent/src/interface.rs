@@ -1,25 +1,36 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use serde::{Deserialize, Serialize};
 
-use llung_core::network::message::{AgentResult, Backend, ChatMessage};
+use llung_core::network::message::{AgentResult, ChatMessage};
 
-/// A pluggable LLM backend. Implementations must be safe to call from
-/// the agent bridge task. Boxed (not `impl Future`) so the trait stays
-/// dyn-compatible for `Box<dyn LlmBackend>`.
-pub trait LlmBackend: Send + Sync {
+use crate::config::AgentConfig;
+
+pub trait Backend: Send + Sync {
     fn chat(
         &self,
         messages: &[ChatMessage],
-    ) -> std::pin::Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>>;
 }
 
-/// Talks to any OpenAI-compatible `/v1/chat/completions` endpoint.
-/// One implementation covers ollama (http://localhost:11434/v1),
-/// vLLM, and llama.cpp's llama-server — they differ only in
-/// base URL and model name.
 pub struct OpenAiCompatible {
     base_url: String,
     model: String,
     client: reqwest::Client,
+}
+
+/// Cheap to clone: two strings plus a shared connection pool. Lets the
+/// TUI hand one backend to the agent's chat loop and another to the
+/// history compressor.
+impl Clone for OpenAiCompatible {
+    fn clone(&self) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            client: self.client.clone(),
+        }
+    }
 }
 
 impl OpenAiCompatible {
@@ -30,13 +41,36 @@ impl OpenAiCompatible {
             client: reqwest::Client::new(),
         }
     }
+
+    pub fn llama_server(port: u16) -> Self {
+        Self::new(format!("http://localhost:{port}/v1"), "SmolVLM")
+    }
+
+    /// Build a backend from an agent config: an explicit `model_url`
+    /// wins, otherwise fall back to the default llama-server port.
+    pub fn from_config(config: &AgentConfig) -> Self {
+        match &config.model_url {
+            Some(url) => Self::new(url.clone(), config.model.clone()),
+            None => Self::llama_server(9931),
+        }
+    }
 }
 
+/// Wire format for `/v1/chat/completions`. ChatMessage carries a lot of
+/// llung-specific fields (topic, sender, DAG parent, ...); the endpoint
+/// only wants a role and content, so map explicitly instead of
+/// serializing ChatMessage verbatim.
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: Vec<RequestMessage<'a>>,
     stream: bool,
+}
+
+#[derive(Serialize)]
+struct RequestMessage<'a> {
+    role: &'a str,
+    content: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -51,14 +85,24 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    content: String,
+    content: Option<String>,
 }
 
-impl LlmBackend for OpenAiCompatible {
+fn to_request_messages(messages: &[ChatMessage]) -> Vec<RequestMessage<'_>> {
+    messages
+        .iter()
+        .map(|m| RequestMessage {
+            role: m.agent_role(),
+            content: &m.content,
+        })
+        .collect()
+}
+
+impl Backend for OpenAiCompatible {
     fn chat(
         &self,
         messages: &[ChatMessage],
-    ) -> std::pin::Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = AgentResult<String>> + Send + '_>> {
         // Clone what the request needs so the future owns its data and
         // no borrowed lifetimes leak into the boxed type.
         let model = self.model.clone();
@@ -73,7 +117,7 @@ impl LlmBackend for OpenAiCompatible {
                 .post(url)
                 .json(&ChatRequest {
                     model: &model,
-                    messages: &messages,
+                    messages: to_request_messages(&messages),
                     stream: false,
                 })
                 .send()
@@ -85,8 +129,9 @@ impl LlmBackend for OpenAiCompatible {
             body.choices
                 .into_iter()
                 .next()
-                .map(|c| c.message.content)
-                .ok_or_else(|| "LLM backend returned no choices".into())
+                .and_then(|c| c.message.content)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| "model backend returned no content".into())
         })
     }
 }

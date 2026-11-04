@@ -42,7 +42,7 @@ impl Database {
         let secret = keypair.to_protobuf_encoding()?;
 
         self.conn.execute(
-            "INSERT INTO machines (peer_id, being_id, device_name, secret_key)
+            "INSERT INTO machines (peer_id, being_id, machine_name, secret_key)
             VALUES (?1, NULL, ?2, ?3)",
             (&peer_id.to_base58(), device_name, &secret),
         )?;
@@ -538,5 +538,50 @@ impl Database {
             .prepare("SELECT image_bytes FROM avatar_cache WHERE cid = ?1")?;
         let mut rows = stmt.query_map([cid], |row| row.get::<_, Vec<u8>>(0))?;
         Ok(rows.next().transpose()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("llung-db-test-{tag}-{nanos}.sqlite"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Regression: `/agent spawn` provisions a machine + being. The INSERT
+    /// in `create_machine` must target the `machine_name` column the
+    /// schema actually defines (it once said `device_name` and crashed
+    /// with "table machines has no column named device_name").
+    #[test]
+    fn agent_provisioning_inserts_machine_and_being() {
+        let path = temp_db_path("provision");
+        let (db, _human_machine) = Database::new(&path).unwrap();
+
+        let agent_machine = db.create_machine("plotter").unwrap();
+        assert_eq!(agent_machine.device_name, "plotter");
+
+        let being = db
+            .create_being_for_machine(
+                &agent_machine.peer_id.to_base58(),
+                "plotter",
+                BeingKind::Agent,
+            )
+            .unwrap();
+        assert_eq!(being.human_name, "plotter");
+        assert_eq!(being.kind, BeingKind::Agent);
+
+        // Reload from disk: the agent's machine row must be intact.
+        let db2 = Database::open(&path).unwrap();
+        let _ = db2.load_being().expect("db reopens after provisioning");
+
+        std::fs::remove_file(&path).ok();
     }
 }

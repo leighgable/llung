@@ -8,6 +8,16 @@ pub struct AvatarThumbnail {
     pixels: Vec<(Color, Color)>, // (top_fg, bottom_bg) per cell
 }
 
+impl AvatarThumbnail {
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+}
+
 pub fn decode_avatar_hex(bytes: &[u8], cell_width: u16) -> Option<AvatarThumbnail> {
     let img = image::load_from_memory(bytes).ok()?;
     let cell_height = cell_width / 2; // terminal cells are ~2:1, so 4x2 cells = 4x4 pixels
@@ -66,13 +76,13 @@ pub fn render_avatar(buf: &mut Buffer, x: u16, y: u16, thumb: &AvatarThumbnail) 
     }
 }
 
-pub fn fallback_avatar(buf: &mut Buffer, x: u16, y: u16, initial: char, bg: Color) {
+pub fn fallback_avatar(buf: &mut Buffer, x: u16, y: u16, initial: char, bg: Color, fg: Color) {
     let initial_str = initial.to_string();
     for dy in 0..2 {
         for dx in 0..2 {
             if let Some(cell) = buf.cell_mut((x + dx, y + dy)) {
                 cell.set_bg(bg);
-                cell.set_fg(Color::White);
+                cell.set_fg(fg);
                 cell.set_symbol(if dx == 0 && dy == 0 {
                     &initial_str
                 } else {

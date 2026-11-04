@@ -29,10 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (app, mut event_rx) = LlungApp::init(
         CoreConfig {
             db_path,
-            agent: None,
             chat_topic: "introductions".into(),
         },
-        db,
         machine,
         being,
     )

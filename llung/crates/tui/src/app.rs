@@ -1,14 +1,19 @@
-use crate::avatar::{fallback_avatar, render_avatar};
+use crate::avatar::{decode_avatar_hex, fallback_avatar, render_avatar};
 use crate::prefix_text::PrefixText;
 use crate::registration_panel::RegistrationPanel;
 use crate::{chat_panel::ChatPanel, taffy_ui::TaffyUi};
+use agent::config::AgentConfig;
+use agent::history::{HistoryCompressor, ModelSummarizer};
+use agent::interface::OpenAiCompatible;
+use agent::{AgentLoopContext, run_agent_loop};
+use core::option::Option::None;
 use crossterm::{
     ExecutableCommand,
     event::{Event, KeyCode, KeyEventKind, KeyModifiers},
 };
 use libp2p::{PeerId, gossipsub::IdentTopic};
-use llung_core::utils::generate_cid_from_bytes;
 use llung_core::protocol::invite::InvitePayload;
+use llung_core::utils::generate_cid_from_bytes;
 use llung_core::{
     app::LlungApp,
     config::CoreConfig,
@@ -19,7 +24,7 @@ use llung_core::{
     },
     network::{
         NetworkCommand, NetworkEvent,
-        message::{ChatMessage, MessageKind},
+        message::{Attachment, AttachmentKind, ChatMessage, MessageKind},
     },
     storage::db::Database,
 };
@@ -27,9 +32,12 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::Rect,
-    style::{Color, Modifier, Style},
 };
+use serde_json;
+
+use crate::theme::{Role, Theme};
 use std::collections::HashMap;
+use std::error::Error;
 use std::io;
 use std::result::Result;
 // use taffy::{Dimension, Display, FlexDirection, NodeId, Size, TaffyTree};
@@ -69,6 +77,7 @@ pub struct App {
     my_name: String,
 
     taffy_ui: TaffyUi,
+    theme: Theme,
 
     // Content
     screen: AppScreen,
@@ -85,6 +94,11 @@ pub struct App {
 
     peer_id: String,
     known_peers: HashMap<String, PeerInfo>,
+    /// Local agents spawned via `/agent spawn`: name -> the command
+    /// channel of the agent's own network stack. Everything else about
+    /// an agent (being_id, avatar, presence) lives in `known_peers`,
+    /// same as any remote peer — this is the only peer-specific extra.
+    agent_cmd_txs: HashMap<String, mpsc::Sender<NetworkCommand>>,
 }
 
 impl App {
@@ -105,6 +119,7 @@ impl App {
             cmd_tx: None,
             my_name: String::new(),
             taffy_ui: TaffyUi::new_chat_layout(size.width, size.height, false),
+            theme: Theme::from_env(),
             screen: AppScreen::Splash,
             chat_panel: ChatPanel::new(String::new()),
             registration: RegistrationPanel::new(),
@@ -117,13 +132,11 @@ impl App {
             current_topic: "introductions".to_string(),
             peer_id: machine.peer_id.to_base58(),
             known_peers: HashMap::new(),
+            agent_cmd_txs: HashMap::new(),
         }
     }
 
-    pub async fn run(
-        &mut self,
-        db: &mut Database,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self, db: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
         let (term_tx, mut term_rx) = mpsc::channel::<Event>(32);
         crate::events::spawn_terminal_reader(term_tx);
 
@@ -187,7 +200,7 @@ impl App {
                         }
                     }
                 }
-                // Disabled until the network comes up (registration complete).
+                // Disabled until the network registration complete
                 Some(net_ev) = async {
                     match event_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -249,7 +262,11 @@ impl App {
                 .map_err(|e| format!("'{q}' is not a valid peer id: {e}")),
             _ => Err(format!(
                 "'{q}' is ambiguous — it matches: {}",
-                matches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                matches
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }
@@ -280,14 +297,22 @@ impl App {
     }
 
     fn load_missing_avatars(&mut self, db: &Database) {
-        for info in self.known_peers.values_mut() {
+        let mut loaded: Vec<(String, crate::avatar::AvatarThumbnail)> = Vec::new();
+        for (id, info) in self.known_peers.iter_mut() {
             if info.avatar.is_some() || info.avatar_cid.is_none() {
                 continue;
             }
             let cid = info.avatar_cid.as_ref().unwrap();
             if let Ok(Some(bytes)) = db.get_avatar_cache(cid) {
-                info.avatar = crate::avatar::decode_avatar_hex(&bytes, 4);
+                if let Some(thumb) = decode_avatar_hex(&bytes, 4) {
+                    info.avatar = Some(thumb.clone());
+                    loaded.push((id.clone(), thumb));
+                }
             }
+        }
+        // Avatars often arrive after the messages did; retro-attach them.
+        for (id, thumb) in loaded {
+            self.chat_panel.update_peer_avatar(&id, &thumb);
         }
     }
 
@@ -315,7 +340,7 @@ impl App {
                     let is_command = self.input_text.trim().starts_with('/');
                     if is_command {
                         let cmd = std::mem::take(&mut self.input_text);
-                        self.handle_command(cmd.trim()).await?;
+                        self.handle_command(cmd.trim(), db).await?;
                     } else if !self.input_text.trim().is_empty() {
                         let text = std::mem::take(&mut self.input_text);
                         let text = text.trim().to_string();
@@ -334,17 +359,25 @@ impl App {
                             kind: MessageKind::Human,
                         };
 
-                        let _ = db.save_message(&msg);
+                        if let Err(e) = db.save_message(&msg) {
+                            self.report_error("Failed to save message", e);
+                        }
                         let my_avatar = self
                             .known_peers
                             .get(&self.peer_id)
                             .and_then(|i| i.avatar.clone());
                         let my_id = self.peer_id.clone();
-                        self.chat_panel
-                            .push(my_id, self.my_name.clone(), text.clone(), my_avatar);
+                        self.chat_panel.push(
+                            my_id,
+                            self.my_name.clone(),
+                            text.clone(),
+                            my_avatar,
+                            None,
+                        );
+
                         let cmd = NetworkCommand::PublishMessage {
                             topic: IdentTopic::new(&self.current_topic),
-                            contents: text.into_bytes(),
+                            contents: serde_json::to_vec(&msg)?,
                         };
                         if let Some(tx) = &self.cmd_tx {
                             tx.send(cmd).await?;
@@ -375,63 +408,163 @@ impl App {
                 data,
                 topic,
             } => {
-                let sender_id = sender.to_base58();
+                if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&data) {
+                    self.handle_chat_message(msg, db);
+                    return;
+                }
 
                 if let Ok(presence) = serde_json::from_slice::<PresenceMessage>(&data) {
-                    let human_name = presence.human_name;
-                    self.known_peers.insert(
-                        sender_id.clone(),
-                        PeerInfo {
-                            name: human_name.clone(),
-                            avatar_cid: presence.avatar_cid,
-                            avatar: None, // lazy loaded
-                            enc_public_key: presence.enc_public_key,
-                        },
-                    );
-                    // Messages received before presence get their names now.
-                    self.chat_panel.update_peer_name(&sender_id, &human_name);
+                    self.handle_presence(sender, presence);
                     return;
                 }
 
                 let text = String::from_utf8_lossy(&data).into_owned();
-
-                let sender_name = self
-                    .known_peers
-                    .get(&sender_id)
-                    .map(|info| info.name.clone())
-                    .unwrap_or_else(|| "Unknown".to_string());
-
-                let timestamp = chrono::Utc::now().timestamp();
-                let msg = ChatMessage {
-                    id: generate_cid_from_bytes(
-                        &(sender.to_base58() + &text + &timestamp.to_string()).into_bytes(),
-                    )
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
-                    topic: topic.clone(),
-                    parent_id: None, // Todo reply threading
-                    sender_id: sender.to_base58(),
-                    sender_name: sender_name.clone(),
-                    content: text.clone(),
-                    timestamp: timestamp as u64,
-                    kind: MessageKind::Human,
-                };
-
-                let _ = db.save_message(&msg);
-
-                if topic == self.current_topic {
-                    let avatar = self
-                        .known_peers
-                        .get(&sender_id)
-                        .and_then(|info| info.avatar.clone());
-
-                    self.chat_panel.push(sender_id, msg.sender_name, text, avatar);
-                }
+                self.handle_raw_text(sender, topic, text, db);
             }
 
             NetworkEvent::DirectMessageReceived { sender, payload } => {
                 self.handle_direct_message(sender, payload, db);
             }
             _ => {}
+        }
+    }
+
+    /// Surface an error in the chat panel as a system message.
+    fn report_error(&mut self, context: &str, e: impl std::fmt::Display) {
+        self.chat_panel.push(
+            "system".into(),
+            "system".into(),
+            format!("{context}: {e}"),
+            None,
+            None,
+        );
+    }
+
+    fn handle_chat_message(&mut self, msg: ChatMessage, db: &Database) {
+        // Save to local history
+        if let Err(e) = db.save_message(&msg) {
+            self.report_error("Failed to save message", e);
+        }
+
+        // Learn new peers by their stable being_id
+        if !msg.sender_name.is_empty() && !self.known_peers.contains_key(&msg.sender_id) {
+            self.known_peers.insert(
+                msg.sender_id.clone(),
+                PeerInfo {
+                    name: msg.sender_name.clone(),
+                    avatar_cid: None,
+                    avatar: None,
+                    enc_public_key: None,
+                },
+            );
+        }
+
+        // Only render if it's the current topic
+        if msg.topic != self.current_topic {
+            return;
+        }
+
+        let avatar = self
+            .known_peers
+            .get(&msg.sender_id)
+            .and_then(|i| i.avatar.clone());
+
+        match msg.kind {
+            MessageKind::Human | MessageKind::Agent => {
+                self.chat_panel
+                    .push(msg.sender_id, msg.sender_name, msg.content, avatar, None);
+            }
+
+            MessageKind::Media(ref attachment) => {
+                // Decode thumbnail if we have the bytes locally
+                if attachment.kind == AttachmentKind::Image {
+                    if let Ok(Some(bytes)) = db.get_avatar_cache(&attachment.cid) {
+                        if let Some(thumb) = decode_avatar_hex(&bytes, 6) {
+                            self.chat_panel
+                                .thumb_cache
+                                .insert(attachment.cid.clone(), thumb);
+                        }
+                    }
+                }
+                self.chat_panel.push(
+                    msg.sender_id,
+                    msg.sender_name,
+                    msg.content, // caption
+                    avatar,
+                    Some(attachment.clone()),
+                );
+            }
+
+            MessageKind::System => {
+                self.chat_panel
+                    .push("system".into(), "system".into(), msg.content, None, None);
+            }
+
+            MessageKind::ToolCall { .. }
+            | MessageKind::ToolResponse { .. }
+            | MessageKind::Notes => {
+                // Agents render these; humans might ignore or show collapsed
+            }
+        }
+    }
+
+    fn handle_presence(&mut self, sender: PeerId, presence: PresenceMessage) {
+        // Key by being_id if your PresenceMessage has it, otherwise by peer_id
+        let key = if presence.being_id.is_empty() {
+            sender.to_base58()
+        } else {
+            presence.being_id.clone()
+        };
+        self.known_peers.insert(
+            key.clone(),
+            PeerInfo {
+                name: presence.human_name.clone(),
+                avatar_cid: presence.avatar_cid,
+                avatar: None,
+                enc_public_key: presence.enc_public_key,
+            },
+        );
+        // Presence may arrive after the peer's messages did.
+        self.chat_panel.update_peer_name(&key, &presence.human_name);
+    }
+
+    fn handle_raw_text(&mut self, sender: PeerId, topic: String, text: String, db: &Database) {
+        let sender_id = sender.to_base58();
+        let sender_name = self
+            .known_peers
+            .get(&sender_id)
+            .map(|i| i.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                // Raw-text peer we haven't identified: short id beats "unknown".
+                let mut short = sender_id.clone();
+                short.truncate(8);
+                short
+            });
+
+        let msg = ChatMessage {
+            id: generate_cid_from_bytes(&(sender_id.clone() + &text).as_bytes())
+                .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+            topic: topic.clone(),
+            parent_id: None,
+            sender_id: sender_id.clone(),
+            sender_name: sender_name.clone(),
+            content: text.clone(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            kind: MessageKind::Human,
+        };
+
+        if let Err(e) = db.save_message(&msg) {
+            self.report_error("Failed to save message", e);
+        }
+
+        if topic == self.current_topic {
+            let avatar = self
+                .known_peers
+                .get(&sender_id)
+                .and_then(|i| i.avatar.clone());
+            self.chat_panel
+                .push(sender_id, sender_name, text, avatar, None);
         }
     }
 
@@ -445,6 +578,7 @@ impl App {
         let peers = &self.known_peers;
         let chats = &self.chats;
         let current_topic = &self.current_topic;
+        let theme = &self.theme;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -457,14 +591,14 @@ impl App {
 
             match screen {
                 AppScreen::Splash => {
-                    Self::render_splash(buf, area);
+                    Self::render_splash(buf, area, theme);
                 }
                 AppScreen::Registration => {
-                    registration.render(buf, area);
+                    registration.render(buf, area, theme);
                 }
                 AppScreen::Chat => {
-                    chat_panel.render(buf, chat_rect);
-                    Self::render_input_buf(buf, input_rect, input_text);
+                    chat_panel.render(buf, chat_rect, theme);
+                    Self::render_input_buf(buf, input_rect, input_text, theme);
                     Self::render_sidebar_buf(
                         buf,
                         sidebar_rect,
@@ -472,6 +606,7 @@ impl App {
                         peers,
                         chats,
                         current_topic,
+                        theme,
                     );
                 }
             }
@@ -480,19 +615,19 @@ impl App {
         Ok(())
     }
 
-    fn render_splash(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    fn render_splash(buf: &mut ratatui::buffer::Buffer, area: Rect, theme: &Theme) {
+        let canvas_bg = theme.bg(Role::Canvas);
         for y in area.y..(area.y + area.height) {
             for x in area.x..(area.x + area.width) {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(Color::Black);
+                    cell.set_bg(canvas_bg);
                 }
             }
         }
 
-        let center = |text: &str| -> u16 {
-            area.x + area.width.saturating_sub(text.len() as u16) / 2
-        };
+        let center =
+            |text: &str| -> u16 { area.x + area.width.saturating_sub(text.len() as u16) / 2 };
         let mid = area.y + area.height / 2;
 
         let logo = "llung";
@@ -500,14 +635,14 @@ impl App {
             center(logo),
             mid.saturating_sub(2),
             logo,
-            Style::default().fg(Color::Cyan),
+            theme.style(Role::Logo),
         );
         let status = "loading account…";
         buf.set_string(
             center(status),
             mid,
             status,
-            Style::default().fg(Color::DarkGray),
+            theme.style(Role::Muted),
         );
     }
 
@@ -528,7 +663,7 @@ impl App {
         let text = String::from_utf8_lossy(&plaintext).into_owned();
         let dm_id = sender.to_base58();
         let dm_name = format!("[DM] {}", self.resolve_name(&sender));
-        self.chat_panel.push(dm_id, dm_name, text, None);
+        self.chat_panel.push(dm_id, dm_name, text, None, None);
     }
 
     pub fn handle_invite(&mut self, sender: PeerId, invite: InvitePayload) {
@@ -546,6 +681,7 @@ impl App {
                 from, invite.display_name, topic_id
             ),
             None,
+            None,
         );
     }
 
@@ -558,7 +694,14 @@ impl App {
             .unwrap_or_else(|| id[..8.min(id.len())].to_string())
     }
 
-    fn render_input_buf(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
+    fn render_input_buf(
+        buf: &mut ratatui::buffer::Buffer,
+        area: Rect,
+        text: &str,
+        theme: &Theme,
+    ) {
+        let canvas_bg = theme.bg(Role::Canvas);
+        let border = theme.style(Role::BorderMuted);
         let buf_area = buf.area().clone();
 
         let x0 = area.x.min(buf_area.width);
@@ -570,7 +713,7 @@ impl App {
             for x in x0..x1 {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(Color::Black);
+                    cell.set_bg(canvas_bg);
                 }
             }
         }
@@ -578,6 +721,7 @@ impl App {
         for x in x0..x1 {
             if let Some(cell) = buf.cell_mut((x, y0)) {
                 cell.set_symbol("─");
+                cell.set_style(border);
             }
         }
 
@@ -598,7 +742,7 @@ impl App {
             if y >= y1 {
                 break;
             }
-            buf.set_string(x0 + 1, y, line, Style::default());
+            buf.set_string(x0 + 1, y, line, theme.style(Role::Text));
         }
     }
 
@@ -609,7 +753,9 @@ impl App {
         peers: &HashMap<String, PeerInfo>,
         chats: &[String],
         current_topic: &str,
+        theme: &Theme,
     ) {
+        let panel_bg = theme.bg(Role::Panel);
         let buf_area = buf.area().clone();
         let x0 = area.x.min(buf_area.width);
         let y0 = area.y.min(buf_area.height);
@@ -621,7 +767,7 @@ impl App {
             for x in x0..x1 {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
-                    cell.set_bg(Color::DarkGray);
+                    cell.set_bg(panel_bg);
                 }
             }
         }
@@ -629,7 +775,7 @@ impl App {
         match mode {
             SidebarMode::Hidden => {}
             SidebarMode::Peers => {
-                buf.set_string(x0 + 1, y0, " Peers ", Style::default().fg(Color::White));
+                buf.set_string(x0 + 1, y0, " Peers ", theme.style(Role::PanelTitle));
                 let mut y = y0 + 2;
                 for (peer_id, info) in peers.iter() {
                     if y + 2 >= y1 {
@@ -641,9 +787,14 @@ impl App {
                         render_avatar(buf, x0 + 1, y, thumb);
                     } else {
                         let initial = info.name.chars().next().unwrap_or('?');
-                        let hash = peer_id.bytes().fold(0u8, |a, b| a.wrapping_mul(b));
-                        let bg = Color::Rgb(hash, hash.wrapping_mul(7), hash.wrapping_mul(13));
-                        fallback_avatar(buf, x0 + 1, y, initial, bg);
+                        fallback_avatar(
+                            buf,
+                            x0 + 1,
+                            y,
+                            initial,
+                            theme.avatar_color(peer_id),
+                            theme.avatar_text(),
+                        );
                     }
 
                     let name = if info.name.is_empty() {
@@ -652,17 +803,20 @@ impl App {
                         &info.name
                     };
                     let avail = (x1.saturating_sub(x0 + 1)) as usize;
-                    buf.set_stringn(x0 + 1, y + 2, name, avail, Style::default().fg(Color::Cyan));
+                    buf.set_stringn(x0 + 1, y + 2, name, avail, theme.style(Role::PeerName));
+
+                    // Avatar (2 rows) + name row + 1 row of padding.
+                    y += 4;
                 }
             }
             SidebarMode::Chats => {
-                buf.set_string(x0 + 1, y0, " Chats ", Style::default().fg(Color::White));
+                buf.set_string(x0 + 1, y0, " Chats ", theme.style(Role::PanelTitle));
                 if chats.is_empty() {
                     buf.set_string(
                         x0 + 1,
                         y0 + 2,
                         "(no chats yet)",
-                        Style::default().fg(Color::DarkGray),
+                        theme.style(Role::Dim),
                     );
                 } else {
                     let avail = (x1.saturating_sub(x0 + 1)) as usize;
@@ -673,11 +827,9 @@ impl App {
                         }
                         let is_current = topic == current_topic;
                         let style = if is_current {
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD)
+                            theme.style(Role::ActiveItem)
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            theme.style(Role::InactiveItem)
                         };
                         buf.set_stringn(x0 + 1, y, format!("#{topic}"), avail, style);
                         y += 1;
@@ -685,18 +837,22 @@ impl App {
                 }
             }
             SidebarMode::Media => {
-                buf.set_string(x0 + 1, y0, " Media ", Style::default().fg(Color::White));
+                buf.set_string(x0 + 1, y0, " Media ", theme.style(Role::PanelTitle));
                 buf.set_string(
                     x0 + 1,
                     y0 + 2,
                     "(empty)",
-                    Style::default().fg(Color::DarkGray),
+                    theme.style(Role::Dim),
                 );
             }
         }
     }
 
-    async fn handle_command(&mut self, cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_command(
+        &mut self,
+        cmd: &str,
+        db: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (name, args) = match cmd.find(' ') {
             Some(i) => (&cmd[..i], cmd[i + 1..].trim()),
             None => (cmd, ""),
@@ -714,7 +870,7 @@ impl App {
             "/invite" => {
                 if let Err(e) = self.handle_invite_command(args).await {
                     self.chat_panel
-                        .push("system".to_string(), "system".to_string(), e, None);
+                        .push("system".to_string(), "system".to_string(), e, None, None);
                 }
             }
             "/join" => {
@@ -729,6 +885,7 @@ impl App {
                         "system".to_string(),
                         "usage: /join #<topic>".to_string(),
                         None,
+                        None,
                     );
                 } else {
                     self.join_topic(topic_id);
@@ -737,45 +894,261 @@ impl App {
                         "system".to_string(),
                         format!("Switched to #{topic_id}"),
                         None,
+                        None,
                     );
                 }
             }
-            _ => {
-                self.chat_panel.push(
-                    "system".to_string(),
-                    "system".to_string(),
-                    format!("Unknown command: {cmd} (try /invite <peer>... #<topic>)"),
-                    None,
-                );
+
+            "/agent" => {
+                let mut parts = args.split_whitespace();
+                let sub = parts.next().unwrap_or("");
+                match sub {
+                    "spawn" => {
+                        let name = parts.next().unwrap_or("").to_string();
+                        if name.is_empty() {
+                            self.chat_panel.push(
+                                "system".into(), "system".into(),
+                                "Usage: /agent spawn <name>".into(),
+                                None, None,
+                            );
+                            return Ok(());
+                        }
+
+                        // Provision in DB: new Being + new Machine
+                        let agent_id = agent::provision_agent(db, &name)?;
+            
+                        // Start the agent's own network stack
+                        let (agent_app, agent_event_rx) = LlungApp::init(
+                            CoreConfig {
+                                db_path: self.config.db_path.clone(),
+                                chat_topic: self.current_topic.clone(),
+                            },
+                            agent_id.machine,
+                            agent_id.being.clone(),
+                        ).await?;
+
+                        // Spawn the agent loop. The Aukora kernel and the
+                        // wasm tool worker are wired up inside `new`; the
+                        // history compressor shares the agent's model
+                        // backend (with a compressor system prompt).
+                        let agent_cmd_tx = agent_app.command_tx();
+                        let agent_config =
+                            AgentConfig { name: name.clone(), ..Default::default() };
+                        let backend = OpenAiCompatible::from_config(&agent_config);
+                        let ctx = AgentLoopContext::new(
+                            agent_config.clone(),
+                            Box::new(backend.clone()),
+                            HistoryCompressor::new(
+                                Box::new(ModelSummarizer::new(Box::new(backend))),
+                                64_000,
+                            ),
+                            Database::open(
+                                self.config.db_path.to_str().ok_or("non-UTF8 db path")?,
+                            )?,
+                            agent_cmd_tx.clone(),
+                            self.current_topic.clone(),
+                            agent_id.being.being_id.clone(),
+                            name.clone(),
+                        );
+                        tokio::spawn(run_agent_loop(ctx, agent_event_rx));
+
+                        // The agent's Being is already a peer (its own
+                        // machine + being in the DB, listed in known_peers
+                        // below). Keep only what /invite needs: a handle
+                        // to tell its network stack to join a topic.
+                        self.agent_cmd_txs.insert(name.clone(), agent_cmd_tx);
+
+                        // Also add to known_peers so presence rendering works
+                        self.known_peers.insert(
+                            agent_id.being.being_id.clone(),
+                            PeerInfo {
+                                name: name.clone(),
+                                avatar_cid: None,
+                                avatar: None,
+                                enc_public_key: None,
+                            }
+                        );
+
+                        self.chat_panel.push(
+                            "system".into(), "system".into(),
+                            format!("Agent '{name}' is ready. Invite it with: /invite {name} #{}", self.current_topic),
+                            None, None,
+                        );
+                    }
+                    _ => {
+                        self.chat_panel.push(
+                            "system".into(), "system".into(),
+                            "Unknown /agent subcommand. Try: /agent spawn <name>".into(),
+                            None, None,
+                        );
+                    }
+                }
             }
+
+            "/attach" => {
+                let rest = args;
+                let (path_str, caption) = if rest.starts_with('"') {
+                    if let Some(end_quote) = rest[1..].find('"') {
+                        let path = &rest[1..=end_quote];
+                        let cap = rest[end_quote + 2..].trim();
+                        (
+                            path,
+                            if cap.is_empty() {
+                                None
+                            } else {
+                                Some(cap.to_string())
+                            },
+                        )
+                    } else {
+                        self.chat_panel.push(
+                            "system".into(),
+                            String::new(),
+                            "Usage: /attach <path> [caption]".into(),
+                            None,
+                            None,
+                        );
+                        return Ok(());
+                    }
+                } else {
+                    let mut parts = rest.splitn(2, ' ');
+                    let path = parts.next().unwrap_or("");
+                    let cap = parts.next().map(|s| s.to_string());
+                    (path, cap)
+                };
+
+                if path_str.is_empty() {
+                    self.chat_panel.push(
+                        "system".into(),
+                        String::new(),
+                        "Usage: /attach <path> [caption]".into(),
+                        None,
+                        None,
+                    );
+                    return Ok(());
+                }
+
+                let expanded = shellexpand::tilde(path_str);
+                let path = std::path::Path::new(expanded.as_ref());
+
+                if !path.exists() {
+                    self.chat_panel.push(
+                        "system".into(),
+                        String::new(),
+                        format!("File not found: {}", path.display()),
+                        None,
+                        None,
+                    );
+                    return Ok(());
+                }
+
+                if let Err(e) = self.send_attachment(path, caption, db).await {
+                    self.chat_panel.push(
+                        "system".into(),
+                        String::new(),
+                        format!("Failed to attach: {e}"),
+                        None,
+                        None,
+                    );
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    /// /invite <peer> [peer...] #<topic> [display name]
-    ///
-    /// The `#` sigil delimits peers from the topic: everything before it is a
-    /// peer list, the token itself is the topic, and anything after is an
-    /// optional human-friendly name for the topic.
-    async fn handle_invite_command(&mut self, args: &str) -> std::result::Result<(), String> {
-        let (peer_queries, topic_id, display_name) = parse_invite_args(args)?;
+    async fn send_attachment(
+        &mut self,
+        path: &std::path::Path,
+        caption: Option<String>,
+        db: &Database,
+    ) -> Result<(), Box<dyn Error>> {
+        let bytes = std::fs::read(path)?;
 
-        // Resolve everyone before sending anything.
-        let mut targets = Vec::new();
-        for q in &peer_queries {
-            targets.push(self.resolve_peer(q)?);
+        let cid = generate_cid_from_bytes(&bytes)?;
+        db.save_avatar_cache(&cid, &bytes)?;
+
+        let attachment = Attachment::from_path(path.to_str().unwrap_or("unknown"), cid.clone())?;
+
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(NetworkCommand::ProvideMediaCid { cid: cid.clone() })
+                .await?;
+        }
+
+        let my_avatar = self
+            .known_peers
+            .get(&self.peer_id)
+            .and_then(|info| info.avatar.clone());
+
+        if attachment.kind == AttachmentKind::Image {
+            if let Some(thumb) = decode_avatar_hex(&bytes, 6) {
+                self.chat_panel
+                    .thumb_cache
+                    .insert(attachment.cid.clone(), thumb);
+            }
         }
 
         let timestamp = chrono::Utc::now().timestamp();
+        let msg = ChatMessage {
+            id: generate_cid_from_bytes(
+                &(self.peer_id.clone() + &cid + &timestamp.to_string()).as_bytes(),
+            )
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+            topic: self.current_topic.clone(),
+            parent_id: None,
+            sender_id: self.peer_id.clone(),
+            sender_name: self.my_name.clone(),
+            content: caption.clone().unwrap_or_default(),
+            timestamp: timestamp as u64,
+            kind: MessageKind::Media(attachment.clone()),
+        };
 
-        for target in &targets {
+        db.save_message(&msg)?;
+
+        self.chat_panel.push(
+            self.peer_id.clone(),
+            self.my_name.clone(),
+            msg.content.clone(),
+            my_avatar,
+            Some(attachment),
+        );
+
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(NetworkCommand::PublishMessage {
+                topic: IdentTopic::new(&self.current_topic),
+                contents: serde_json::to_vec(&msg)?,
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_invite_command(&mut self, args: &str) -> std::result::Result<(), String> {
+        let (peer_queries, topic_id, display_name) = parse_invite_args(args)?;
+
+        let mut remote_targets: Vec<PeerId> = Vec::new();
+
+        for q in &peer_queries {
+            // LOCAL AGENT: by name. It is a peer like any other — we just
+            // also hold its command channel, so tell it to join directly
+            // instead of sending an encrypted DM to itself.
+            if let Some(tx) = self.agent_cmd_txs.get(q) {
+                let _ = tx.send(NetworkCommand::SubscribeTopic {
+                    topic: IdentTopic::new(&topic_id),
+                }).await;
+                continue;
+            }
+            // REMOTE PEER: resolve via known_peers / DHT
+            remote_targets.push(self.resolve_peer(q)?);
+        }
+
+        // ── Remote peers: encrypted DM invite ──
+        for target in &remote_targets {
             let id = target.to_base58();
             let info = self.known_peers.get(&id);
             let name = info.map(|i| i.name.as_str()).unwrap_or(&id);
             let Some(pk) = info.and_then(|i| i.enc_public_key) else {
-                return Err(format!(
-                    "no encryption key for '{name}' yet — wait a few seconds for their presence"
-                ));
+                return Err(format!("no encryption key for '{name}'"));
             };
 
             let payload = InvitePayload {
@@ -783,7 +1156,7 @@ impl App {
                 encryption_key: random_hex_key(),
                 display_name: display_name.clone(),
                 invited_by: self.my_name.clone(),
-                timestamp,
+                timestamp: chrono::Utc::now().timestamp(),
             };
             let json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
             let encrypted = encrypt_to_public_key(&pk, &json).map_err(|e| e.to_string())?;
@@ -792,24 +1165,17 @@ impl App {
             tx.send(NetworkCommand::SendDirectMessage {
                 target: *target,
                 payload: encrypted,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            }).await.map_err(|e| e.to_string())?;
         }
 
-        // Join the new topic ourselves so we see the conversation.
+        // Join the topic ourselves
         self.join_topic(&topic_id);
 
+        let invited_names = peer_queries.join(", ");
         self.chat_panel.push(
-            "system".to_string(),
-            "system".to_string(),
-            format!(
-                "Invited {} to '{}' — you are now in #{}",
-                peer_queries.join(", "),
-                display_name,
-                topic_id
-            ),
-            None,
+            "system".into(), "system".into(),
+            format!("Invited {invited_names} to '{display_name}' — now in #{topic_id}"),
+            None, None,
         );
         Ok(())
     }
@@ -884,7 +1250,11 @@ mod tests {
 
     #[test]
     fn parse_invite_requires_sigil() {
-        assert!(parse_invite_args("alice bob").unwrap_err().contains("usage"));
+        assert!(
+            parse_invite_args("alice bob")
+                .unwrap_err()
+                .contains("usage")
+        );
     }
 
     #[test]

@@ -1,7 +1,12 @@
-use llung_core::{app::LlungApp, config::CoreConfig, network::NetworkCommand};
+use llung_core::{
+    app::LlungApp, config::CoreConfig, network::NetworkCommand, storage::db::Database,
+};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+uniffi::setup_scaffolding!();
+
+#[derive(uniffi::Object)]
 pub struct IosBridge {
     rt: Runtime,
     app: Arc<LlungApp>,
@@ -9,27 +14,30 @@ pub struct IosBridge {
 }
 
 #[uniffi::export]
-fn ios_init(db_path: String) -> Arc<IosBridge> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (app, mut event_rx) = rt.block_on(async {
-        LlungApp::init(CoreConfig {
-            db_path: db_path.into(),
-            agent: None,
-            chat_topic: "introductions".into(),
-        })
+fn ios_init(db_path: String) -> std::result::Result<Arc<IosBridge>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let (app, _event_rx) = rt.block_on(async {
+        let (db, machine) = Database::new(&db_path).map_err(|e| e.to_string())?;
+        let being = db
+            .load_being()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no being registered in this database".to_string())?;
+        LlungApp::init(
+            CoreConfig {
+                db_path: db_path.into(),
+                chat_topic: "introductions".into(),
+            },
+            machine,
+            being,
+        )
         .await
-        .unwrap()
-    });
+        .map_err(|e| e.to_string())
+    })?;
 
-    let bridge = Arc::new(IosBridge {
+    Ok(Arc::new(IosBridge {
         rt,
         app: Arc::new(app),
-    });
-
-    // Spawn event forwarder to Swift callback
-    // (simplified: in practice you'd use a callback interface)
-
-    bridge
+    }))
 }
 
 #[uniffi::export]

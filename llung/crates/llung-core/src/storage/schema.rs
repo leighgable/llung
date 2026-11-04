@@ -136,6 +136,30 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         }
     }
 
+    // Older databases have a `messages` table with `sender_peer_id` instead
+    // of `sender_id`/`sender_name`.
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "sender_id") {
+        if columns.iter().any(|c| c == "sender_peer_id") {
+            conn.execute(
+                "ALTER TABLE messages RENAME COLUMN sender_peer_id TO sender_id",
+                [],
+            )?;
+        } else {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
     // Older databases have a `messages` table without the `kind` column.
     let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
     let columns: Vec<String> = stmt

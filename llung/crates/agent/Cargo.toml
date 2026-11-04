@@ -8,6 +8,7 @@ llung-core = { path = "../llung-core" }
 agent-rt = { path = "../agent-rt" }
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 sha2.workspace = true
 libp2p = { workspace = true }

@@ -5,6 +5,8 @@ pub mod interface;
 pub mod orchestrator;
 pub mod tools;
 
+pub use orchestrator::{AgentLoopContext, run_agent_loop};
+
 use llung_core::{
     identity::being::{Being, BeingKind},
     identity::machine::MachineIdentity,

@@ -9,9 +9,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "olmo-7B-think".into(),
+            model: "SmolVLM".into(),
             name: "llung-agent".into(),
-            model_url: None,
+            // llama.cpp's llama-server hosting SmolVLM Q4.
+            model_url: Some("http://localhost:9931/v1".into()),
             max_history: 20,
         }
     }
