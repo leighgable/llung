@@ -5,11 +5,11 @@ use crossterm::{
 };
 use llung_core::{
     config::CoreConfig,
-    identity::session::{ensure_profile_dir, list_identities},
+    identity::session::{list_identities, profile_db_path},
     storage::db::Database,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{self, Write, stdout};
+use std::io::{Write, stdout};
 use tracing_subscriber;
 
 mod app;
@@ -17,6 +17,7 @@ mod avatar;
 mod chat_panel;
 mod events;
 mod prefix_text;
+mod profile_picker;
 mod registration_panel;
 mod settings;
 mod taffy_ui;
@@ -34,6 +35,7 @@ Usage: tui [OPTIONS]
 Options:
   --theme <THEME>   Theme for this session (not saved): a name, a light/dark
                     pair, or a path to a .json theme file
+  --profile <NAME>  Open this profile directly, skipping the picker
   --list-themes     List available themes and exit
   -h, --help        Show this help
 
@@ -47,10 +49,11 @@ and ~/.pi/agent/themes. Use /theme in the chat to switch and save.";
 
 struct Cli {
     theme: Option<String>,
+    profile: Option<String>,
 }
 
 fn parse_args() -> Result<Cli, String> {
-    let mut cli = Cli { theme: None };
+    let mut cli = Cli { theme: None, profile: None };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,10 +70,18 @@ fn parse_args() -> Result<Cli, String> {
             "--theme" => {
                 cli.theme = Some(args.next().ok_or("--theme needs a value")?);
             }
-            _ => match arg.strip_prefix("--theme=") {
-                Some(v) => cli.theme = Some(v.to_string()),
-                None => return Err(format!("unknown argument: {arg}\n\n{USAGE}")),
-            },
+            "--profile" => {
+                cli.profile = Some(args.next().ok_or("--profile needs a value")?);
+            }
+            _ => {
+                if let Some(v) = arg.strip_prefix("--theme=") {
+                    cli.theme = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("--profile=") {
+                    cli.profile = Some(v.to_string());
+                } else {
+                    return Err(format!("unknown argument: {arg}\n\n{USAGE}"));
+                }
+            }
         }
     }
     Ok(cli)
@@ -138,81 +149,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── 1. Profile selection in NORMAL terminal mode ──
-    let db_path = run_profile_picker().await?;
-    let (mut db, machine) = Database::new(db_path.to_str().unwrap())?;
+    // `--profile` must name an existing profile; checked before the TUI
+    // starts so the error lands in the normal terminal.
+    let direct_profile = match cli.profile {
+        Some(name) => {
+            if !list_identities().iter().any(|p| p.profile_name == name) {
+                eprintln!("no profile named '{name}' (start without --profile to create one)");
+                std::process::exit(2);
+            }
+            Some((profile_db_path(&name), name))
+        }
+        None => None,
+    };
 
-    // ── 2. Enter the TUI ──
-    // The App owns everything from here: splash screen -> account load ->
-    // registration (if needed) -> network start -> chat.
+    // ── Enter the TUI; everything from here is styled ──
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let result = run_tui(direct_profile, theme).await;
 
-    let config = CoreConfig::new(db_path, "introductions".into());
-    let mut app = App::new(terminal, config, machine, theme);
-    let result = app.run(&mut db).await;
-
-    // ── 3. Cleanup ──
+    // ── Cleanup (also after errors) ──
     let _ = stdout().write_all(&terminal::cleanup_sequence());
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     result
 }
 
-// ── Stdin profile picker (runs before raw mode) ──
-async fn run_profile_picker() -> io::Result<std::path::PathBuf> {
-    let identities = list_identities();
+/// Profile picker (unless `--profile` chose already), then the app, on
+/// one terminal: the picker hands it over without leaving the TUI.
+async fn run_tui(
+    direct_profile: Option<(std::path::PathBuf, String)>,
+    mut theme: ThemeStartup,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    if identities.is_empty() {
-        println!("No existing profiles found.");
-        return register_new_profile().await;
-    }
-
-    println!("\n=== Llung TUI ===\n");
-    for (i, id) in identities.iter().enumerate() {
-        println!("  {}. {}", i + 1, id.profile_name);
-    }
-    let next = identities.len() + 1;
-    println!("  {}. Create new profile", next);
-    println!("  {}. Exit", next + 1);
-
-    loop {
-        print!("\nSelect: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            // EOF (stdin closed/piped): don't spin on "Invalid option".
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no profile selected"));
-        }
-
-        match input.trim().parse::<usize>() {
-            Ok(n) if n >= 1 && n <= identities.len() => {
-                return Ok(identities[n - 1].db_path.clone());
+    let (db_path, profile) = match direct_profile {
+        Some(p) => p,
+        None => {
+            let last = theme.settings.last_profile().map(String::from);
+            match profile_picker::run(&mut term, &theme.theme, last.as_deref())? {
+                Some(p) => p,
+                None => return Ok(()), // quit from the picker
             }
-            Ok(n) if n == next => return register_new_profile().await,
-            Ok(n) if n == next + 1 => std::process::exit(0),
-            _ => println!("Invalid option, try again."),
         }
+    };
+    if let Err(e) = theme.settings.set_last_profile(&profile) {
+        tracing::warn!("couldn't remember last profile: {e}");
     }
-}
+    tracing::info!("opening profile '{profile}' at {}", db_path.display());
 
-async fn register_new_profile() -> io::Result<std::path::PathBuf> {
-    print!("Choose a profile name: ");
-    io::stdout().flush()?;
+    let (mut db, machine) = Database::new(
+        db_path.to_str().ok_or("profile path is not valid UTF-8")?,
+    )?;
 
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    let name = name.trim().to_lowercase();
-
-    if name.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty name"));
-    }
-
-    let db_path = ensure_profile_dir(&name)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-    println!("Created profile '{}'.", name);
-    Ok(db_path)
+    // The App owns everything from here: splash screen -> account load ->
+    // registration (if needed) -> network start -> chat.
+    let config = CoreConfig::new(db_path, "introductions".into());
+    let mut app = App::new(term, config, machine, theme);
+    app.run(&mut db).await
 }

@@ -64,6 +64,16 @@ impl Settings {
         self.save()
     }
 
+    /// Profile opened last; the picker preselects it.
+    pub fn last_profile(&self) -> Option<&str> {
+        self.data.get("lastProfile")?.as_str().filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn set_last_profile(&mut self, name: &str) -> io::Result<()> {
+        self.data.insert("lastProfile".into(), Value::String(name.to_string()));
+        self.save()
+    }
+
     /// Write atomically (temp file + rename) so a crash never leaves a
     /// truncated settings file.
     fn save(&self) -> io::Result<()> {
@@ -116,6 +126,17 @@ mod tests {
         let (s2, _) = Settings::load_from(&path);
         assert_eq!(s2.theme(), Some("light/dark"));
         assert_eq!(s2.data["future"]["x"], 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn last_profile_round_trip() {
+        let path = temp("lastprofile");
+        std::fs::remove_file(&path).ok();
+        let (mut s, _) = Settings::load_from(&path);
+        assert_eq!(s.last_profile(), None);
+        s.set_last_profile("work").unwrap();
+        assert_eq!(Settings::load_from(&path).0.last_profile(), Some("work"));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
