@@ -29,10 +29,15 @@ pub struct ThemeWatcher {
 impl ThemeWatcher {
     /// Watch `path`; `None` (built-in themes) never reports changes.
     pub fn new(path: Option<&Path>) -> Self {
+        Self::new_at(path, Instant::now())
+    }
+
+    /// Clock-injected constructor, so tests don't depend on timing.
+    fn new_at(path: Option<&Path>, now: Instant) -> Self {
         Self {
             last: path.and_then(stamp),
             path: path.map(Path::to_path_buf),
-            next_check: Instant::now() + POLL_INTERVAL,
+            next_check: now + POLL_INTERVAL,
         }
     }
 
@@ -79,8 +84,8 @@ mod tests {
         let path = dir.join("t.json");
         std::fs::write(&path, "a").unwrap();
 
-        let mut w = ThemeWatcher::new(Some(&path));
         let mut t = Instant::now();
+        let mut w = ThemeWatcher::new_at(Some(&path), t);
         let mut tick = || {
             t += POLL_INTERVAL;
             t
@@ -103,9 +108,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.json");
         std::fs::write(&path, "a").unwrap();
-        let mut w = ThemeWatcher::new(Some(&path));
-        std::fs::write(&path, "ab").unwrap();
         let now = Instant::now();
+        let mut w = ThemeWatcher::new_at(Some(&path), now);
+        std::fs::write(&path, "ab").unwrap();
         assert!(!w.poll_at(now), "too soon");
         assert!(w.poll_at(now + POLL_INTERVAL));
         std::fs::remove_dir_all(&dir).ok();

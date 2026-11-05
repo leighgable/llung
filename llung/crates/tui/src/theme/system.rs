@@ -19,6 +19,7 @@
 //! - nothing: ANSI indices and default colors, rendered by the terminal itself.
 
 use super::file::Appearance;
+use super::contrast::{ensure_contrast, wcag_contrast};
 use super::oklab;
 use crate::terminal::query::TerminalColors;
 use serde_json::{Map, Value, json};
@@ -338,21 +339,6 @@ fn okhsl(h: f64, s: f64, l: f64) -> Rgb {
     oklab::okhsl_to_rgb(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
 }
 
-/// WCAG 2 relative luminance.
-pub fn relative_luminance(c: Rgb) -> f64 {
-    let lin = |v: u8| {
-        let v = v as f64 / 255.0;
-        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-    };
-    0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2])
-}
-
-/// WCAG 2 contrast ratio, 1-21.
-pub fn wcag_contrast(a: Rgb, b: Rgb) -> f64 {
-    let (la, lb) = (relative_luminance(a), relative_luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-}
-
 const WHITE: Rgb = [255, 255, 255];
 const BLACK: Rgb = [0, 0, 0];
 
@@ -437,22 +423,7 @@ fn anchored(src: &Source, f: &Family, lightness: f64) -> Rgb {
 /// Move a text color toward white/black until it reaches the WCAG minimum
 /// on every surface.
 fn with_text_contrast(color: Rgb, surfaces: &[Rgb], lighter: bool) -> Rgb {
-    let meets = |c: Rgb| surfaces.iter().all(|s| wcag_contrast(c, *s) >= TEXT_MIN_CONTRAST);
-    if meets(color) {
-        return color;
-    }
-    let (h, s, l) = oklab::rgb_to_okhsl(color);
-    let at = |x: f64| okhsl(h, s, x);
-    let extreme = if lighter { 1.0 } else { 0.0 };
-    if !meets(at(extreme)) {
-        return at(extreme);
-    }
-    let (mut lo, mut hi) = (l, extreme);
-    for _ in 0..20 {
-        let mid = (lo + hi) / 2.0;
-        if meets(at(mid)) { hi = mid } else { lo = mid }
-    }
-    at(hi)
+    ensure_contrast(color, surfaces, TEXT_MIN_CONTRAST, lighter)
 }
 
 // ── Generation ──
@@ -461,6 +432,7 @@ fn with_text_contrast(color: Rgb, surfaces: &[Rgb], lighter: bool) -> Rgb {
 pub struct Generated {
     /// A complete pi theme JSON document.
     pub theme: Value,
+    #[cfg_attr(not(test), allow(dead_code))] // also in `theme["appearance"]`
     pub appearance: Appearance,
     /// Nothing-reported tier: neutral secondary tokens are "" and should
     /// render faint (SGR 2) instead.

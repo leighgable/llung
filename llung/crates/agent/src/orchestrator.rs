@@ -173,7 +173,7 @@ async fn execute_secured_tool(
     ctx: &mut AgentLoopContext,
     tool_name: String,
     arguments: Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let manifest = Manifest {
         agent_id: ctx.self_being_id.clone(),
         target_effect: tool_name,
@@ -198,11 +198,21 @@ async fn execute_secured_tool(
         )
         .await?;
 
-    // The tool's actual output (e.g. braille art) is what the chat sees;
-    // the receipt's output commitment stays in the kernel for audit.
-    publish_agent_text(ctx, output).await?;
+    // The tool's actual output is what the chat sees (the caller
+    // publishes it); the receipt's output commitment stays in the kernel
+    // for audit.
+    Ok(output)
+}
 
-    Ok(())
+/// One-line description of a tool output for `ToolResponse.result_summary`.
+fn summarize_output(output: &str) -> String {
+    if let Ok(doc) = serde_json::from_str::<serde_json::Value>(output) {
+        if let Some(kind) = doc.get("render").and_then(|v| v.as_str()) {
+            let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            return format!("{kind} render of '{title}'");
+        }
+    }
+    output.lines().next().unwrap_or("").chars().take(80).collect()
 }
 
 /// Publish `text` to the topic on behalf of the agent and log it in the
@@ -215,12 +225,23 @@ async fn publish_agent_text(
     ctx: &mut AgentLoopContext,
     text: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    publish(ctx, MessageKind::Agent, None, text).await.map(|_| ())
+}
+
+/// Publish a message of any `kind` (optionally replying to `parent_id`)
+/// and log it in the DAG. Returns the message id.
+async fn publish(
+    ctx: &mut AgentLoopContext,
+    kind: MessageKind,
+    parent_id: Option<String>,
+    text: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let self_peer: libp2p::PeerId = ctx.self_being_id.parse()?;
     let msg = ChatMessage::new(
         ctx.topic.clone(),
         self_peer,
-        None,
-        MessageKind::Agent,
+        parent_id,
+        kind,
         ctx.self_name.clone(),
         text,
     );
@@ -233,7 +254,7 @@ async fn publish_agent_text(
 
     let _ = ctx.db.save_message(&msg);
 
-    Ok(())
+    Ok(msg.id)
 }
 
 // compressed history + agent reply
@@ -285,18 +306,36 @@ async fn generate_reply(
     // The model may have asked for a tool instead of plain prose.
     if let Some(call) = crate::tools::parse_tool_call(&reply) {
         tracing::info!(agent = %ctx.self_name, tool = %call.name, "model requested tool");
-        match execute_secured_tool(&mut *ctx, call.name.clone(), call.arguments.into_bytes())
-            .await
-        {
-            Ok(()) => return Ok(()),
-            // Never go silent: if the tool fails (missing wasm, bad args),
-            // say so in chat so the failure is visible where it happened.
-            Err(e) => {
-                let note = format!("tool '{}' failed: {e}", call.name);
-                tracing::error!(tool = %call.name, "{note}");
-                return publish_agent_text(ctx, note).await;
-            }
-        }
+        // Announce the call first: viewers show a pending tool panel, then
+        // swap in the response (whose parent_id points back here).
+        let call_id = publish(
+            ctx,
+            MessageKind::ToolCall {
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+            None,
+            call.arguments.clone(),
+        )
+        .await?;
+        let (content, error) =
+            match execute_secured_tool(&mut *ctx, call.name.clone(), call.arguments.into_bytes())
+                .await
+            {
+                Ok(output) => (output, false),
+                // Never go silent: if the tool fails (missing wasm, bad
+                // args), the error panel shows it where it happened.
+                Err(e) => {
+                    tracing::error!(tool = %call.name, "tool failed: {e}");
+                    (format!("tool '{}' failed: {e}", call.name), true)
+                }
+            };
+        let response = MessageKind::ToolResponse {
+            tool_name: call.name,
+            result_summary: summarize_output(&content),
+            error,
+        };
+        return publish(ctx, response, Some(call_id), content).await.map(|_| ());
     }
 
     // Prompt-parroting (common with tiny models): publishing the echo
@@ -397,10 +436,27 @@ mod tests {
         .await
         .is_err());
         drop(wasm); // path documented; load happens inside the worker
+        let doc: serde_json::Value =
+            serde_json::from_str(&output).expect("tool returns a JSON render document");
+        assert_eq!(doc["render"], "braille-v1", "got: {output}");
         assert!(
-            output.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "expected braille art, got: {output}"
+            doc["rows"].as_array().unwrap().iter().any(|r| r
+                .as_str()
+                .unwrap()
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))),
+            "expected braille dots"
         );
+        assert_eq!(summarize_output(&output), "braille-v1 render of 'sin(x)*cos(y)'");
+    }
+
+    #[test]
+    fn summaries() {
+        assert_eq!(
+            summarize_output(r#"{"render":"braille-v1","title":"sin(x)"}"#),
+            "braille-v1 render of 'sin(x)'"
+        );
+        assert_eq!(summarize_output("tool 'x' failed: boom\nmore"), "tool 'x' failed: boom");
     }
 
     #[test]

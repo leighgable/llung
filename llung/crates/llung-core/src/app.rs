@@ -7,6 +7,7 @@ use crate::{
     network::{
         NetworkCommand, NetworkEngine, NetworkEvent,
         behaviour::{DirectMessageBehaviour, LlungBehaviour},
+        dns::{self, DnsSetup},
     },
 };
 use libp2p::{
@@ -27,7 +28,13 @@ use std::{
 };
 use tokio::{io, sync::mpsc};
 
-pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Error>> {
+/// Build the swarm. `dns` comes from [`dns::system`]; when DNS is
+/// unavailable it's a resolver without nameservers, so only `/dns*` dials
+/// fail (see `network::dns`).
+pub fn build_swarm(
+    keypair: Keypair,
+    dns: DnsSetup,
+) -> Result<Swarm<LlungBehaviour>, Box<dyn Error>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -36,7 +43,7 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Er
             yamux::Config::default,
         )?
         .with_quic()
-        .with_dns()?
+        .with_dns_config(dns.config, dns.opts)
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             let peer_id = key.public().to_peer_id();
@@ -98,6 +105,10 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<LlungBehaviour>, Box<dyn Er
 pub struct LlungApp {
     pub local_being: Being,
     pub local_peer_id: PeerId,
+    /// `false` when the node started without DNS (offline, or the system
+    /// resolver config was empty): local peers via mDNS still work,
+    /// `/dns*` addresses don't, until restart.
+    pub dns_available: bool,
     cmd_tx: mpsc::Sender<NetworkCommand>,
 }
 
@@ -128,7 +139,9 @@ impl LlungApp {
             enc_public_key,
         };
 
-        let mut swarm = build_swarm(machine.keypair)?;
+        let dns = dns::system(dns::DEFAULT_WAIT).await;
+        let dns_available = dns.available();
+        let mut swarm = build_swarm(machine.keypair, dns)?;
         swarm
             .behaviour_mut()
             .kademlia
@@ -164,6 +177,7 @@ impl LlungApp {
             LlungApp {
                 local_being: being,
                 local_peer_id,
+                dns_available,
                 cmd_tx,
             },
             event_rx,
@@ -172,5 +186,18 @@ impl LlungApp {
 
     pub fn command_tx(&self) -> mpsc::Sender<NetworkCommand> {
         self.cmd_tx.clone()
+    }
+}
+
+#[cfg(test)]
+mod dns_offline_tests {
+    use super::*;
+
+    /// Offline startup: the full swarm builds with a nameserver-less
+    /// resolver (this used to abort with "no nameservers found in config").
+    #[tokio::test]
+    async fn swarm_builds_without_dns() {
+        let swarm = build_swarm(Keypair::generate_ed25519(), DnsSetup::none("offline"));
+        assert!(swarm.is_ok(), "{:?}", swarm.err());
     }
 }

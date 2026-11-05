@@ -38,6 +38,7 @@ use serde_json;
 use crate::settings::Settings;
 use crate::theme::watch::ThemeWatcher;
 use crate::theme::{Role, Theme};
+use crate::tool_panel::ToolBlock;
 
 /// Theme state resolved in `main` before the TUI starts.
 pub struct ThemeStartup {
@@ -309,6 +310,13 @@ impl App {
         let (llung_app, event_rx) =
             LlungApp::init(self.config.clone(), self.machine.clone(), being).await?;
         self.cmd_tx = Some(llung_app.command_tx());
+        if !llung_app.dns_available {
+            self.pending_notices.push(
+                "No DNS (offline?): local peers only. Restart llung after reconnecting \
+                 to reach peers by DNS name."
+                    .into(),
+            );
+        }
         Ok(event_rx)
     }
 
@@ -470,6 +478,8 @@ impl App {
         self.theme_watch = ThemeWatcher::new(theme.source.as_deref());
         self.theme = theme;
         self.theme_selection = selection;
+        // Kitty plot images bake in theme colors: lay out again.
+        self.chat_panel.invalidate();
     }
 
     /// Hot reload: re-read the active theme file after it changes. An
@@ -487,6 +497,7 @@ impl App {
             Ok(theme) => {
                 tracing::info!("theme reloaded from {}", path.display());
                 self.theme = theme;
+                self.chat_panel.invalidate();
             }
             Err(e) => self.report_error("Theme reload failed (keeping current theme)", e),
         }
@@ -617,10 +628,30 @@ impl App {
                     .push("system".into(), "system".into(), msg.content, None, None);
             }
 
-            MessageKind::ToolCall { .. }
-            | MessageKind::ToolResponse { .. }
-            | MessageKind::Notes => {
-                // Agents render these; humans might ignore or show collapsed
+            // pi-style tool panels: pending on the call, then replaced in
+            // place by the response (which points back via parent_id).
+            MessageKind::ToolCall { tool_name, arguments } => {
+                let block = ToolBlock::pending(msg.id.clone(), tool_name, &arguments);
+                self.chat_panel
+                    .push_tool(msg.sender_id, msg.sender_name, avatar, block);
+            }
+            MessageKind::ToolResponse { tool_name, error, .. } => {
+                let block = ToolBlock::response(
+                    msg.parent_id.clone(),
+                    tool_name,
+                    &msg.content,
+                    error,
+                );
+                self.chat_panel.push_tool_response(
+                    msg.sender_id,
+                    msg.sender_name,
+                    avatar,
+                    msg.parent_id.as_deref(),
+                    block,
+                );
+            }
+            MessageKind::Notes => {
+                // Agent-internal; not shown.
             }
         }
     }

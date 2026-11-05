@@ -50,8 +50,8 @@ pub const LANDSCAPE_TOOL_SCHEMA: &str = r#"
             "yaw": {"type": "number", "default": 35, "description": "Camera yaw in degrees"},
             "distance": {"type": "number", "default": 3.5, "description": "Camera distance (must be > 0)"},
             "grid": {"type": "integer", "default": 15, "description": "Mesh resolution, 4..=200"},
-            "width": {"type": "integer", "default": 120, "description": "Output width in characters, 8..=400"},
-            "height": {"type": "integer", "default": 60, "description": "Output height in characters, 4..=200"}
+            "width": {"type": "integer", "default": 120, "description": "Output width in characters, 8..=400 (width*height is capped at 10000 cells)"},
+            "height": {"type": "integer", "default": 60, "description": "Output height in characters, 4..=200 (width*height is capped at 10000 cells)"}
         }
     }
 }

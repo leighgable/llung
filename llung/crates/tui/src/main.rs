@@ -22,6 +22,7 @@ mod settings;
 mod taffy_ui;
 mod terminal;
 mod theme;
+mod tool_panel;
 
 use app::{App, ThemeStartup};
 use settings::Settings;

@@ -25,6 +25,10 @@ rand_core = "0.10.1"
 shellexpand = "3.1.2"
 base64 = "0.22"
 
+[dev-dependencies]
+# End-to-end tests render real tool output (host build of the wasm tool's logic).
+landscape-tool = { path = "../tools/landscape" }
+
 # Embedded terminal panes (future, see `src/terminal/mod.rs`): an opt-in
 # feature so machines without the Zig toolchain never build libghostty.
 # [features]

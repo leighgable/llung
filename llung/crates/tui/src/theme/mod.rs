@@ -10,6 +10,7 @@
 //! `light` are pi's own, and any pi theme loads unchanged.
 
 mod color;
+pub mod contrast;
 pub mod file;
 mod oklab;
 pub mod system;
@@ -40,13 +41,31 @@ pub struct Theme {
     /// neutral text uses the terminal default plus SGR 2 (faint) instead
     /// of a concrete gray, as in pi.
     pub faint_neutrals: bool,
+    /// Plot elevation gradient, low to high (see [`plot_gradient`]).
+    pub plot: [Color; PLOT_LEVELS],
+}
+
+/// Number of height levels in tool plots (`braille-v1` levels `0`-`9`).
+pub const PLOT_LEVELS: usize = 10;
+
+/// Minimum WCAG contrast of plot colors on their panel. 3:1 is WCAG's
+/// bar for graphical objects; plots are lines, not body text.
+pub const PLOT_MIN_CONTRAST: f64 = 3.0;
+
+/// Tool execution state, selecting pi's tool panel backgrounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolState {
+    Pending,
+    Success,
+    Error,
 }
 
 /// What a piece of UI *is*, independent of how it looks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)] // full role set; not every role has a consumer yet
 pub enum Role {
     /// Unstyled: inherit whatever is already in the cell.
+    #[default]
     Plain,
     Text,
     Muted,
@@ -86,6 +105,13 @@ pub enum Role {
     Button,
     ButtonFocused,
     Logo,
+
+    /// Tool panel fill: `toolPendingBg` / `toolSuccessBg` / `toolErrorBg`.
+    ToolPanel(ToolState),
+    ToolTitle,
+    ToolOutput,
+    /// Plot dots at height level 0-9 (elevation gradient).
+    PlotLevel(u8),
 }
 
 impl Theme {
@@ -136,6 +162,20 @@ impl Theme {
                 .bg(c.success)
                 .add_modifier(Modifier::BOLD),
             Role::Logo => s.fg(c.accent).add_modifier(Modifier::BOLD),
+
+            Role::ToolPanel(state) => s.fg(c.tool_output).bg(self.tool_bg(state)),
+            Role::ToolTitle => s.fg(c.tool_title).add_modifier(Modifier::BOLD),
+            Role::ToolOutput => s.fg(c.tool_output),
+            Role::PlotLevel(n) => s.fg(self.plot[(n as usize).min(PLOT_LEVELS - 1)]),
+        }
+    }
+
+    /// Panel background for a tool state.
+    pub fn tool_bg(&self, state: ToolState) -> Color {
+        match state {
+            ToolState::Pending => self.colors.tool_pending_bg,
+            ToolState::Success => self.colors.tool_success_bg,
+            ToolState::Error => self.colors.tool_error_bg,
         }
     }
 
@@ -193,6 +233,7 @@ impl Theme {
             llung: r.llung,
             source: None,
             faint_neutrals: false,
+            plot: plot_gradient(&r.colors, &r.llung, r.appearance, mode),
         }
     }
 
@@ -328,6 +369,72 @@ pub fn theme_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// sRGB value of a resolved color, when concrete (not the terminal
+/// default; ANSI 0-15 are approximated).
+pub fn color_rgb(c: Color) -> Option<[u8; 3]> {
+    color::to_rgb(c)
+}
+
+/// Elevation gradient for plots: `plotLow` (default `syntaxKeyword`, cool)
+/// → `success` → `warning` → `plotHigh` (default `error`, hot),
+/// interpolated in OKLCH and lightened/darkened until every level reaches
+/// [`PLOT_MIN_CONTRAST`] on the success panel. So plots are readable in
+/// every theme, including custom pi themes.
+///
+/// When a stop is a terminal-defined color (ANSI 0-15 or the default, as
+/// in the no-report `system` theme), its real value is unknown: the stops
+/// are used as discrete bands instead, trusting the terminal's palette.
+pub fn plot_gradient(
+    c: &Palette,
+    x: &LlungColors,
+    appearance: Appearance,
+    mode: ColorMode,
+) -> [Color; PLOT_LEVELS] {
+    let stops = [
+        x.plot_low.unwrap_or(c.syntax_keyword),
+        c.success,
+        c.warning,
+        x.plot_high.unwrap_or(c.error),
+    ];
+    let concrete = |col: Color| match col {
+        Color::Rgb(..) | Color::Indexed(16..) => color::to_rgb(col),
+        _ => None,
+    };
+    let rgb: Option<Vec<[u8; 3]>> = stops.iter().map(|s| concrete(*s)).collect();
+    let Some(mut rgb) = rgb else {
+        // Discrete bands: levels 0-2, 3-4, 5-7, 8-9.
+        return std::array::from_fn(|i| stops[(i * 4 / PLOT_LEVELS).min(3)]);
+    };
+    // Gray stops carry no height information (e.g. `system` on a mid-gray
+    // terminal relaxes every accent to black): use pi's blue, green,
+    // yellow and red family hues instead; contrast fixing below then
+    // finds each one's lightness.
+    let chroma = |c: &[u8; 3]| {
+        let [_, a, b] = oklab::rgb_to_oklab(*c);
+        a.hypot(b)
+    };
+    if rgb.iter().all(|c| chroma(c) < 0.03) {
+        rgb = [231.49, 158.68, 82.36, 20.0]
+            .iter()
+            .map(|h| oklab::okhsl_to_rgb(*h, 0.8, 0.5))
+            .collect();
+    }
+
+    let bg = concrete(c.tool_success_bg).unwrap_or(match appearance {
+        Appearance::Dark => [0, 0, 0],
+        Appearance::Light => [255, 255, 255],
+    });
+    let lighter =
+        contrast::wcag_contrast([255; 3], bg) >= contrast::wcag_contrast([0; 3], bg);
+    std::array::from_fn(|i| {
+        let t = i as f64 / (PLOT_LEVELS - 1) as f64 * 3.0;
+        let k = (t.floor() as usize).min(2);
+        let mixed = contrast::mix_oklch(rgb[k], rgb[k + 1], t - k as f64);
+        let fixed = contrast::ensure_contrast(mixed, &[bg], PLOT_MIN_CONTRAST, lighter);
+        mode.adapt(color::rgb(fixed))
+    })
+}
+
 /// Whether the terminal has a light or dark background: from the colors
 /// it reported at startup (OSC 10/11), else `COLORFGBG` (`"fg;bg"`, set by
 /// rxvt, Konsole, iTerm2 and others), else dark. Picks the side of a
@@ -424,6 +531,63 @@ mod tests {
         assert_eq!(t.bg(Role::Canvas), Color::Reset);
         // Focused button needs a concrete fg even with a terminal-default bg.
         assert_eq!(t.style(Role::ButtonFocused).fg, Some(Color::Rgb(0, 0, 0)));
+    }
+
+    #[test]
+    fn plot_gradient_is_readable_everywhere() {
+        use crate::terminal::query::TerminalColors;
+        let mut themes = vec![
+            Theme::builtin("dark", ColorMode::TrueColor).unwrap(),
+            Theme::builtin("light", ColorMode::TrueColor).unwrap(),
+            Theme::builtin("dark", ColorMode::Ansi256).unwrap(),
+        ];
+        // `system` generated for a few backgrounds, including mid-gray.
+        for bg in [[0x1e, 0x1e, 0x2e], [0xff, 0xff, 0xff], [0x80, 0x80, 0x80]] {
+            let g = system::generate(
+                &TerminalColors { background: Some(bg), ..Default::default() },
+                Appearance::Dark,
+            );
+            let r = file::parse_system(g.theme, ColorMode::TrueColor).unwrap();
+            themes.push(Theme::from_resolved(r, ColorMode::TrueColor));
+        }
+        for t in &themes {
+            let bg = color::to_rgb(t.colors.tool_success_bg).unwrap();
+            for (i, c) in t.plot.iter().enumerate() {
+                let rgb = color::to_rgb(*c).unwrap();
+                let ratio = contrast::wcag_contrast(rgb, bg);
+                // 256-color rounding can shave a little off.
+                let min = if t.mode == ColorMode::Ansi256 { 2.5 } else { PLOT_MIN_CONTRAST - 1e-6 };
+                assert!(ratio >= min, "{} level {i}: {ratio:.2}", t.name);
+            }
+            assert_ne!(t.plot[0], t.plot[9], "{}: gradient has range", t.name);
+        }
+    }
+
+    #[test]
+    fn plot_gradient_discrete_without_terminal_colors() {
+        let g = system::generate(&Default::default(), Appearance::Dark);
+        let r = file::parse_system(g.theme, ColorMode::TrueColor).unwrap();
+        let t = Theme::from_resolved(r, ColorMode::TrueColor);
+        assert_eq!(t.plot[0], t.colors.syntax_keyword);
+        assert_eq!(t.plot[9], t.colors.error);
+    }
+
+    #[test]
+    fn plot_vars_override_ends() {
+        let json = BUILTIN_DARK.replacen(
+            "\"vars\": {",
+            "\"vars\": {\"llung.plotLow\": \"#ffffff\", \"llung.plotHigh\": \"#fffffe\",",
+            1,
+        );
+        let t = Theme::from_json(&json, ColorMode::TrueColor).unwrap();
+        assert_eq!(t.plot[0], Color::Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn tool_roles() {
+        let t = Theme::builtin("dark", ColorMode::TrueColor).unwrap();
+        assert_eq!(t.bg(Role::ToolPanel(ToolState::Error)), t.colors.tool_error_bg);
+        assert_eq!(t.style(Role::PlotLevel(42)).fg, Some(t.plot[9]));
     }
 
     #[test]

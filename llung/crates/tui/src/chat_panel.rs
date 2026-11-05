@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use crate::theme::{Role, Theme};
+use crate::tool_panel::{ImageRow, ToolBlock};
 use unicode_width::UnicodeWidthStr;
 
 use crate::avatar::{AvatarThumbnail, render_avatar};
@@ -32,8 +33,11 @@ pub struct ChatLine {
     pub is_me: bool,
     pub avatar: Option<AvatarThumbnail>,
     pub attachment: Option<Attachment>,
+    /// Tool run shown as a panel instead of `content`.
+    pub tool: Option<ToolBlock>,
 }
 
+#[derive(Default)]
 struct VisualLine {
     text: String,
     x_offset: u16,
@@ -50,6 +54,12 @@ struct VisualLine {
     /// thumbnails). Skipped by the renderer so the thumbnail above isn't
     /// cleared.
     attachment_cont: bool,
+    /// Styled runs drawn after `text` (tool panels).
+    segments: Vec<(String, Role)>,
+    /// Background fill `(role, width)` from `x_offset` (tool panels).
+    fill: Option<(Role, u16)>,
+    /// Kitty image row drawn 1 column into the line (tool plots).
+    image: Option<ImageRow>,
 }
 
 /// Rendered footprint of an attachment: (block width, block height in rows).
@@ -118,7 +128,61 @@ impl ChatPanel {
             is_me,
             avatar,
             attachment,
+            tool: None,
         });
+        self.cache.clear();
+        self.cached_width = 0;
+    }
+
+    /// Show a tool call as a pending panel.
+    pub fn push_tool(
+        &mut self,
+        sender_id: String,
+        sender: String,
+        avatar: Option<AvatarThumbnail>,
+        block: ToolBlock,
+    ) {
+        let is_me = sender.trim() == self.my_name.trim();
+        self.messages.push(ChatLine {
+            sender_id,
+            sender,
+            content: PrefixText::new(String::new()),
+            is_me,
+            avatar,
+            attachment: None,
+            tool: Some(block),
+        });
+        self.invalidate();
+    }
+
+    /// A tool response: replaces the pending panel of the call it answers
+    /// (matched by `parent_id`), or appears as a new panel if the call was
+    /// never seen (e.g. joined mid-run).
+    pub fn push_tool_response(
+        &mut self,
+        sender_id: String,
+        sender: String,
+        avatar: Option<AvatarThumbnail>,
+        parent_id: Option<&str>,
+        block: ToolBlock,
+    ) {
+        let pending = parent_id.and_then(|pid| {
+            self.messages.iter_mut().rev().find(|m| {
+                m.tool.as_ref().is_some_and(|t| t.call_id.as_deref() == Some(pid))
+            })
+        });
+        match pending {
+            Some(line) => {
+                line.tool = Some(block);
+                self.invalidate();
+            }
+            None => self.push_tool(sender_id, sender, avatar, block),
+        }
+    }
+
+    /// Drop the layout cache, e.g. after a theme change (Kitty plot images
+    /// bake in theme colors).
+    pub fn invalidate(&mut self) {
         self.cache.clear();
         self.cached_width = 0;
     }
@@ -157,7 +221,7 @@ impl ChatPanel {
         }
     }
 
-    fn rewrap(&mut self, width: u16) {
+    fn rewrap(&mut self, width: u16, theme: &Theme) {
         if width == 0 || width == self.cached_width {
             return;
         }
@@ -178,9 +242,37 @@ impl ChatPanel {
                     msg_index: i,
                     attachment: None,
                     attachment_cont: false,
+                    ..Default::default()
                 });
             }
             last_was_me = msg.is_me;
+
+            // ── TOOL PANELS: pi-style tinted block, near full width ──
+            if let Some(ref tool) = msg.tool {
+                let avatar_pad = msg.avatar.as_ref().map(|a| a.width() + 1).unwrap_or(0);
+                let left_margin = 2 + avatar_pad;
+                if msg.avatar.is_none() {
+                    self.cache.push(VisualLine {
+                        text: msg.sender.clone(),
+                        x_offset: left_margin,
+                        role: Role::PeerName,
+                        msg_index: i,
+                        ..Default::default()
+                    });
+                }
+                let panel_w = width.saturating_sub(left_margin + 2).max(12);
+                for line in tool.layout(panel_w, theme) {
+                    self.cache.push(VisualLine {
+                        x_offset: left_margin,
+                        msg_index: i,
+                        segments: line.segments,
+                        fill: Some((Role::ToolPanel(tool.state), panel_w)),
+                        image: line.image,
+                        ..Default::default()
+                    });
+                }
+                continue;
+            }
 
             if msg.is_me {
                 // ── MY MESSAGES: right-aligned bubble ──
@@ -199,6 +291,7 @@ impl ChatPanel {
                         msg_index: i,
                         attachment: None,
                         attachment_cont: false,
+                        ..Default::default()
                     });
                 }
             } else {
@@ -226,6 +319,7 @@ impl ChatPanel {
                         msg_index: i,
                         attachment: None,
                         attachment_cont: false,
+                        ..Default::default()
                     });
 
                     for line in msg.content.wrap_lines(max_content) {
@@ -237,6 +331,7 @@ impl ChatPanel {
                             msg_index: i,
                             attachment: None,
                             attachment_cont: false,
+                            ..Default::default()
                         });
                     }
                 } else {
@@ -260,6 +355,7 @@ impl ChatPanel {
                             msg_index: i,
                             attachment: None,
                             attachment_cont: false,
+                            ..Default::default()
                         });
                         first = false;
                     }
@@ -285,6 +381,7 @@ impl ChatPanel {
                         msg_index: i,
                         attachment: if r == 0 { Some(att.clone()) } else { None },
                         attachment_cont: r > 0,
+                        ..Default::default()
                     });
                 }
             }
@@ -293,7 +390,7 @@ impl ChatPanel {
 
     pub fn render(&mut self, buf: &mut Buffer, area: Rect, theme: &Theme) {
         let canvas_bg = theme.bg(Role::Canvas);
-        self.rewrap(area.width);
+        self.rewrap(area.width, theme);
 
         let total = self.cache.len();
         let height = area.height as usize;
@@ -387,9 +484,30 @@ impl ChatPanel {
 
             if !line.is_gap {
                 let text_x = (area_x0 + line.x_offset).min(max_x);
+                if let Some((fill_role, fill_w)) = line.fill {
+                    let style = theme.style(fill_role);
+                    for col in text_x..(text_x.saturating_add(fill_w)).min(area_x1) {
+                        if let Some(cell) = buf.cell_mut((col, y)) {
+                            cell.set_style(style);
+                        }
+                    }
+                }
                 if text_x < max_x {
                     let max_len = (area_x1.saturating_sub(text_x)) as usize;
-                    buf.set_stringn(text_x, y, &line.text, max_len, theme.style(line.role));
+                    let (mut sx, _) =
+                        buf.set_stringn(text_x, y, &line.text, max_len, theme.style(line.role));
+                    for (text, role) in &line.segments {
+                        if sx >= area_x1 {
+                            break;
+                        }
+                        let room = (area_x1 - sx) as usize;
+                        sx = buf.set_stringn(sx, y, text, room, theme.style(*role)).0;
+                    }
+                }
+                if let Some(img) = line.image {
+                    let ix = text_x.saturating_add(1);
+                    let cols = img.cols.min(area_x1.saturating_sub(ix));
+                    crate::terminal::kitty::render_row(buf, ix, y, img.id, cols, img.row);
                 }
             }
 
@@ -489,7 +607,7 @@ mod tests {
     }
 
     fn first_text_line(panel: &mut ChatPanel) -> String {
-        panel.rewrap(80);
+        panel.rewrap(80, &crate::theme::Theme::default());
         panel
             .cache
             .iter()
@@ -536,7 +654,7 @@ mod tests {
             None,
         );
 
-        panel.rewrap(80);
+        panel.rewrap(80, &crate::theme::Theme::default());
         let line = panel
             .cache
             .iter()
@@ -566,5 +684,74 @@ mod tests {
 
         panel.update_peer_name("peer1", "bob");
         assert!(first_text_line(&mut panel).starts_with("bob "));
+    }
+
+    /// The full path with real `landscape` output: pending panel, replaced
+    /// in place by the response; rows stay rows; dots are colored by
+    /// height and readable on the panel (the "black on black" report).
+    #[test]
+    fn landscape_tool_panel_end_to_end() {
+        use crate::theme::Theme;
+
+        let mode = crate::theme::ColorMode::TrueColor;
+        for theme in [
+            Theme::default(),
+            Theme::select("dark", mode).unwrap(),
+            Theme::select("light", mode).unwrap(),
+        ] {
+            check_landscape_panel(&theme);
+        }
+    }
+
+    fn check_landscape_panel(theme: &crate::theme::Theme) {
+        use crate::theme::{Role, ToolState, contrast::wcag_contrast};
+        use crate::tool_panel::ToolBlock;
+
+        let mut panel = ChatPanel::new("me".into());
+        let args = r#"{"expr": "sin(x)*cos(y)", "width": 120, "height": 40}"#;
+        panel.push_tool(
+            "agent-id".into(),
+            "plotter".into(),
+            None,
+            ToolBlock::pending("call-1".into(), "landscape".into(), args),
+        );
+        let output = landscape_tool::run(args).unwrap();
+        panel.push_tool_response(
+            "agent-id".into(),
+            "plotter".into(),
+            None,
+            Some("call-1"),
+            ToolBlock::response(Some("call-1".into()), "landscape".into(), &output, false),
+        );
+        assert_eq!(panel.messages.len(), 1, "response replaced the pending panel");
+        assert_eq!(panel.messages[0].tool.as_ref().unwrap().state, ToolState::Success);
+
+        let area = Rect::new(0, 0, 100, 60);
+        let mut buf = Buffer::empty(area);
+        panel.render(&mut buf, area, theme);
+
+        let panel_bg = theme.bg(Role::ToolPanel(ToolState::Success));
+        let mut fgs = std::collections::HashSet::new();
+        let mut dots = 0;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                let ch = cell.symbol().chars().next().unwrap_or(' ');
+                if ('\u{2801}'..='\u{28FF}').contains(&ch) {
+                    dots += 1;
+                    assert_eq!(cell.bg, panel_bg, "dot on the panel at ({x},{y})");
+                    fgs.insert(format!("{:?}", cell.fg));
+                    if let (Some(fg), Some(bg)) =
+                        (crate::theme::color_rgb(cell.fg), crate::theme::color_rgb(cell.bg))
+                    {
+                        assert!(wcag_contrast(fg, bg) >= 2.9, "{}: readable dot at ({x},{y})", theme.name);
+                    }
+                }
+            }
+        }
+        assert!(dots > 100, "{}: a real plot is visible ({dots} dot cells)", theme.name);
+        assert!(fgs.len() >= 4, "colored by height: {} distinct colors", fgs.len());
+        // The plot fits the panel: nothing drawn past the right edge.
+        assert!((0..area.height).all(|y| buf[(area.width - 1, y)].symbol() == " "));
     }
 }

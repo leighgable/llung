@@ -182,6 +182,10 @@ pub struct LlungColors {
     /// OKHSL (saturation, lightness) of `llung.avatar`, applied with a
     /// per-peer hue to generated fallback avatars.
     pub avatar_sl: (f64, f64),
+    /// `llung.plotLow` / `llung.plotHigh`: ends of the plot elevation
+    /// gradient. Default: `syntaxKeyword` / `error` (via success, warning).
+    pub plot_low: Option<Color>,
+    pub plot_high: Option<Color>,
 }
 
 /// Reserved var names. Unknown `llung.*` names are rejected to catch typos.
@@ -191,6 +195,8 @@ pub const LLUNG_VARS: &[&str] = &[
     "llung.peerName",
     "llung.peerMessageText",
     "llung.avatar",
+    "llung.plotLow",
+    "llung.plotHigh",
 ];
 
 /// A fully resolved theme file.
@@ -358,6 +364,14 @@ fn resolve(file: ThemeFile, mode: ColorMode, system: bool) -> Result<ResolvedThe
         peer_name: var(&mut res, "llung.peerName", colors.accent)?,
         peer_message_text: var(&mut res, "llung.peerMessageText", colors.text)?,
         avatar_sl,
+        plot_low: match file.vars.get("llung.plotLow") {
+            Some(v) => Some(res.resolve(v, "vars.llung.plotLow")?),
+            None => None,
+        },
+        plot_high: match file.vars.get("llung.plotHigh") {
+            Some(v) => Some(res.resolve(v, "vars.llung.plotHigh")?),
+            None => None,
+        },
     };
 
     Ok(ResolvedTheme {

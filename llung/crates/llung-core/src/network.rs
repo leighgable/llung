@@ -1,5 +1,6 @@
 pub mod behaviour;
 pub mod command;
+pub mod dns;
 pub mod engine;
 pub mod event;
 pub mod message;

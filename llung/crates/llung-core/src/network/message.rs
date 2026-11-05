@@ -82,9 +82,17 @@ pub enum MessageKind {
         tool_name: String,
         arguments: String,
     },
+    /// Result of a tool run. `parent_id` of the carrying `ChatMessage`
+    /// points at the `ToolCall` message, so viewers can replace the
+    /// pending call with its result. `content` holds the tool output
+    /// (e.g. a `braille-v1` render document) or the error text.
     ToolResponse {
         tool_name: String,
         result_summary: String,
+        /// The tool failed; `content` is the error. Defaulted so stored
+        /// pre-existing responses still deserialize.
+        #[serde(default)]
+        error: bool,
     },
     System, // joins, leaves, topic changes
     Notes,

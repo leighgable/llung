@@ -20,6 +20,29 @@ no I/O, no side effects, bounded cost.
 | `width`    | `120`                         | output width in chars, clamped to `8..=400`  |
 | `height`   | `60`                          | output height in chars, clamped to `4..=200` |
 
+Sizes are capped at `width * height <= 10000` cells (aspect kept), so the
+result always fits one chat message (gossipsub's 64 KiB limit).
+
+## Output
+
+A `braille-v1` render document (JSON), which the TUI shows as a pi-style
+tool panel: dots fitted to the viewer's width, colored by height with the
+theme's elevation gradient, or drawn as an anti-aliased image in Kitty
+graphics terminals (Ghostty, Kitty).
+
+```json
+{"render": "braille-v1", "title": "sin(x)*cos(y)", "width": 120,
+ "rows":   ["⠀⣠⠔…", …],
+ "levels": ["..12…", …],
+ "z_range": [-1.0, 1.0]}
+```
+
+- `rows`: braille characters, one string per text row.
+- `levels`: one char per cell, `'0'`-`'9'` = height level of the cell's
+  highest dot (mapped linearly over `z_range`), `'.'` = empty cell.
+
+The format is parsed in `crates/tui/src/tool_panel.rs`; keep them in sync.
+
 ## Build
 
 The component targets `wasm32-wasip2`; nightly rustc emits a component

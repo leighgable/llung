@@ -136,13 +136,19 @@ fn diacritic(i: u16) -> char {
 /// cell background is left alone, so transparent image areas show the
 /// themed surface below.
 pub fn render(buf: &mut Buffer, x: u16, y: u16, id: u32, cols: u16, rows: u16) {
-    let fg = id_color(id);
     for r in 0..rows {
-        for c in 0..cols {
-            if let Some(cell) = buf.cell_mut((x + c, y + r)) {
-                cell.set_symbol(&placeholder(r, c));
-                cell.set_fg(fg);
-            }
+        render_row(buf, x, y + r, id, cols, r);
+    }
+}
+
+/// Draw only row `row` of image `id` at `(x, y)`. Lets line-based views
+/// (the chat panel) draw each visible row of a partially scrolled image.
+pub fn render_row(buf: &mut Buffer, x: u16, y: u16, id: u32, cols: u16, row: u16) {
+    let fg = id_color(id);
+    for c in 0..cols {
+        if let Some(cell) = buf.cell_mut((x + c, y)) {
+            cell.set_symbol(&placeholder(row, c));
+            cell.set_fg(fg);
         }
     }
 }
