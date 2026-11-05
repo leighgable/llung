@@ -5931,10 +5931,12 @@ name = "tui"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "base64",
  "chrono",
  "crossterm",
  "futures",
  "image",
+ "libc",
  "libp2p",
  "llung-core",
  "rand 0.10.3",

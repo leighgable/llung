@@ -1,4 +1,4 @@
-use crate::avatar::{decode_avatar_hex, fallback_avatar, render_avatar};
+use crate::avatar::{decode_attachment, decode_avatar_hex, fallback_avatar, render_avatar};
 use crate::prefix_text::PrefixText;
 use crate::registration_panel::RegistrationPanel;
 use crate::{chat_panel::ChatPanel, taffy_ui::TaffyUi};
@@ -35,7 +35,19 @@ use ratatui::{
 };
 use serde_json;
 
+use crate::settings::Settings;
+use crate::theme::watch::ThemeWatcher;
 use crate::theme::{Role, Theme};
+
+/// Theme state resolved in `main` before the TUI starts.
+pub struct ThemeStartup {
+    pub theme: Theme,
+    /// The selection that produced `theme` (name, pair or path).
+    pub selection: String,
+    pub settings: Settings,
+    /// Messages to show once the chat is up (e.g. a bad saved theme).
+    pub notices: Vec<String>,
+}
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
@@ -78,6 +90,13 @@ pub struct App {
 
     taffy_ui: TaffyUi,
     theme: Theme,
+    /// Selection behind `theme`, as the user wrote it (`/theme` shows it,
+    /// `/theme reload` re-resolves it).
+    theme_selection: String,
+    theme_watch: ThemeWatcher,
+    settings: Settings,
+    /// System messages queued until the chat screen exists.
+    pending_notices: Vec<String>,
 
     // Content
     screen: AppScreen,
@@ -106,6 +125,7 @@ impl App {
         terminal: Terminal<CrosstermBackend<io::Stdout>>,
         config: CoreConfig,
         machine: MachineIdentity,
+        theme: ThemeStartup,
     ) -> Self {
         let size = terminal
             .size()
@@ -119,7 +139,11 @@ impl App {
             cmd_tx: None,
             my_name: String::new(),
             taffy_ui: TaffyUi::new_chat_layout(size.width, size.height, false),
-            theme: Theme::from_env(),
+            theme_watch: ThemeWatcher::new(theme.theme.source.as_deref()),
+            theme: theme.theme,
+            theme_selection: theme.selection,
+            settings: theme.settings,
+            pending_notices: theme.notices,
             screen: AppScreen::Splash,
             chat_panel: ChatPanel::new(String::new()),
             registration: RegistrationPanel::new(),
@@ -211,6 +235,12 @@ impl App {
                 }
                 _ = tick.tick() => {}
             };
+            self.poll_theme_file();
+            if self.screen == AppScreen::Chat && !self.pending_notices.is_empty() {
+                for notice in std::mem::take(&mut self.pending_notices) {
+                    self.system(notice);
+                }
+            }
             self.load_missing_avatars(db);
             self.draw()?;
         }
@@ -429,6 +459,93 @@ impl App {
         }
     }
 
+    /// Show a system message in the chat panel.
+    fn system(&mut self, text: impl Into<String>) {
+        self.chat_panel
+            .push("system".into(), "system".into(), text.into(), None, None);
+    }
+
+    /// Make `theme` active and watch its file (if any) for edits.
+    fn apply_theme(&mut self, theme: Theme, selection: String) {
+        self.theme_watch = ThemeWatcher::new(theme.source.as_deref());
+        self.theme = theme;
+        self.theme_selection = selection;
+    }
+
+    /// Hot reload: re-read the active theme file after it changes. An
+    /// invalid edit keeps the current theme and reports the error.
+    /// Successful reloads are silent, so saving repeatedly while tweaking
+    /// colors doesn't flood the chat.
+    fn poll_theme_file(&mut self) {
+        if !self.theme_watch.poll() {
+            return;
+        }
+        let Some(path) = self.theme_watch.path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        match Theme::from_path(&path, self.theme.mode) {
+            Ok(theme) => {
+                tracing::info!("theme reloaded from {}", path.display());
+                self.theme = theme;
+            }
+            Err(e) => self.report_error("Theme reload failed (keeping current theme)", e),
+        }
+    }
+
+    /// `/theme [reload | <name> | <light>/<dark> | <path.json>]`
+    fn handle_theme_command(&mut self, args: &str) {
+        match args {
+            "" => {
+                let source = match &self.theme.source {
+                    Some(p) => p.display().to_string(),
+                    None => "built-in".to_string(),
+                };
+                let available: Vec<String> = Theme::available()
+                    .into_iter()
+                    .map(|n| if n == self.theme.name { format!("{n}*") } else { n })
+                    .collect();
+                self.system(format!(
+                    "Theme: {} ({source}), selection '{}', {:?} color",
+                    self.theme.name, self.theme_selection, self.theme.mode
+                ));
+                self.system(format!("Available: {}", available.join(", ")));
+                self.system(
+                    "Usage: /theme <name | light/dark | path.json> (saved) · /theme reload",
+                );
+            }
+            "reload" => match Theme::select(&self.theme_selection, self.theme.mode) {
+                Ok(theme) => {
+                    let name = theme.name.clone();
+                    let selection = self.theme_selection.clone();
+                    self.apply_theme(theme, selection);
+                    self.system(format!("Theme '{name}' reloaded"));
+                }
+                Err(e) => self.report_error("Theme reload failed (keeping current theme)", e),
+            },
+            sel => match Theme::select(sel, self.theme.mode) {
+                Ok(theme) => {
+                    let name = theme.name.clone();
+                    self.apply_theme(theme, sel.to_string());
+                    match self.settings.set_theme(sel) {
+                        Ok(()) => {
+                            let at = self
+                                .settings
+                                .path()
+                                .map(|p| format!(" (saved to {})", p.display()))
+                                .unwrap_or_default();
+                            self.system(format!("Theme set to '{name}'{at}"));
+                        }
+                        Err(e) => self.report_error(
+                            &format!("Theme set to '{name}' but not saved"),
+                            e,
+                        ),
+                    }
+                }
+                Err(e) => self.report_error("Theme not changed", e),
+            },
+        }
+    }
+
     /// Surface an error in the chat panel as a system message.
     fn report_error(&mut self, context: &str, e: impl std::fmt::Display) {
         self.chat_panel.push(
@@ -479,7 +596,7 @@ impl App {
                 // Decode thumbnail if we have the bytes locally
                 if attachment.kind == AttachmentKind::Image {
                     if let Ok(Some(bytes)) = db.get_avatar_cache(&attachment.cid) {
-                        if let Some(thumb) = decode_avatar_hex(&bytes, 6) {
+                        if let Some(thumb) = decode_attachment(&bytes) {
                             self.chat_panel
                                 .thumb_cache
                                 .insert(attachment.cid.clone(), thumb);
@@ -579,6 +696,19 @@ impl App {
         let chats = &self.chats;
         let current_topic = &self.current_topic;
         let theme = &self.theme;
+
+        // Upload newly decoded Kitty images before the frame that shows
+        // their placeholders. Order doesn't strictly matter (the terminal
+        // renders placeholders once the image arrives), but this avoids a
+        // blank flash. APC sequences don't move the cursor, so ratatui's
+        // cursor tracking stays valid.
+        let pending = crate::terminal::kitty::take_pending();
+        if !pending.is_empty() {
+            use std::io::Write;
+            let backend = self.terminal.backend_mut();
+            backend.write_all(&pending)?;
+            backend.flush()?;
+        }
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -860,6 +990,12 @@ impl App {
 
         match name {
             "/quit" | "/q" => {
+                {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&crate::terminal::cleanup_sequence());
+                    let _ = out.flush();
+                }
                 crossterm::terminal::disable_raw_mode().ok();
                 let _ = std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen);
                 std::process::exit(0);
@@ -867,6 +1003,7 @@ impl App {
             "/peers" => self.toggle_sidebar(SidebarMode::Peers),
             "/chats" => self.toggle_sidebar(SidebarMode::Chats),
             "/media" => self.toggle_sidebar(SidebarMode::Media),
+            "/theme" => self.handle_theme_command(args),
             "/invite" => {
                 if let Err(e) = self.handle_invite_command(args).await {
                     self.chat_panel
@@ -1080,7 +1217,7 @@ impl App {
             .and_then(|info| info.avatar.clone());
 
         if attachment.kind == AttachmentKind::Image {
-            if let Some(thumb) = decode_avatar_hex(&bytes, 6) {
+            if let Some(thumb) = decode_attachment(&bytes) {
                 self.chat_panel
                     .thumb_cache
                     .insert(attachment.cid.clone(), thumb);

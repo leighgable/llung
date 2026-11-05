@@ -14,6 +14,10 @@ pub enum NodeContent {
     },
     /// Bordered box, optionally titled
     Container { title: Option<String>, border: bool },
+    // Future: `Terminal { pane: PaneId }` for an embedded terminal
+    // (libghostty-vt behind the `ghostty` feature, see
+    // `crate::terminal`). Its layout rect drives the PTY size: resize the
+    // child whenever Taffy recomputes this node.
 }
 
 pub struct TaffyUi {

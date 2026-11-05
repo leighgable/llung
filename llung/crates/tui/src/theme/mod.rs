@@ -12,6 +12,8 @@
 mod color;
 pub mod file;
 mod oklab;
+pub mod system;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,10 @@ pub struct Theme {
     pub llung: LlungColors,
     /// File the theme was loaded from (`None` for built-ins).
     pub source: Option<PathBuf>,
+    /// `system` theme on a terminal that reported no colors: secondary
+    /// neutral text uses the terminal default plus SGR 2 (faint) instead
+    /// of a concrete gray, as in pi.
+    pub faint_neutrals: bool,
 }
 
 /// What a piece of UI *is*, independent of how it looks.
@@ -88,11 +94,15 @@ impl Theme {
         let c = &self.colors;
         let x = &self.llung;
         let s = Style::default();
+        // Faint secondary text (no-report `system` theme only).
+        let f = |st: Style| {
+            if self.faint_neutrals { st.add_modifier(Modifier::DIM) } else { st }
+        };
         match role {
             Role::Plain => s,
             Role::Text => s.fg(c.text),
-            Role::Muted => s.fg(c.muted),
-            Role::Dim => s.fg(c.dim),
+            Role::Muted => f(s.fg(c.muted)),
+            Role::Dim => f(s.fg(c.dim)),
             Role::Accent => s.fg(c.accent),
             Role::Success => s.fg(c.success),
             Role::Error => s.fg(c.error),
@@ -103,12 +113,12 @@ impl Theme {
 
             Role::Border => s.fg(c.border),
             Role::BorderAccent => s.fg(c.border_accent),
-            Role::BorderMuted => s.fg(c.border_muted),
+            Role::BorderMuted => f(s.fg(c.border_muted)),
 
             Role::PanelTitle => s.fg(c.text).add_modifier(Modifier::BOLD),
             Role::Selected => s.fg(c.text).bg(c.selected_bg),
             Role::ActiveItem => s.fg(c.accent).add_modifier(Modifier::BOLD),
-            Role::InactiveItem => s.fg(c.muted),
+            Role::InactiveItem => f(s.fg(c.muted)),
 
             Role::MyMessage => s.fg(c.user_message_text).bg(c.user_message_bg),
             Role::PeerMessage => s.fg(x.peer_message_text),
@@ -118,7 +128,7 @@ impl Theme {
             Role::AttachmentAudio => s.fg(c.success),
             Role::AttachmentVideo => s.fg(c.accent),
             Role::AttachmentDocument => s.fg(c.md_link),
-            Role::AttachmentMeta => s.fg(c.muted),
+            Role::AttachmentMeta => f(s.fg(c.muted)),
 
             Role::Button => s.fg(c.success),
             Role::ButtonFocused => s
@@ -171,15 +181,19 @@ impl Theme {
 
     /// Parse a theme from JSON.
     pub fn from_json(json: &str, mode: ColorMode) -> Result<Self, ThemeError> {
-        let r = file::parse(json, mode)?;
-        Ok(Self {
+        Ok(Self::from_resolved(file::parse(json, mode)?, mode))
+    }
+
+    fn from_resolved(r: file::ResolvedTheme, mode: ColorMode) -> Self {
+        Self {
             name: r.name,
             appearance: r.appearance,
             mode,
             colors: r.colors,
             llung: r.llung,
             source: None,
-        })
+            faint_neutrals: false,
+        }
     }
 
     /// Load a theme file.
@@ -192,17 +206,20 @@ impl Theme {
         Ok(theme)
     }
 
-    pub fn dark() -> Self {
-        Self::builtin("dark", ColorMode::detect()).expect("built-in dark theme")
-    }
-
-    #[allow(dead_code)] // used by the upcoming `/theme` command
-    pub fn light() -> Self {
-        Self::builtin("light", ColorMode::detect()).expect("built-in light theme")
+    /// The `system` theme, generated from the colors the terminal reported
+    /// at startup (see [`query`]). Like pi, this is the default theme.
+    pub fn system(mode: ColorMode) -> Self {
+        let generated = system::generate(&system::terminal_colors(), colorfgbg_appearance());
+        let resolved = file::parse_system(generated.theme, mode)
+            .expect("generated system theme is valid");
+        let mut theme = Self::from_resolved(resolved, mode);
+        theme.faint_neutrals = generated.faint_neutrals;
+        theme
     }
 
     fn builtin(name: &str, mode: ColorMode) -> Option<Self> {
         let json = match name {
+            system::SYSTEM_THEME_NAME => return Some(Self::system(mode)),
             "dark" => BUILTIN_DARK,
             "light" => BUILTIN_LIGHT,
             _ => return None,
@@ -236,30 +253,33 @@ impl Theme {
         Err(ThemeError(format!("theme not found: {name}")))
     }
 
-    /// Theme selected via `LLUNG_THEME` (a name, or a path to a `.json`
-    /// file), falling back to `dark` with a logged warning on any error.
-    /// Interim until the theme becomes a persisted config setting.
-    pub fn from_env() -> Self {
-        let mode = ColorMode::detect();
-        let Ok(sel) = std::env::var("LLUNG_THEME") else {
-            return Self::dark();
-        };
-        let result = if sel.ends_with(".json") {
-            let path = shellexpand::tilde(&sel).into_owned();
-            Self::from_path(Path::new(&path), mode)
-        } else {
-            Self::load(&sel, mode)
-        };
-        result.unwrap_or_else(|e| {
-            tracing::warn!("theme: {e}; using dark");
-            Self::dark()
-        })
+    /// Resolve a theme *selection* as written in settings, `--theme` or
+    /// `/theme`:
+    /// - a path to a `.json` file (`~` expanded),
+    /// - a `light/dark` pair, picked by [`terminal_appearance`],
+    /// - a theme name (see [`Theme::load`]).
+    pub fn select(selection: &str, mode: ColorMode) -> Result<Self, ThemeError> {
+        let sel = selection.trim();
+        if sel.is_empty() {
+            return Err(ThemeError("empty theme selection".into()));
+        }
+        if sel.ends_with(".json") {
+            let path = shellexpand::tilde(sel).into_owned();
+            return Self::from_path(Path::new(&path), mode);
+        }
+        if let Some((light, dark)) = sel.split_once('/') {
+            let name = match terminal_appearance() {
+                Appearance::Light => light.trim(),
+                Appearance::Dark => dark.trim(),
+            };
+            return Self::load(name, mode);
+        }
+        Self::load(sel, mode)
     }
 
     /// Names of all available themes (built-ins first, then user themes).
-    #[allow(dead_code)] // used by the upcoming `/theme` command
     pub fn available() -> Vec<String> {
-        let mut names = vec!["dark".to_string(), "light".to_string()];
+        let mut names: Vec<String> = ["system", "dark", "light"].map(String::from).to_vec();
         for dir in theme_dirs() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -281,12 +301,12 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark()
+        Self::system(ColorMode::detect())
     }
 }
 
 /// Theme search path, highest priority first:
-/// 1. `$XDG_CONFIG_HOME/llung/themes` (default `~/.config/llung/themes`)
+/// 1. `<config_dir>/themes` (default `~/.config/llung/themes`)
 /// 2. pi's user themes: `$PI_CODING_AGENT_DIR/themes` (default
 ///    `~/.pi/agent/themes`), so existing pi themes just work.
 pub fn theme_dirs() -> Vec<PathBuf> {
@@ -297,8 +317,8 @@ pub fn theme_dirs() -> Vec<PathBuf> {
     };
     let home = env("HOME");
     let mut dirs = Vec::new();
-    if let Some(cfg) = env("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config"))) {
-        dirs.push(cfg.join("llung/themes"));
+    if let Some(cfg) = crate::settings::config_dir() {
+        dirs.push(cfg.join("themes"));
     }
     if let Some(pi) =
         env("PI_CODING_AGENT_DIR").or_else(|| home.as_ref().map(|h| h.join(".pi/agent")))
@@ -306,6 +326,33 @@ pub fn theme_dirs() -> Vec<PathBuf> {
         dirs.push(pi.join("themes"));
     }
     dirs
+}
+
+/// Whether the terminal has a light or dark background: from the colors
+/// it reported at startup (OSC 10/11), else `COLORFGBG` (`"fg;bg"`, set by
+/// rxvt, Konsole, iTerm2 and others), else dark. Picks the side of a
+/// `light/dark` theme pair.
+pub fn terminal_appearance() -> Appearance {
+    let reported = system::terminal_colors();
+    match reported.background {
+        Some(bg) => system::terminal_appearance(bg, reported.foreground),
+        None => colorfgbg_appearance(),
+    }
+}
+
+fn colorfgbg_appearance() -> Appearance {
+    appearance_from_colorfgbg(std::env::var("COLORFGBG").ok().as_deref())
+}
+
+fn appearance_from_colorfgbg(value: Option<&str>) -> Appearance {
+    let bg = value
+        .and_then(|v| v.rsplit(';').next())
+        .and_then(|b| b.trim().parse::<u8>().ok());
+    match bg {
+        // ANSI white / bright colors except bright black (8).
+        Some(7) | Some(9..=15) => Appearance::Light,
+        _ => Appearance::Dark,
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +367,28 @@ mod tests {
         let l = Theme::builtin("light", ColorMode::TrueColor).unwrap();
         assert_eq!(l.appearance, Appearance::Light);
         assert!(Theme::builtin("nope", ColorMode::TrueColor).is_none());
+    }
+
+    #[test]
+    fn select_forms() {
+        let m = ColorMode::TrueColor;
+        assert_eq!(Theme::select("light", m).unwrap().name, "light");
+        let pair = Theme::select("light/dark", m).unwrap();
+        assert!(pair.name == "light" || pair.name == "dark");
+        assert!(Theme::select("", m).is_err());
+        assert!(Theme::select("/nonexistent/x.json", m).is_err());
+        // Exactly one side of a pair is used; a bad name on that side fails.
+        assert!(Theme::select("nope/nope", m).is_err());
+    }
+
+    #[test]
+    fn colorfgbg() {
+        assert_eq!(appearance_from_colorfgbg(None), Appearance::Dark);
+        assert_eq!(appearance_from_colorfgbg(Some("15;0")), Appearance::Dark);
+        assert_eq!(appearance_from_colorfgbg(Some("0;15")), Appearance::Light);
+        assert_eq!(appearance_from_colorfgbg(Some("0;default;7")), Appearance::Light);
+        assert_eq!(appearance_from_colorfgbg(Some("7;8")), Appearance::Dark);
+        assert_eq!(appearance_from_colorfgbg(Some("garbage")), Appearance::Dark);
     }
 
     #[test]

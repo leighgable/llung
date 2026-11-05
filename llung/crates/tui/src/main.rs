@@ -18,10 +18,98 @@ mod chat_panel;
 mod events;
 mod prefix_text;
 mod registration_panel;
+mod settings;
 mod taffy_ui;
+mod terminal;
 mod theme;
 
-use app::App;
+use app::{App, ThemeStartup};
+use settings::Settings;
+use theme::{ColorMode, Theme};
+
+const USAGE: &str = "\
+Usage: tui [OPTIONS]
+
+Options:
+  --theme <THEME>   Theme for this session (not saved): a name, a light/dark
+                    pair, or a path to a .json theme file
+  --list-themes     List available themes and exit
+  -h, --help        Show this help
+
+Environment:
+  LLUNG_THEME       Theme selection, overridden by --theme
+  LLUNG_COLOR_MODE  Force color mode: truecolor | 256
+  LLUNG_GRAPHICS    Force image backend: kitty | halfblocks
+
+Themes are pi-compatible JSON files, searched in ~/.config/llung/themes
+and ~/.pi/agent/themes. Use /theme in the chat to switch and save.";
+
+struct Cli {
+    theme: Option<String>,
+}
+
+fn parse_args() -> Result<Cli, String> {
+    let mut cli = Cli { theme: None };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            "--list-themes" => {
+                for name in Theme::available() {
+                    println!("{name}");
+                }
+                std::process::exit(0);
+            }
+            "--theme" => {
+                cli.theme = Some(args.next().ok_or("--theme needs a value")?);
+            }
+            _ => match arg.strip_prefix("--theme=") {
+                Some(v) => cli.theme = Some(v.to_string()),
+                None => return Err(format!("unknown argument: {arg}\n\n{USAGE}")),
+            },
+        }
+    }
+    Ok(cli)
+}
+
+/// Resolve the startup theme. Precedence: `--theme` (this session only)
+/// > `LLUNG_THEME` > saved setting > `system`.
+///
+/// A bad `--theme` is a hard error, reported before the TUI starts. A bad
+/// env or saved selection falls back to `system`, with a notice shown in
+/// the chat.
+fn initial_theme(cli_theme: Option<String>) -> Result<ThemeStartup, String> {
+    let mode = ColorMode::detect();
+    let (settings, settings_err) = Settings::load();
+    let mut notices: Vec<String> = settings_err
+        .into_iter()
+        .map(|e| format!("Settings ignored: {e}"))
+        .collect();
+
+    if let Some(sel) = cli_theme {
+        let theme = Theme::select(&sel, mode).map_err(|e| format!("--theme: {e}"))?;
+        return Ok(ThemeStartup { theme, selection: sel, settings, notices });
+    }
+
+    let env = std::env::var("LLUNG_THEME").ok().filter(|s| !s.trim().is_empty());
+    let (source, sel) = match (&env, settings.theme()) {
+        (Some(sel), _) => ("LLUNG_THEME", sel.clone()),
+        (None, Some(sel)) => ("saved theme", sel.to_string()),
+        (None, None) => ("default", "system".to_string()),
+    };
+    let (theme, selection) = match Theme::select(&sel, mode) {
+        Ok(t) => (t, sel),
+        Err(e) => {
+            tracing::warn!("{source} '{sel}': {e}");
+            notices.push(format!("{source} '{sel}' failed ({e}); using system"));
+            (Theme::system(mode), "system".to_string())
+        }
+    };
+    Ok(ThemeStartup { theme, selection, settings, notices })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +117,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::fs::File::create("llung.log").unwrap())
         .with_ansi(false)
         .try_init();
+
+    let cli = match parse_args() {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    // Probe the terminal (colors for the `system` theme and `light/dark`,
+    // Kitty graphics for inline images) before anything else reads input.
+    terminal::init();
+    // Resolve the theme before the profile picker, so a bad --theme fails fast.
+    let theme = match initial_theme(cli.theme) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
 
     // ── 1. Profile selection in NORMAL terminal mode ──
     let db_path = run_profile_picker().await?;
@@ -42,10 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let config = CoreConfig::new(db_path, "introductions".into());
-    let mut app = App::new(terminal, config, machine);
+    let mut app = App::new(terminal, config, machine, theme);
     let result = app.run(&mut db).await;
 
     // ── 3. Cleanup ──
+    let _ = stdout().write_all(&terminal::cleanup_sequence());
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     result
@@ -73,7 +181,10 @@ async fn run_profile_picker() -> io::Result<std::path::PathBuf> {
         io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        if io::stdin().read_line(&mut input)? == 0 {
+            // EOF (stdin closed/piped): don't spin on "Invalid option".
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no profile selected"));
+        }
 
         match input.trim().parse::<usize>() {
             Ok(n) if n >= 1 && n <= identities.len() => {

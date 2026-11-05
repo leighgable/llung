@@ -263,7 +263,19 @@ pub fn parse(json: &str, mode: ColorMode) -> Result<ResolvedTheme, ThemeError> {
     let json = json.strip_prefix('\u{feff}').unwrap_or(json);
     let file: ThemeFile =
         serde_json::from_str(json).map_err(|e| ThemeError(format!("invalid theme JSON: {e}")))?;
+    resolve(file, mode, false)
+}
 
+/// Resolve the generated `system` theme document (the one place the
+/// reserved name is allowed). It goes through the same validation as
+/// files, so a generator bug can't produce a partial palette.
+pub fn parse_system(doc: Value, mode: ColorMode) -> Result<ResolvedTheme, ThemeError> {
+    let file: ThemeFile = serde_json::from_value(doc)
+        .map_err(|e| ThemeError(format!("generated system theme invalid: {e}")))?;
+    resolve(file, mode, true)
+}
+
+fn resolve(file: ThemeFile, mode: ColorMode, system: bool) -> Result<ResolvedTheme, ThemeError> {
     let name = file.name.trim();
     if name.is_empty() {
         return err("theme name must not be empty");
@@ -273,7 +285,7 @@ pub fn parse(json: &str, mode: ColorMode) -> Result<ResolvedTheme, ThemeError> {
             "invalid theme name \"{name}\": '/' is reserved for light/dark theme pairs"
         ));
     }
-    if name == "system" {
+    if name == "system" && !system {
         return err("\"system\" is a reserved theme name");
     }
     if let Some(bad) = file

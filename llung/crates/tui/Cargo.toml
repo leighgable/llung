@@ -23,3 +23,12 @@ uuid = "1.26.1"
 rand = "0.10.3"
 rand_core = "0.10.1"
 shellexpand = "3.1.2"
+base64 = "0.22"
+
+# Embedded terminal panes (future, see `src/terminal/mod.rs`): an opt-in
+# feature so machines without the Zig toolchain never build libghostty.
+# [features]
+# ghostty = ["dep:libghostty-vt-sys"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
