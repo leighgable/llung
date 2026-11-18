@@ -104,6 +104,22 @@ pub enum Role {
 
     Button,
     ButtonFocused,
+
+    /// Markdown: headings, links, inline code, code blocks, quotes,
+    /// rules, list bullets. Colors come from the theme's md* palette.
+    MdHeading,
+    MdLink,
+    MdLinkUrl,
+    MdCode,
+    MdCodeBlock,
+    MdCodeBlockBorder,
+    MdQuote,
+    MdQuoteBorder,
+    MdHr,
+    MdListBullet,
+    /// `**strong**` and `*emphasis*`: base text with a modifier.
+    MdStrong,
+    MdEm,
     Logo,
 
     /// Tool panel fill: `toolPendingBg` / `toolSuccessBg` / `toolErrorBg`.
@@ -161,6 +177,19 @@ impl Theme {
                 .fg(self.concrete_bg())
                 .bg(c.success)
                 .add_modifier(Modifier::BOLD),
+
+            Role::MdHeading => s.fg(c.md_heading).add_modifier(Modifier::BOLD),
+            Role::MdLink => s.fg(c.md_link).add_modifier(Modifier::UNDERLINED),
+            Role::MdLinkUrl => s.fg(c.md_link_url).add_modifier(Modifier::DIM),
+            Role::MdCode => s.fg(c.md_code).bg(x.panel_bg),
+            Role::MdCodeBlock => s.fg(c.md_code_block).bg(x.panel_bg),
+            Role::MdCodeBlockBorder => s.fg(c.md_code_block_border),
+            Role::MdQuote => s.fg(c.md_quote),
+            Role::MdQuoteBorder => s.fg(c.md_quote_border),
+            Role::MdHr => s.fg(c.md_hr),
+            Role::MdListBullet => s.fg(c.md_list_bullet),
+            Role::MdStrong => s.fg(c.text).add_modifier(Modifier::BOLD),
+            Role::MdEm => s.fg(c.text).add_modifier(Modifier::ITALIC),
             Role::Logo => s.fg(c.accent).add_modifier(Modifier::BOLD),
 
             Role::ToolPanel(state) => s.fg(c.tool_output).bg(self.tool_bg(state)),

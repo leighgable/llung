@@ -33,6 +33,9 @@ pub struct ToolBlock {
 pub enum ToolBody {
     Running,
     Plot(Plot),
+    /// A `sugi-v1` render document: node coordinates + edges, drawn as
+    /// boxes with orthogonal connectors (see `SugiDiagram`).
+    Sugi(SugiDiagram),
     Text(String),
 }
 
@@ -54,6 +57,8 @@ impl ToolBlock {
             (ToolState::Error, String::new(), ToolBody::Text(content.to_string()))
         } else if let Some(plot) = Plot::parse(content) {
             (ToolState::Success, plot.title.clone(), ToolBody::Plot(plot))
+        } else if let Some(sugi) = SugiDiagram::parse(content) {
+            (ToolState::Success, sugi.title.clone(), ToolBody::Sugi(sugi))
         } else {
             (ToolState::Success, String::new(), ToolBody::Text(content.to_string()))
         };
@@ -84,7 +89,11 @@ impl ToolBlock {
 
         match &self.body {
             ToolBody::Running => {
-                lines.push(PanelLine::text(vec![(" running…".into(), Role::Muted)]));
+                // The braille spinner is plain Unicode text: it animates
+                // in any terminal, graphics protocol or not.
+                lines.push(PanelLine::text(vec![
+                    (format!(" {} running…", crate::spinner::frame()), Role::Muted),
+                ]));
             }
             ToolBody::Text(text) => {
                 let role = if self.state == ToolState::Error { Role::Error } else { Role::ToolOutput };
@@ -97,6 +106,11 @@ impl ToolBlock {
                 lines.extend(plot_lines(&fitted, theme));
                 if fitted.has_levels() {
                     lines.push(legend(&fitted));
+                }
+            }
+            ToolBody::Sugi(sugi) => {
+                for row in sugi.render_rows(inner as usize) {
+                    lines.push(PanelLine::text(vec![(format!(" {row}"), Role::ToolOutput)]));
                 }
             }
         }
@@ -137,20 +151,257 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// `{"expr": "sin(x)"}` → `sin(x)`; other JSON → compact `k=v` pairs.
+/// `{"expr": "sin(x)"}` → `sin(x)`. A `title` wins over `expr`
+/// (diagram/artist pass one). Extra arguments (camera choices) are
+/// appended: `{"expr": "sin(x)", "pitch": 0}` → `sin(x)  pitch=0` —
+/// a model-picked bad view must be visible in the panel, not hidden.
 fn summarize_args(arguments: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(serde_json::Value::Object(map)) => {
-            if let Some(expr) = map.get("expr").and_then(|v| v.as_str()) {
-                return expr.to_string();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(title) = map.get("title").and_then(|v| v.as_str()) {
+                parts.push(title.to_string());
+            } else if let Some(expr) = map.get("expr").and_then(|v| v.as_str()) {
+                parts.push(expr.to_string());
             }
-            map.iter()
-                .map(|(k, v)| format!("{k}={}", v.as_str().map(String::from).unwrap_or(v.to_string())))
-                .collect::<Vec<_>>()
-                .join(" ")
+            for (k, v) in map.iter() {
+                if k == "expr" || k == "title" || k == "graph" || k == "csv" {
+                    continue;
+                }
+                parts.push(format!(
+                    "{k}={}",
+                    v.as_str().map(String::from).unwrap_or(v.to_string())
+                ));
+            }
+            parts.join("  ")
         }
         _ => arguments.trim().to_string(),
     }
+}
+
+// ── Sugi diagrams ──
+
+/// One node of a `sugi-v1` render document (character units).
+#[derive(Clone, Debug, PartialEq)]
+struct SugiNode {
+    id: String,
+    label: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SugiEdge {
+    from: String,
+    to: String,
+    label: Option<String>,
+}
+
+/// A layered graph layout from the `sugi` tool: the tool does the
+/// Sugiyama math and returns coordinates; THIS side places boxes on a
+/// character grid and draws orthogonal connectors with
+/// `ratatui::symbols::line` glyphs, so the diagram re-fits the viewer's
+/// width at render time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SugiDiagram {
+    pub title: String,
+    nodes: Vec<SugiNode>,
+    edges: Vec<SugiEdge>,
+    width: f64,
+    height: f64,
+    max_width: Option<f64>,
+}
+
+impl SugiDiagram {
+    pub fn parse(content: &str) -> Option<SugiDiagram> {
+        let doc: serde_json::Value = serde_json::from_str(content).ok()?;
+        if doc.get("render")?.as_str()? != "sugi-v1" {
+            return None;
+        }
+        let num = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_f64());
+        let nodes = doc
+            .get("nodes")?
+            .as_array()?
+            .iter()
+            .map(|n| {
+                Some(SugiNode {
+                    id: n.get("id")?.as_str()?.to_string(),
+                    label: n.get("label")?.as_str()?.to_string(),
+                    x: num(n, "x")?,
+                    y: num(n, "y")?,
+                    w: num(n, "w")?,
+                    h: num(n, "h")?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let edges = doc
+            .get("edges")?
+            .as_array()?
+            .iter()
+            .map(|e| {
+                Some(SugiEdge {
+                    from: e.get("from")?.as_str()?.to_string(),
+                    to: e.get("to")?.as_str()?.to_string(),
+                    label: e.get("label").and_then(|l| l.as_str()).map(String::from),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if nodes.is_empty() {
+            return None;
+        }
+        Some(SugiDiagram {
+            title: doc.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            nodes,
+            edges,
+            width: doc.get("width").and_then(|w| w.as_f64()).unwrap_or(40.0),
+            height: doc.get("height").and_then(|h| h.as_f64()).unwrap_or(10.0),
+            max_width: doc.get("max_width").and_then(|w| w.as_f64()),
+        })
+    }
+
+    /// Draw the diagram at most `max_cols` columns wide; returns the
+    /// rows (without panel padding — the caller adds it).
+    fn render_rows(&self, max_cols: usize) -> Vec<String> {
+        use ratatui::symbols::line as g;
+        const MAX_ROWS: f64 = 40.0;
+        let limit = self.max_width.unwrap_or(f64::INFINITY).min(max_cols as f64);
+        let scale = (limit / self.width.max(1.0))
+            .min(1.0)
+            .min(MAX_ROWS / self.height.max(1.0));
+        let rows = ((self.height * scale).ceil() as usize).max(1);
+        let mut grid = vec![vec![' '; max_cols]; rows];
+
+        let rect = |id: &str| -> Option<(usize, usize, usize, usize)> {
+            let n = self.nodes.iter().find(|n| n.id == id)?;
+            Some((
+                (n.x * scale).round() as usize,
+                (n.y * scale).round() as usize,
+                ((n.w * scale).round() as usize).max(4),
+                ((n.h * scale).round() as usize).max(3),
+            ))
+        };
+
+        // Line-drawing chars merge to a cross on overlap; boxes redraw
+        // their borders afterwards, so connectors visually pass BEHIND
+        // node boxes.
+        let mut put = |grid: &mut Vec<Vec<char>>, x: usize, y: usize, c: char| {
+            if y >= grid.len() || x >= grid[y].len() {
+                return;
+            }
+            let old = grid[y][x];
+            // Cross only when two straight segments intersect; corners
+            // and labels drawn over a straight line win outright.
+            grid[y][x] = if old != ' ' && old != c && is_straight(old) && is_straight(c) {
+                '┼'
+            } else {
+                c
+            };
+        };
+
+        // 1) Edges, orthogonal: exit bottom-center, elbow at the
+        // vertical midpoint, enter top-center with an arrow.
+        for edge in &self.edges {
+            let Some((sx, sy, sw, sh)) = rect(&edge.from) else { continue };
+            let Some((tx, ty, tw, _th)) = rect(&edge.to) else { continue };
+            let (scx, tcx) = (sx + sw / 2, tx + tw / 2);
+            if ty >= sy + sh {
+                // Target below: the standard layered case.
+                let start_y = sy + sh; // just under the bottom border
+                let arrow_y = ty - 1; // just above the top border
+                if arrow_y <= start_y {
+                    continue;
+                }
+                let mid_y = (start_y + arrow_y) / 2;
+                for y in start_y..=mid_y.min(arrow_y - 1) {
+                    put(&mut grid, scx, y, g::VERTICAL.chars().next().unwrap());
+                }
+                if scx != tcx {
+                    let (lo, hi) = (scx.min(tcx), scx.max(tcx));
+                    for x in lo..=hi {
+                        put(&mut grid, x, mid_y, g::HORIZONTAL.chars().next().unwrap());
+                    }
+                    // Corners: down→horizontal, horizontal→down.
+                    let (c1, c2) = if tcx > scx {
+                        ('└', '┌')
+                    } else {
+                        ('┘', '┐')
+                    };
+                    put(&mut grid, scx, mid_y, c1);
+                    put(&mut grid, tcx, mid_y, c2);
+                    for y in (mid_y + 1)..arrow_y {
+                        put(&mut grid, tcx, y, g::VERTICAL.chars().next().unwrap());
+                    }
+                    // Edge label sits on the horizontal segment.
+                    if let Some(label) = &edge.label {
+                        let label: String = label.chars().take(hi - lo).collect();
+                        let lx = lo + (hi - lo).saturating_sub(label.chars().count()) / 2;
+                        for (i, ch) in label.chars().enumerate() {
+                            put(&mut grid, lx + i, mid_y, ch);
+                        }
+                    }
+                } else {
+                    // Straight drop, no elbow.
+                    for y in start_y..arrow_y {
+                        put(&mut grid, scx, y, g::VERTICAL.chars().next().unwrap());
+                    }
+                }
+                put(&mut grid, tcx, arrow_y, '▼');
+            } else {
+                // Same layer / target above (non-layered leftovers):
+                // straight horizontal connector with a side arrow.
+                let y = sy + sh / 2;
+                let (lo, hi) = (sx.min(tx) + sw, sx.max(tx));
+                if hi <= lo {
+                    continue;
+                }
+                for x in lo..hi {
+                    put(&mut grid, x, y, g::HORIZONTAL.chars().next().unwrap());
+                }
+                put(&mut grid, if tx > sx { hi - 1 } else { lo }, y, if tx > sx { '▶' } else { '◀' });
+            }
+        }
+
+        // 2) Boxes (over the connectors): rounded borders, label
+        // centered on the middle row.
+        for node in &self.nodes {
+            let Some((x, y, w, h)) = rect(&node.id) else { continue };
+            if x + w > max_cols || y + h > rows {
+                continue;
+            }
+            for i in 0..w {
+                put(&mut grid, x + i, y, if i == 0 { '╭' } else if i == w - 1 { '╮' } else { '─' });
+                put(
+                    &mut grid,
+                    x + i,
+                    y + h - 1,
+                    if i == 0 { '╰' } else if i == w - 1 { '╯' } else { '─' },
+                );
+            }
+            for row in y + 1..y + h - 1 {
+                put(&mut grid, x, row, g::VERTICAL.chars().next().unwrap());
+                put(&mut grid, x + w - 1, row, g::VERTICAL.chars().next().unwrap());
+            }
+            let label: String = node.label.chars().take(w.saturating_sub(2)).collect();
+            let lx = x + 1 + (w.saturating_sub(2 + label.chars().count())) / 2;
+            let ly = y + h / 2;
+            for (i, ch) in label.chars().enumerate() {
+                put(&mut grid, lx + i, ly, ch);
+            }
+        }
+
+        grid.into_iter()
+            .map(|row| {
+                let s: String = row.into_iter().collect::<String>();
+                s.trim_end().to_string()
+            })
+            .collect()
+    }
+}
+
+fn is_straight(c: char) -> bool {
+    matches!(c, '─' | '│')
 }
 
 // ── Plots ──
@@ -415,6 +666,64 @@ fn legend(plot: &Plot) -> PanelLine {
 mod tests {
     use super::*;
 
+    fn sugi_doc() -> String {
+        serde_json::json!({
+            "render": "sugi-v1",
+            "title": "flow",
+            "width": 40.0,
+            "height": 9.0,
+            "nodes": [
+                {"id": "A", "label": "Intake", "x": 4.0, "y": 0.0, "w": 12.0, "h": 3.0},
+                {"id": "B", "label": "Plan", "x": 18.0, "y": 6.0, "w": 8.0, "h": 3.0}
+            ],
+            "edges": [{"from": "A", "to": "B", "label": "go"}]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sugi_doc_parses_and_renders_boxes_and_orthogonal_edge() {
+        let diagram = SugiDiagram::parse(&sugi_doc()).expect("sugi-v1 doc parses");
+        assert_eq!(diagram.title, "flow");
+        assert_eq!(diagram.nodes.len(), 2);
+        let rows = diagram.render_rows(80);
+        let art = rows.join("\n");
+        // Rounded box around each label.
+        assert!(art.contains('╭') && art.contains('╯'), "boxes:\n{art}");
+        assert!(art.contains("Intake") && art.contains("Plan"), "labels:\n{art}");
+        // Orthogonal connector: vertical run + arrow into the target.
+        assert!(art.contains('│'), "vertical line:\n{art}");
+        assert!(art.contains('▼'), "arrowhead:\n{art}");
+        // Edge label rides the horizontal segment.
+        assert!(art.contains('└') || art.contains('┌'), "elbow:\n{art}");
+    }
+
+    #[test]
+    fn sugi_renders_within_width_cap() {
+        // serde_json compacts: no spaces in the pattern.
+        let doc = sugi_doc().replace("\"width\":40.0", "\"width\":40.0,\"max_width\":20.0");
+        let diagram = SugiDiagram::parse(&doc).unwrap();
+        for row in diagram.render_rows(80) {
+            assert!(row.chars().count() <= 21, "row over cap: {row:?}");
+        }
+    }
+
+    #[test]
+    fn sugi_parse_rejects_other_documents() {
+        assert!(SugiDiagram::parse("{\"render\": \"braille-v1\"}").is_none());
+        assert!(SugiDiagram::parse("not json").is_none());
+        // Missing nodes array → not a sugi doc.
+        assert!(SugiDiagram::parse("{\"render\": \"sugi-v1\"}").is_none());
+    }
+
+    #[test]
+    fn tool_block_routes_sugi_output_to_the_diagram_body() {
+        let block = ToolBlock::response(Some("id".into()), "sugi".into(), &sugi_doc(), false);
+        assert!(matches!(block.body, ToolBody::Sugi(_)), "body: {:?}", block.body);
+        assert_eq!(block.subtitle, "flow");
+    }
+
+
     fn doc(rows: &[&str], levels: &[&str]) -> String {
         serde_json::json!({
             "render": "braille-v1", "title": "sin(x)", "width": rows[0].chars().count(),
@@ -502,8 +811,15 @@ mod tests {
 
     #[test]
     fn args_summary() {
-        assert_eq!(summarize_args(r#"{"expr": "sin(x)", "grid": 9}"#), "sin(x)");
+        assert_eq!(summarize_args(r#"{"expr": "sin(x)", "grid": 9}"#), "sin(x)  grid=9");
         assert_eq!(summarize_args(r#"{"grid": 9}"#), "grid=9");
+        assert_eq!(summarize_args(r#"{"expr": "cos(x)*sin(y)", "pitch": 0, "distance": 1}"#),
+                   "cos(x)*sin(y)  distance=1  pitch=0");
+        // A title wins; the bulky 'graph' payload stays out of the subtitle.
+        assert_eq!(
+            summarize_args(r#"{"graph": "A: Alpha\nB: Beta\nA -> B\n", "title": "agent loop"}"#),
+            "agent loop"
+        );
         assert_eq!(truncate("abcdef", 4), "abc…");
     }
 }

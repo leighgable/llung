@@ -29,7 +29,7 @@
 use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::network::message::ChatMessage;
+use crate::network::message::{ChatMessage, MessageKind};
 
 #[derive(Debug, Clone)]
 pub struct DagNode {
@@ -181,6 +181,162 @@ impl ChatDag {
         }
 
         out
+    }
+
+    /// The linear view of ONE branch: the ancestor chain of `id`, root
+    /// first. Every node has exactly one parent, so this is always a
+    /// plain chain — the "current branch" of the chat UI and of an
+    /// agent's context. Unknown id yields an empty chain.
+    pub fn ancestors_of(&self, id: &str) -> Vec<&ChatMessage> {
+        let mut chain = Vec::new();
+        let mut cur = self.nodes.get(id);
+        while let Some(node) = cur {
+            chain.push(&node.message);
+            cur = node
+                .message
+                .parent_id
+                .as_ref()
+                .and_then(|pid| self.nodes.get(pid));
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Childless tips of one topic — each is the head of a branch.
+    pub fn leaves_of(&self, topic: &str) -> Vec<&String> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.message.topic == topic && node.children.is_empty()
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The tip an unfocused view follows: the leaf with the greatest
+    /// (hash, id). Deterministic on purpose — the same choice every peer
+    /// computes, independent of wall clocks (see the module header).
+    pub fn tip_of(&self, topic: &str) -> Option<String> {
+        self.leaves_of(topic)
+            .into_iter()
+            .max_by_key(|id| (self.nodes[*id].hash, (*id).clone()))
+            .cloned()
+    }
+
+    /// Sibling branches at `id`'s fork point: the other children of its
+    /// parent (or the other roots, for a root). The view cursor walks
+    /// this list with next/prev.
+    pub fn siblings_of(&self, id: &str) -> Vec<String> {
+        let Some(node) = self.nodes.get(id) else {
+            return Vec::new();
+        };
+        let mut sibs = match &node.message.parent_id {
+            Some(pid) => self
+                .nodes
+                .get(pid)
+                .map(|p| p.children.clone())
+                .unwrap_or_default(),
+            None => self
+                .topic_roots
+                .get(&node.message.topic)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        sibs.retain(|s| s != id);
+        sibs
+    }
+
+    /// The context view for an agent addressed on `trigger_id` (and the
+    /// TUI's linear view of a branch): the trigger's ancestor chain, with
+    /// every *non-human* reply hanging off that chain folded in — parallel
+    /// agent replies, tool calls and their responses — ordered by
+    /// (timestamp, hash).
+    ///
+    /// Human children that are not the chain continuation are explicit
+    /// `/branch` forks: their whole subtree stays OUT of the context —
+    /// unless the trigger itself lives on that fork, in which case the
+    /// fork IS the chain (its own human children still isolate further
+    /// sub-forks).
+    ///
+    /// Net effect: agents @'d on the same message all see each other's
+    /// replies (the chat stays linear); only explicit forks isolate
+    /// context. Views only — the canonical `topic_linear` is untouched.
+    pub fn context_chain(&self, trigger_id: &str) -> Vec<&ChatMessage> {
+        let chain = self.ancestors_of(trigger_id);
+        let mut out = Vec::with_capacity(chain.len());
+        for (i, msg) in chain.iter().enumerate() {
+            out.push(*msg);
+            let chain_child = chain.get(i + 1).map(|m| m.id.as_str());
+            let Some(node) = self.nodes.get(&msg.id) else {
+                continue;
+            };
+            let mut chatter: Vec<&String> = node
+                .children
+                .iter()
+                .filter(|c| Some(c.as_str()) != chain_child)
+                .filter(|c| {
+                    !matches!(
+                        self.nodes[*c].message.kind,
+                        MessageKind::Human | MessageKind::Media(_)
+                    )
+                })
+                .collect();
+            chatter.sort_by_key(|c| {
+                (
+                    self.nodes[*c].message.timestamp,
+                    self.nodes[*c].hash,
+                    (*c).clone(),
+                )
+            });
+            for c in chatter {
+                self.collect_chatter(c, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Depth-first fold of a chatter subtree (agent reply trees,
+    /// tool-call → response chains): everything under it is
+    /// conversational by construction — include it all, deterministically
+    /// ordered by (timestamp, hash).
+    fn collect_chatter<'a>(&'a self, id: &str, out: &mut Vec<&'a ChatMessage>) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        out.push(&node.message);
+        let mut children: Vec<&String> = node.children.iter().collect();
+        children.sort_by_key(|c| {
+            (
+                self.nodes[*c].message.timestamp,
+                self.nodes[*c].hash,
+                (*c).clone(),
+            )
+        });
+        for c in children {
+            self.collect_chatter(c, out);
+        }
+    }
+
+    /// Ordered sibling branches at `id`'s fork point, INCLUDING `id`:
+    /// the parent's children in this topic (or the topic's roots),
+    /// ordered deterministically by (hash, id) — the list `/branch
+    /// next`/`prev` walks.
+    pub fn branch_options(&self, id: &str) -> Vec<String> {
+        let Some(node) = self.nodes.get(id) else {
+            return Vec::new();
+        };
+        let topic = node.message.topic.clone();
+        let mut opts = match &node.message.parent_id {
+            Some(pid) => self
+                .nodes
+                .get(pid)
+                .map(|p| p.children.clone())
+                .unwrap_or_default(),
+            None => self.topic_roots.get(&topic).cloned().unwrap_or_default(),
+        };
+        opts.retain(|c| self.nodes[c].message.topic == topic);
+        opts.sort_by_key(|c| (self.nodes[c].hash, c.clone()));
+        opts
     }
 
     /// Global epoch root: a merkle fold over the sorted frontier (childless
@@ -341,6 +497,92 @@ mod tests {
         let mut dag = mk();
         dag.insert(msg("d", "t", Some("b"), "new tip"));
         assert_ne!(dag.epoch_root(), mk().epoch_root());
+    }
+
+    #[test]
+    fn ancestors_form_the_branch_view() {
+        let mut dag = ChatDag::new();
+        dag.insert(msg("a", "t", None, "root"));
+        dag.insert(msg("b", "t", Some("a"), "reply"));
+        dag.insert(msg("c", "t", Some("b"), "fork one"));
+        dag.insert(msg("d", "t", Some("b"), "fork two"));
+        dag.insert(msg("e", "other", None, "different topic"));
+
+        let chain: Vec<&str> = dag.ancestors_of("d").iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(chain, vec!["a", "b", "d"], "forks stay on their own branch");
+        assert!(dag.ancestors_of("missing").is_empty());
+        // The other topic never leaks into a branch view.
+        assert!(!chain.contains(&"e"));
+    }
+
+    #[test]
+    fn tip_is_the_greatest_leaf_and_siblings_share_a_parent() {
+        let mut dag = ChatDag::new();
+        dag.insert(msg("a", "t", None, "root"));
+        dag.insert(msg("b", "t", Some("a"), "main"));
+        dag.insert(msg("c", "t", Some("a"), "side branch"));
+        dag.insert(msg("d", "u", None, "other topic"));
+
+        let tip = dag.tip_of("t").expect("a tip");
+        assert!(dag.nodes[&tip].children.is_empty());
+        assert_eq!(dag.nodes[&tip].message.topic, "t");
+        assert_ne!(tip_of_view(&dag, "t"), "d", "other topic's leaf excluded");
+
+        let mut sibs = dag.siblings_of("b");
+        sibs.sort();
+        assert_eq!(sibs, vec!["c".to_string()]);
+        // Roots are siblings of each other.
+        let mut root_sibs = dag.siblings_of("a");
+        root_sibs.sort();
+        assert!(root_sibs.is_empty(), "only root in topic t");
+        assert!(dag.siblings_of("missing").is_empty());
+    }
+
+    fn tip_of_view(dag: &ChatDag, topic: &str) -> String {
+        dag.tip_of(topic).unwrap()
+    }
+
+    #[test]
+    fn context_chain_keeps_parallel_agents_linear_and_forks_out() {
+        let agent_msg = |id: &str, topic: &str, parent: Option<&str>, content: &str, ts: u64| {
+            let mut m = msg(id, topic, parent, content);
+            m.kind = MessageKind::Agent;
+            m.timestamp = ts;
+            m
+        };
+        let mut dag = ChatDag::new();
+        dag.insert(msg("h1", "t", None, "hello"));
+        dag.insert(msg("h2", "t", Some("h1"), "agents, compare notes"));
+        // Two agents @'d on h2 in parallel, plus a tool call + response.
+        dag.insert(agent_msg("a1", "t", Some("h2"), "from agent one", 30));
+        dag.insert(agent_msg("t1", "t", Some("h2"), "TOOL {}", 31));
+        dag.insert(agent_msg("r1", "t", Some("t1"), "tool output", 32));
+        dag.insert(agent_msg("a2", "t", Some("h2"), "from agent two", 33));
+        // An explicit /branch fork off h1, with an agent reply on it.
+        let mut f1 = msg("f1", "t", Some("h1"), "forked aside");
+        f1.timestamp = 20;
+        dag.insert(f1);
+        dag.insert(agent_msg("fa", "t", Some("f1"), "agent on the fork", 21));
+
+        // An agent addressed on the main chain sees the OTHER agent's
+        // reply and the tool traffic — the conversation is linear.
+        let ctx: Vec<&str> = dag
+            .context_chain("h2")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ctx, vec!["h1", "h2", "a1", "t1", "r1", "a2"]);
+        assert!(!ctx.contains(&"f1"), "explicit fork excluded");
+        assert!(!ctx.contains(&"fa"));
+
+        // An agent addressed on the fork sees the fork chain — and the
+        // fork's own chatter, but not the main branch's humans.
+        let fctx: Vec<&str> = dag
+            .context_chain("fa")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(fctx, vec!["h1", "f1", "fa"]);
     }
 
     #[test]

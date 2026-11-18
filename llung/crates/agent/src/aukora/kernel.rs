@@ -48,10 +48,27 @@ pub enum ReceiptStatus {
     Replayed,
 }
 
+/// A standing (perpetual) grant: authorizes every manifest matching
+/// (agent_id, effect), argument-agnostic, without consuming nonces.
+/// Created by the operator via `/grant <effect> perpetual` or the
+/// prompt's "always" answer; `authorized_by` is the supervisor pin that
+/// vouched for it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StandingGrant {
+    pub agent_id: String,
+    pub effect: String,
+    pub authorized_by: [u8; 32],
+}
+
 pub struct KernelState {
     pub pinned_keys: HashSet<[u8; 32]>, // Strict key pinning vs TOFU
     pub executed_nonces: HashSet<u64>,  // Anti-replay state tracking
     pub current_history_root: [u8; 32], // Current Merkle root
+    /// Monotonic allocation counter for manifest nonces. Persisted so a
+    /// restart can never re-issue a nonce that was already consumed.
+    pub next_nonce: u64,
+    /// Operator-approved perpetual grants (see `StandingGrant`).
+    pub standing_grants: Vec<StandingGrant>,
 }
 
 impl Default for KernelState {
@@ -60,7 +77,64 @@ impl Default for KernelState {
             pinned_keys: HashSet::new(),
             executed_nonces: HashSet::new(),
             current_history_root: [0u8; 32],
+            next_nonce: 1,
+            standing_grants: Vec::new(),
         }
+    }
+}
+
+impl KernelState {
+    /// Allocate the next manifest nonce. Gaps are fine (crash between
+    /// allocation and execution); reuse is what anti-replay forbids, so
+    /// the counter only ever moves forward and is persisted.
+    pub fn alloc_nonce(&mut self) -> u64 {
+        let nonce = self.next_nonce;
+        self.next_nonce += 1;
+        nonce
+    }
+
+    /// True when a standing grant covers this manifest. Standing grants
+    /// skip the grant-signature and nonce-consumption path entirely —
+    /// the operator pre-authorized the (agent, effect) pair.
+    pub fn check_standing(&self, manifest: &Manifest) -> bool {
+        self.standing_grants.iter().any(|g| {
+            g.agent_id == manifest.agent_id && g.effect == manifest.target_effect
+        })
+    }
+
+    /// Add a standing grant; false when an identical rule exists.
+    pub fn grant_standing(&mut self, grant: StandingGrant) -> bool {
+        if self.check_standing(&Manifest {
+            agent_id: grant.agent_id.clone(),
+            target_effect: grant.effect.clone(),
+            arguments: Vec::new(),
+            nonce: 0,
+        }) {
+            return false;
+        }
+        self.standing_grants.push(grant);
+        true
+    }
+
+    /// Remove a standing grant; true when one was removed.
+    pub fn revoke_standing(&mut self, agent_id: &str, effect: &str) -> bool {
+        let before = self.standing_grants.len();
+        self.standing_grants
+            .retain(|g| !(g.agent_id == agent_id && g.effect == effect));
+        self.standing_grants.len() != before
+    }
+
+    /// Record a DENIED action in the append-only history: the receipt
+    /// folds into the merkle root without a grant being consumed, so a
+    /// retry (with a fresh ask) stays possible and the denial is auditable.
+    pub fn record_denial(&mut self, manifest: &Manifest) -> Receipt {
+        let receipt = Receipt {
+            manifest_hash: compute_sha256(manifest),
+            status: ReceiptStatus::Denied,
+            output_commitment: [0u8; 32],
+        };
+        self.advance_history_root(&receipt);
+        receipt
     }
 }
 
@@ -82,13 +156,18 @@ pub fn compute_sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Signature verification against the pinned supervisor key.
-///
-/// TODO: real ed25519 verification. While the supervisor-signing flow is
-/// unimplemented, self-grants carry an empty signature and this accepts
-/// them — the anti-replay + key-pin machinery around it still functions.
-pub fn verify_signature(_signature: &[u8], _hash: &[u8; 32], _key: &[u8; 32]) -> bool {
-    true
+/// Signature verification against the pinned supervisor key. Real
+/// ed25519: an empty or malformed signature is rejected outright (the
+/// old stub accepted it, which made self-grants unverifiable in spirit).
+pub fn verify_signature(signature: &[u8], hash: &[u8; 32], key: &[u8; 32]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(key) = VerifyingKey::from_bytes(key) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    key.verify(hash, &signature).is_ok()
 }
 
 /// Append-only history: fold the new leaf into the running merkle root.

@@ -8,6 +8,10 @@ members = [
   "crates/agent",
   "crates/agent-rt",
   "crates/tools/landscape",
+  "crates/tools/artist",
+  "crates/tools/diagram",
+  "crates/tools/plot-device",
+  "crates/tools/sugi",
 ]
 
 resolver = "2"

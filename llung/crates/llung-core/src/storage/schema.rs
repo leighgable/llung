@@ -58,6 +58,16 @@ pub const CREATE_AGENT_IDENTITY_TABLE: &str = "
     );
 ";
 
+// The account's Aukora supervisor key (ed25519 seed). One row, created
+// with the account; agents load it to sign grants instead of minting a
+// throwaway key per process.
+pub const CREATE_AUKORA_SUPERVISOR_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS aukora_supervisor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        seed_bytes BLOB NOT NULL
+    );
+";
+
 pub const CREATE_MEDIA_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS media_assets (
         cid TEXT PRIMARY KEY,
@@ -66,6 +76,45 @@ pub const CREATE_MEDIA_TABLE: &str = "
         size_bytes INTEGER NOT NULL,
         local_path TEXT,          -- NULL if not downloaded yet
         download_status TEXT NOT NULL DEFAULT 'remote' -- 'remote', 'downloading', 'ready', 'failed'
+    );
+";
+
+// Aukora kernel state, persisted per agent so anti-replay nonces and the
+// receipt-history merkle root survive restarts. `next_nonce` is the
+// monotonic allocation counter (gaps are fine, reuse is not).
+pub const CREATE_KERNEL_STATE_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_state (
+        agent_id TEXT PRIMARY KEY,
+        history_root BLOB NOT NULL,
+        next_nonce INTEGER NOT NULL
+    );
+";
+
+// Consumed anti-replay nonces (one row per executed manifest).
+pub const CREATE_KERNEL_NONCES_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_nonces (
+        agent_id TEXT NOT NULL,
+        nonce INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, nonce)
+    );
+";
+
+// Operator-approved standing (perpetual) grants per agent.
+pub const CREATE_KERNEL_STANDING_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_standing (
+        agent_id TEXT NOT NULL,
+        effect TEXT NOT NULL,
+        authorized_by BLOB NOT NULL,
+        PRIMARY KEY (agent_id, effect)
+    );
+";
+
+// Supervisor public keys pinned by the kernel's strict key-pinning check.
+pub const CREATE_KERNEL_PINNED_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_pinned_keys (
+        agent_id TEXT NOT NULL,
+        key_pin BLOB NOT NULL,
+        PRIMARY KEY (agent_id, key_pin)
     );
 ";
 
@@ -105,6 +154,11 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CREATE_MESSAGE_ATTACHMENTS_TABLE)?;
     conn.execute_batch(CREATE_MACHINES_TABLE)?;
     conn.execute_batch(CREATE_AVATAR_CACHE_TABLE)?;
+    conn.execute_batch(CREATE_KERNEL_STATE_TABLE)?;
+    conn.execute_batch(CREATE_KERNEL_NONCES_TABLE)?;
+    conn.execute_batch(CREATE_KERNEL_PINNED_TABLE)?;
+    conn.execute_batch(CREATE_AUKORA_SUPERVISOR_TABLE)?;
+    conn.execute_batch(CREATE_KERNEL_STANDING_TABLE)?;
 
     // Older databases have a `beings` table without the `kind` column.
     let mut stmt = conn.prepare("PRAGMA table_info(beings)")?;

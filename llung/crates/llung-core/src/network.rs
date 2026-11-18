@@ -4,6 +4,7 @@ pub mod dns;
 pub mod engine;
 pub mod event;
 pub mod message;
+pub mod sync;
 
 pub use behaviour::{LlungBehaviour, LlungBehaviourEvent};
 pub use command::NetworkCommand;

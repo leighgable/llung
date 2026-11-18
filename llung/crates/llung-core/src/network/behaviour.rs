@@ -3,12 +3,16 @@ use libp2p::{
     request_response::cbor::Behaviour as CborBehaviour, swarm::NetworkBehaviour,
 };
 
+use crate::media::image::{ImageRequest, ImageResponse};
 use crate::network::{
     event::NetworkEvent,
     message::{DirectMessage, DirectMessageResponse},
+    sync::{SyncRequest, SyncResponse},
 };
 
 pub type DirectMessageBehaviour = CborBehaviour<DirectMessage, DirectMessageResponse>;
+pub type ImageTransferBehaviour = CborBehaviour<ImageRequest, ImageResponse>;
+pub type HistorySyncBehaviour = CborBehaviour<SyncRequest, SyncResponse>;
 
 #[derive(NetworkBehaviour)]
 pub struct LlungBehaviour {
@@ -19,6 +23,8 @@ pub struct LlungBehaviour {
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
     pub direct_message: DirectMessageBehaviour,
+    pub image_transfer: ImageTransferBehaviour,
+    pub history_sync: HistorySyncBehaviour,
 }
 
 impl LlungBehaviour {
@@ -38,13 +44,6 @@ impl LlungBehaviour {
                 }
                 None
             }
-            LlungBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
-                for addr in info.listen_addrs {
-                    self.kademlia.add_address(&peer_id, addr);
-                }
-                None
-            }
-
             // Transform raw Gossipsub messages into high-level NetworkEvents for app/UI
             LlungBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source,

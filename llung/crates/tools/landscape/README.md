@@ -5,8 +5,17 @@ llung wasm tool: renders a 3D wireframe surface of a math expression
 
 The model controls the math and the camera through JSON arguments — the
 expression evaluator (`src/expr.rs`) is a deliberately tiny language
-(variables `x`/`y`, arithmetic, common functions), *not* a code sandbox:
-no I/O, no side effects, bounded cost.
+(variables `x`/`y`/`z`, arithmetic, common functions), *not* a code
+sandbox: no I/O, no side effects, bounded cost.
+
+## Two modes
+
+- **Heightfield** (expression without `z`): wireframe mesh of
+  `z = f(x, y)` over [-2, 2]².
+- **Implicit surface** (expression WITH `z`): the zero-crossings of
+  `f(x, y, z) = 0` over [-2, 2]³, drawn as points colored by world z.
+  A torus: `(sqrt(x^2+y^2)-1.2)^2 + z^2 - 0.5^2`. In this mode `grid`
+  is the 3D resolution PER AXIS (clamped to 4..=64 — 25-40 works well).
 
 ## Arguments
 

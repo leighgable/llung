@@ -104,6 +104,8 @@ pub struct App {
     chat_panel: ChatPanel,
     registration: RegistrationPanel,
     input_text: String,
+    /// The chat input line: cursor-based editing + history recall.
+    input: crate::input::InputLine,
     last_size: (u16, u16),
 
     sidebar_mode: SidebarMode,
@@ -119,6 +121,43 @@ pub struct App {
     /// an agent (being_id, avatar, presence) lives in `known_peers`,
     /// same as any remote peer — this is the only peer-specific extra.
     agent_cmd_txs: HashMap<String, mpsc::Sender<NetworkCommand>>,
+    /// `/grant` commands into each local agent's orchestrator loop.
+    agent_grant_txs: HashMap<String, mpsc::Sender<agent::AgentCommand>>,
+    /// A permission prompt awaiting the operator's y/Y/n (see
+    /// `agent::permissions::PermissionRequest`). While set, keys are
+    /// intercepted by `handle_chat_key` before any editing.
+    pending_perm: Option<agent::permissions::PermissionRequest>,
+    /// Prompts waiting behind `pending_perm` (concurrent agents).
+    perm_queue: std::collections::VecDeque<agent::permissions::PermissionRequest>,
+    /// Our account's being_id — presence from the SAME being on a
+    /// different machine is one of our other devices; dial it so the
+    /// history-exchange protocol can sync the account across devices.
+    self_being_id: String,
+    /// Device addresses already dialed (dedup for presence redials).
+    dialed_self_addrs: std::collections::HashSet<String>,
+    /// Machines already mesh-dialed (general peers, not own devices).
+    mesh_dialed: std::collections::HashSet<String>,
+    /// Image cids already requested from the relays (dedup set).
+    pending_image_fetches: std::collections::HashSet<String>,
+    /// Relay-fetch completions: (cid, Some((mime, bytes)) | None).
+    image_result_tx: mpsc::Sender<(String, Option<(String, Vec<u8>)>)>,
+    /// Receiver half of `image_result_tx`; drained in `run`.
+    image_result_rx: Option<mpsc::Receiver<(String, Option<(String, Vec<u8>)>)>>,
+    /// Per-topic focus in the chat DAG: the message whose ancestor chain
+    /// fills the panel (the "current branch"). Follows live messages
+    /// that extend the chain; `/branch` moves it; the entry is created
+    /// lazily by the first view render (following the topic's tip).
+    branch_cursors: HashMap<String, String>,
+    /// Sender half of the local agents' streaming channel; created in
+    /// `run`, cloned into every spawned agent.
+    stream_tx: Option<mpsc::Sender<agent::AgentStream>>,
+    /// Sender half of the app-wide permission channel; cloned into
+    /// every spawned agent. Requests arrive on the receiver in `run`.
+    perm_tx: Option<mpsc::Sender<agent::permissions::PermissionRequest>>,
+    /// The status row under the input (topic, agents, context length),
+    /// recomputed when something relevant changes. `draw` has no DB
+    /// access, so it is computed here, not in the render path.
+    status_line: String,
 }
 
 impl App {
@@ -132,6 +171,7 @@ impl App {
             .size()
             .unwrap_or(ratatui::layout::Size::new(80, 24));
         let sidebar_mode = SidebarMode::Hidden;
+        let (image_tx, image_rx) = mpsc::channel::<(String, Option<(String, Vec<u8>)>)>(32);
 
         Self {
             terminal,
@@ -149,6 +189,7 @@ impl App {
             chat_panel: ChatPanel::new(String::new()),
             registration: RegistrationPanel::new(),
             input_text: String::new(),
+            input: crate::input::InputLine::new(),
             last_size: (0, 0),
             sidebar_mode: sidebar_mode,
             peers: Vec::new(),
@@ -158,7 +199,56 @@ impl App {
             peer_id: machine.peer_id.to_base58(),
             known_peers: HashMap::new(),
             agent_cmd_txs: HashMap::new(),
+            agent_grant_txs: HashMap::new(),
+            pending_perm: None,
+            perm_queue: std::collections::VecDeque::new(),
+            self_being_id: String::new(),
+            dialed_self_addrs: std::collections::HashSet::new(),
+            mesh_dialed: std::collections::HashSet::new(),
+            pending_image_fetches: std::collections::HashSet::new(),
+            image_result_tx: image_tx,
+            image_result_rx: Some(image_rx),
+            branch_cursors: HashMap::new(),
+            stream_tx: None,
+            perm_tx: None,
+            status_line: String::new(),
         }
+    }
+
+    /// Recompute the status row: current topic, local agents, and the
+    /// context an agent would read on the focused branch — the
+    /// budgeted summary-tree view, not the raw chat bytes. The size is
+    /// a deterministic dry-run with the rule-based summarizer (no model
+    /// calls); the agent's own summaries differ in wording, not in
+    /// shape or budget.
+    fn update_status_line(&mut self, db: &Database) {
+        const CONTEXT_BUDGET: usize = 64_000;
+        let ctx = db.load_dag().ok().and_then(|dag| {
+            let topic = self.current_topic.clone();
+            let focus = self
+                .branch_cursors
+                .get(&topic)
+                .cloned()
+                .or_else(|| dag.tip_of(&topic))?;
+            let view = dag.context_chain(&focus);
+            let messages: Vec<llung_core::network::message::ChatMessage> =
+                view.iter().map(|m| (*m).clone()).collect();
+            Some((view.len(), compressed_view_bytes(&messages, CONTEXT_BUDGET)))
+        });
+        let mut left = format!("#{}", self.current_topic);
+        if !self.agent_cmd_txs.is_empty() {
+            let mut agents: Vec<&str> = self.agent_cmd_txs.keys().map(String::as_str).collect();
+            agents.sort();
+            left.push_str(&format!(" · agents: {}", agents.join(", ")));
+        }
+        left.push_str(&match ctx {
+            Some((0, _)) | None => " · ctx empty".to_string(),
+            Some((n, Some(bytes))) => {
+                format!(" · ctx {n} msgs · view {}/{}", human_len(bytes), human_len(CONTEXT_BUDGET))
+            }
+            Some((n, None)) => format!(" · ctx {n} msgs"),
+        });
+        self.status_line = left;
     }
 
     pub async fn run(&mut self, db: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
@@ -169,6 +259,17 @@ impl App {
         let mut event_rx: Option<mpsc::Receiver<NetworkEvent>> = None;
         let mut tick = tokio::time::interval(Duration::from_millis(50));
 
+        // Local agents stream their in-progress replies here; the
+        // complete message still arrives over gossipsub afterwards.
+        let (stream_tx, mut stream_rx) = mpsc::channel::<agent::AgentStream>(256);
+        self.stream_tx = Some(stream_tx);
+
+        // App-wide permission prompt channel: every spawned agent sends
+        // `PermissionRequest`s here; the loop below queues them into
+        // `pending_perm` (one prompt at a time on screen).
+        let (perm_tx, mut perm_rx) = mpsc::channel::<agent::permissions::PermissionRequest>(32);
+        self.perm_tx = Some(perm_tx);
+
         // ── Splash: show a frame, then resolve the account ──
         self.draw()?;
         match db.load_being()? {
@@ -176,6 +277,7 @@ impl App {
                 self.setup_identity(&being);
                 event_rx = Some(self.start_network(being).await?);
                 self.screen = AppScreen::Chat;
+                self.render_topic_view(db);
             }
             None => {
                 self.screen = AppScreen::Registration;
@@ -205,6 +307,7 @@ impl App {
                                                 Ok(rx) => {
                                                     event_rx = Some(rx);
                                                     self.screen = AppScreen::Chat;
+                                                    self.render_topic_view(db);
                                                 }
                                                 Err(e) => {
                                                     self.registration.error_message =
@@ -234,7 +337,30 @@ impl App {
                 } => {
                     self.handle_network_event(net_ev, db);
                 }
-                _ = tick.tick() => {}
+                Some(stream_ev) = stream_rx.recv() => {
+                    self.handle_agent_stream(stream_ev);
+                }
+                Some(req) = perm_rx.recv() => {
+                    self.queue_permission(req);
+                }
+                Some((cid, result)) = async {
+                    match self.image_result_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_image_result(db, cid, result);
+                }
+                _ = tick.tick() => {
+                    // Animate braille spinners on running tool panels.
+                    // The frame counter always advances (it's free); the
+                    // layout cache is only dropped while something is
+                    // actually spinning, so idle ticks cost nothing.
+                    crate::spinner::tick();
+                    if self.chat_panel.has_running_tools() {
+                        self.chat_panel.invalidate();
+                    }
+                }
             };
             self.poll_theme_file();
             if self.screen == AppScreen::Chat && !self.pending_notices.is_empty() {
@@ -250,6 +376,7 @@ impl App {
     /// Adopt an account into the UI (chat panel title, own peer entry).
     fn setup_identity(&mut self, being: &Being) {
         self.my_name = being.human_name.clone();
+        self.self_being_id = being.being_id.clone();
         self.chat_panel = ChatPanel::new(being.human_name.clone());
         self.known_peers.insert(
             self.peer_id.clone(),
@@ -334,8 +461,245 @@ impl App {
         }
     }
 
+    /// Rebuild the chat panel from the DAG: the ancestor chain of the
+    /// focused message IS the current branch. Called at startup, on
+    /// topic switches, and after every `/branch` move. When the focus
+    /// is not the topic's tip, an indicator line marks the fork point.
+    fn render_topic_view(&mut self, db: &Database) {
+        let Ok(dag) = db.load_dag() else {
+            return;
+        };
+        let topic = self.current_topic.clone();
+        let Some(focus) = self
+            .branch_cursors
+            .get(&topic)
+            .cloned()
+            .or_else(|| dag.tip_of(&topic))
+        else {
+            self.chat_panel.clear();
+            return;
+        };
+        // Resolve (and remember) the effective focus.
+        self.branch_cursors.insert(topic.clone(), focus.clone());
+        // The view is the same context chain agents read: the branch,
+        // with parallel agent/tool chatter folded in; explicit forks
+        // (human children off the chain) stay out.
+        let view = dag.context_chain(&focus);
+        let off_tip = dag.tip_of(&topic).as_deref() != Some(focus.as_str());
+        let options = dag.branch_options(&focus);
+        let focus_pos = view.iter().position(|m| m.id == focus);
+
+        self.chat_panel.clear();
+        for (i, msg) in view.iter().enumerate() {
+            if off_tip && focus_pos == Some(i) {
+                let sib = if options.len() > 1 {
+                    format!(" · {} sibling branches", options.len() - 1)
+                } else {
+                    String::new()
+                };
+                self.chat_panel.push(
+                    "system".into(),
+                    "system".into(),
+                    format!(
+                        "⎇ on a branch{sib} — Enter forks here · \
+                         /branch up/down/next/prev · /branch tip for the newest"
+                    ),
+                    None,
+                    None,
+                );
+            }
+            self.render_message_line(msg, db);
+        }
+        self.chat_panel.jump_to_bottom();
+        self.update_status_line(db);
+    }
+
+    /// `/branch` — navigate and fork the chat tree. The tree itself is
+    /// the per-topic subgraph of the message DAG (already persisted);
+    /// this command only moves the view focus:
+    ///
+    ///   /branch            where am I?
+    ///   /branch <n>        focus the message n-back on this branch;
+    ///                      Enter then forks at it
+    ///   /branch up         focus the parent message
+    ///   /branch down       focus the greatest child (toward a tip)
+    ///   /branch next|prev  switch to a sibling branch at the same fork
+    ///   /branch tip        release the focus; follow the newest branch
+    fn handle_branch_command(&mut self, args: &str, db: &Database) {
+        let Ok(dag) = db.load_dag() else {
+            self.chat_panel.push(
+                "system".into(), "system".into(),
+                "branch: failed to load chat history".into(),
+                None, None,
+            );
+            return;
+        };
+        let topic = self.current_topic.clone();
+        let focus = self
+            .branch_cursors
+            .get(&topic)
+            .cloned()
+            .or_else(|| dag.tip_of(&topic));
+
+        match args.trim() {
+            "" => {
+                let Some(f) = focus else {
+                    self.chat_panel.push(
+                        "system".into(), "system".into(),
+                        format!("branch: no history in #{topic}"),
+                        None, None,
+                    );
+                    return;
+                };
+                let view = dag.context_chain(&f);
+                let n = view.len();
+                let options = dag.branch_options(&f);
+                let sib = if options.len() > 1 {
+                    format!(" · {} branches at this fork", options.len())
+                } else {
+                    String::new()
+                };
+                let newest = if dag.tip_of(&topic).as_deref() == Some(f.as_str()) {
+                    ""
+                } else {
+                    " · NOT the newest branch"
+                };
+                let preview: String = dag.nodes.get(&f).map(|node| {
+                    let c: String = node
+                        .message
+                        .content
+                        .chars()
+                        .filter(|c| *c != '\n')
+                        .take(40)
+                        .collect();
+                    format!(" — at: \"{c}\"")
+                })
+                .unwrap_or_default();
+                self.chat_panel.push(
+                    "system".into(), "system".into(),
+                    format!("⎇ {n} message{s} up from the root{sib}{newest}{preview}",
+                            s = if n == 1 { "" } else { "s" }),
+                    None, None,
+                );
+            }
+            "tip" => {
+                self.branch_cursors.remove(&topic);
+                self.render_topic_view(db);
+            }
+            "up" => {
+                let parent = focus
+                    .as_ref()
+                    .and_then(|f| dag.nodes.get(f))
+                    .and_then(|n| n.message.parent_id.clone());
+                self.branch_move(db, parent, "already at the root message");
+            }
+            "down" => {
+                // The most recent child (timestamp, then hash as the
+                // deterministic tie-break): drifts back toward the live
+                // end of the conversation after an `up`.
+                let child = focus.as_ref().and_then(|f| {
+                    dag.nodes.get(f).map(|n| {
+                        n.children
+                            .iter()
+                            .filter(|c| dag.nodes[*c].message.topic == topic)
+                            .max_by_key(|c| {
+                                (
+                                    dag.nodes[*c].message.timestamp,
+                                    dag.nodes[*c].hash,
+                                    (*c).clone(),
+                                )
+                            })
+                            .cloned()
+                    })
+                });
+                self.branch_move(db, child.flatten(), "already at the end of this branch");
+            }
+            "next" | "prev" => {
+                let Some(f) = focus else {
+                    self.chat_panel.push(
+                        "system".into(), "system".into(),
+                        "branch: no history in this topic".into(),
+                        None, None,
+                    );
+                    return;
+                };
+                let options = dag.branch_options(&f);
+                let Some(idx) = options.iter().position(|o| o == &f) else {
+                    return;
+                };
+                let delta = if args.trim() == "next" { 1isize } else { -1 };
+                let new_idx = idx as isize + delta;
+                if new_idx < 0 || new_idx as usize >= options.len() {
+                    self.chat_panel.push(
+                        "system".into(), "system".into(),
+                        format!(
+                            "branch: no {} sibling ({} branches at this fork)",
+                            args.trim(),
+                            options.len()
+                        ),
+                        None, None,
+                    );
+                    return;
+                }
+                let target = options[new_idx as usize].clone();
+                self.branch_move(db, Some(target), "unreachable");
+            }
+            other => match other.parse::<usize>() {
+                Ok(n) => {
+                    let Some(f) = focus else {
+                        self.chat_panel.push(
+                            "system".into(), "system".into(),
+                            "branch: no history in this topic".into(),
+                            None, None,
+                        );
+                        return;
+                    };
+                    // Count back over the rendered view (what you see),
+                    // not the bare ancestor chain.
+                    let view = dag.context_chain(&f);
+                    if n >= view.len() {
+                        self.chat_panel.push(
+                            "system".into(), "system".into(),
+                            format!("branch: only {} message{s} in this view",
+                                    view.len(),
+                                    s = if view.len() == 1 { "" } else { "s" }),
+                            None, None,
+                        );
+                        return;
+                    }
+                    let target = view[view.len() - 1 - n].id.clone();
+                    self.branch_move(db, Some(target), "unreachable");
+                }
+                Err(_) => {
+                    self.chat_panel.push(
+                        "system".into(), "system".into(),
+                        "Usage: /branch [n|up|down|next|prev|tip]".into(),
+                        None, None,
+                    );
+                }
+            },
+        }
+    }
+
+    /// Move the branch focus and re-render; `None` means the move was
+    /// invalid (`err` tells the user why).
+    fn branch_move(&mut self, db: &Database, new_focus: Option<String>, err: &str) {
+        if let Some(f) = new_focus {
+            self.branch_cursors
+                .insert(self.current_topic.clone(), f);
+            self.render_topic_view(db);
+        } else {
+            self.chat_panel.push(
+                "system".into(), "system".into(),
+                format!("branch: {err}"),
+                None, None,
+            );
+        }
+    }
+
     fn load_missing_avatars(&mut self, db: &Database) {
         let mut loaded: Vec<(String, crate::avatar::AvatarThumbnail)> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for (id, info) in self.known_peers.iter_mut() {
             if info.avatar.is_some() || info.avatar_cid.is_none() {
                 continue;
@@ -346,7 +710,13 @@ impl App {
                     info.avatar = Some(thumb.clone());
                     loaded.push((id.clone(), thumb));
                 }
+            } else {
+                // Not local: ask the relay cache (after the borrow ends).
+                missing.push(cid.clone());
             }
+        }
+        for cid in missing {
+            self.fetch_image_from_relays(&cid);
         }
         // Avatars often arrive after the messages did; retro-attach them.
         for (id, thumb) in loaded {
@@ -354,42 +724,151 @@ impl App {
         }
     }
 
+    /// Fire a `GetImage` at the relays unless one is already inflight
+    /// for this cid. Results are handled where `image_result_rx` is
+    /// drained (see `run`).
+    fn fetch_image_from_relays(&mut self, cid: &str) {
+        if !self.pending_image_fetches.insert(cid.to_string()) {
+            return;
+        }
+        let Some(tx) = &self.cmd_tx else {
+            return;
+        };
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        let cid_owned = cid.to_string();
+        let result_tx = self.image_result_tx.clone();
+        // Send the command, then forward the result (or timeout) onto the
+        // app-wide result channel so the main loop can cache + redraw.
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(llung_core::network::command::NetworkCommand::GetImage {
+                    cid: cid_owned.clone(),
+                    responder: respond,
+                })
+                .await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(35), rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten();
+            let _ = result_tx.send((cid_owned, result)).await;
+        });
+    }
+
+    /// Cache a relay-fetched image locally; `load_missing_avatars`
+    /// re-attaches thumbnails to the right peers by cid, and the panel
+    /// redraw picks up message attachments from the same cache.
+    fn on_image_fetched(&mut self, db: &Database, cid: &str, data: &[u8]) {
+        if db.save_avatar_cache(cid, data).is_err() {
+            return;
+        }
+        self.load_missing_avatars(db);
+        self.chat_panel.invalidate();
+    }
+
     async fn handle_chat_key(
         &mut self,
         key: crossterm::event::KeyEvent,
         db: &Database,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // A pending permission prompt owns the keyboard until it is
+        // answered: no typing into the chat while an agent waits.
+        if self.pending_perm.is_some() {
+            use agent::permissions::PermissionAnswer;
+            match key.code {
+                KeyCode::Char('y') => self.answer_permission(PermissionAnswer::Once),
+                KeyCode::Char('Y') => {
+                    let allow = self
+                        .pending_perm
+                        .as_ref()
+                        .map(|r| r.allow_standing)
+                        .unwrap_or(false);
+                    if allow {
+                        self.answer_permission(PermissionAnswer::Standing);
+                    } else {
+                        self.system(
+                            "gpu:* never gets an implicit 'always' — use `/grant <effect> perpetual`",
+                        );
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.answer_permission(PermissionAnswer::Deny)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         match key.code {
-            // Typing into the input buffer
+            // Typing inserts at the cursor.
             KeyCode::Char(c) => {
-                self.input_text.push(c);
+                self.input.insert(c);
             }
 
-            // Backspace
+            // Backspace deletes before the cursor; Delete deletes under it.
             KeyCode::Backspace => {
-                self.input_text.pop();
+                self.input.backspace();
+            }
+            KeyCode::Delete => {
+                self.input.delete();
+            }
+
+            // Cursor movement.
+            KeyCode::Left => self.input.move_left(),
+            KeyCode::Right => self.input.move_right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat_panel.jump_to_bottom();
+            }
+            KeyCode::End => self.input.end(),
+
+            // Up/Down recall input history; at the ends of the history
+            // they fall back to scrolling the chat, as before.
+            KeyCode::Up => {
+                if !self.input.recall_older() {
+                    self.chat_panel.scroll_up(1);
+                }
+            }
+            KeyCode::Down => {
+                if !self.input.recall_newer() {
+                    self.chat_panel.scroll_down(1);
+                }
             }
 
             // Send message
             KeyCode::Enter => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.input_text.push('\n');
+                    self.input.insert('\n');
                 } else {
-                    let is_command = self.input_text.trim().starts_with('/');
+                    let is_command = self.input.text.trim().starts_with('/');
                     if is_command {
-                        let cmd = std::mem::take(&mut self.input_text);
+                        let cmd = std::mem::take(&mut self.input.text);
+                        self.input.submit();
                         self.handle_command(cmd.trim(), db).await?;
-                    } else if !self.input_text.trim().is_empty() {
-                        let text = std::mem::take(&mut self.input_text);
-                        let text = text.trim().to_string();
+                    } else if !self.input.text.trim().is_empty() {
+                        let raw = std::mem::take(&mut self.input.text);
+                        self.input.submit();
+                        let text = expand_file_mentions(raw.trim()).trim().to_string();
                         let timestamp = chrono::Utc::now().timestamp();
+                        // The new message extends the focused node: the
+                        // topic tip normally, or the `/branch` focus —
+                        // which is how a message forks the chat.
+                        let parent_id = self
+                            .branch_cursors
+                            .get(&self.current_topic)
+                            .cloned()
+                            .or_else(|| {
+                                db.load_dag()
+                                    .ok()
+                                    .and_then(|dag| dag.tip_of(&self.current_topic))
+                            });
                         let msg = ChatMessage {
                             id: generate_cid_from_bytes(
                                 &(self.peer_id.clone() + &text + &timestamp.to_string()).as_bytes(),
                             )
                             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
                             topic: self.current_topic.clone(),
-                            parent_id: None,
+                            parent_id,
                             sender_id: self.peer_id.clone(),
                             sender_name: self.my_name.clone(),
                             content: text.clone(),
@@ -420,15 +899,16 @@ impl App {
                         if let Some(tx) = &self.cmd_tx {
                             tx.send(cmd).await?;
                         }
+                        // The view follows the message just sent (the
+                        // new tip of this branch).
+                        self.branch_cursors
+                            .insert(self.current_topic.clone(), msg.id.clone());
                     }
                 }
             }
-            // Scroll history
-            KeyCode::Up => self.chat_panel.scroll_up(1),
-            KeyCode::Down => self.chat_panel.scroll_down(1),
+            // Chat scroll (Up/Down recall input history first — see above).
             KeyCode::PageUp => self.chat_panel.scroll_up(10),
             KeyCode::PageDown => self.chat_panel.scroll_down(10),
-            KeyCode::End => self.chat_panel.jump_to_bottom(),
 
             // Quit
             KeyCode::Esc => std::process::exit(0),
@@ -463,7 +943,92 @@ impl App {
             NetworkEvent::DirectMessageReceived { sender, payload } => {
                 self.handle_direct_message(sender, payload, db);
             }
+
+            NetworkEvent::HistoryReceived { from, messages } => {
+                // Idempotent merge (INSERT OR IGNORE per message):
+                // devices of one account converge without conflicts.
+                let mut new_count = 0usize;
+                for msg in &messages {
+                    let had_it = db
+                        .load_dag()
+                        .ok()
+                        .is_some_and(|dag| dag.nodes.contains_key(&msg.id));
+                    if db.save_message(msg).is_ok() && !had_it {
+                        new_count += 1;
+                    }
+                }
+                tracing::info!(%from, total = messages.len(), new_count, "history synced");
+                if new_count > 0 {
+                    self.chat_panel.invalidate();
+                    self.update_status_line(db);
+                }
+            }
+
+            NetworkEvent::ImagePushed {
+                from,
+                cid,
+                data,
+                ..
+            } => {
+                // A relay (or peer) cached one of our images back to us
+                // — usually our own avatar/attachment arriving on a
+                // second device of this account.
+                tracing::debug!(%from, %cid, bytes = data.len(), "image pushed; caching");
+                self.on_image_fetched(db, &cid, &data);
+            }
             _ => {}
+        }
+    }
+
+    /// Queue a permission request: shown one at a time; concurrent
+    /// asks from other agents wait their turn.
+    fn queue_permission(&mut self, req: agent::permissions::PermissionRequest) {
+        self.perm_queue.push_back(req);
+        self.promote_permission();
+    }
+
+    /// Move the next queued request onto the screen (if idle).
+    fn promote_permission(&mut self) {
+        if self.pending_perm.is_some() {
+            return;
+        }
+        if let Some(req) = self.perm_queue.pop_front() {
+            let standing = if req.allow_standing { " · Y always" } else { "" };
+            self.system(format!(
+                "🔐 {} asks for `{}`{}: {} — [y once{} · n deny]",
+                req.agent_name, req.effect, tier_label(req.tier), req.summary, standing,
+            ));
+            self.update_status_line_pending();
+            self.pending_perm = Some(req);
+        }
+    }
+
+    fn update_status_line_pending(&mut self) {
+        if let Some(req) = &self.pending_perm {
+            let always = if req.allow_standing { " · Y=always" } else { "" };
+            self.status_line = format!(
+                "⏳ permission: {} → `{}` — y=once{} · n=deny",
+                req.agent_name, req.effect, always
+            );
+        }
+    }
+
+    /// Answer the on-screen permission prompt (y/Y/n).
+    fn answer_permission(&mut self, answer: agent::permissions::PermissionAnswer) {
+        if let Some(req) = self.pending_perm.take() {
+            let verb = match answer {
+                agent::permissions::PermissionAnswer::Once => "allowed (once)",
+                agent::permissions::PermissionAnswer::Standing => "allowed (always)",
+                agent::permissions::PermissionAnswer::Deny => "denied",
+            };
+            self.system(format!("🔐 `{}` for {} {}", req.effect, req.agent_name, verb));
+            let _ = req.respond.send(answer);
+        }
+        self.promote_permission();
+        // Restore the normal status row on the next relevant update;
+        // cheap to redo now only when idle.
+        if self.pending_perm.is_none() {
+            self.status_line.clear();
         }
     }
 
@@ -587,11 +1152,100 @@ impl App {
             );
         }
 
+        // A message image we don't have yet: ask the relay cache. The
+        // render path reads the avatar/media cache; when the bytes land
+        // (handle_image_result) the panel invalidates and shows it.
+        if let MessageKind::Media(attachment) = &msg.kind {
+            if attachment.kind == AttachmentKind::Image
+                && db.get_avatar_cache(&attachment.cid).ok().flatten().is_none()
+            {
+                self.fetch_image_from_relays(&attachment.cid);
+            }
+        }
+
         // Only render if it's the current topic
         if msg.topic != self.current_topic {
             return;
         }
 
+        // Branch views: humans fork explicitly via /branch, so their
+        // messages render only if they extend the focused node (or are
+        // unparented legacy traffic). Conversational traffic — agent
+        // replies, tool calls/responses, system, media — renders if it
+        // is attached ANYWHERE along the viewed branch (several agents
+        // answering the same message stay in view, and in each other's
+        // context), but chatter on explicit forks stays out.
+        let conversational = matches!(
+            msg.kind,
+            MessageKind::Agent
+                | MessageKind::System
+                | MessageKind::ToolCall { .. }
+                | MessageKind::ToolResponse { .. }
+                | MessageKind::Media(_)
+        );
+        let extends_focus = match msg.parent_id {
+            None => true,
+            Some(ref p) if self.branch_cursors.get(&msg.topic).is_some_and(|f| f == p) => true,
+            Some(ref p) => {
+                conversational
+                    && db.load_dag().ok().is_some_and(|dag| {
+                        self.branch_cursors.get(&msg.topic).is_some_and(|f| {
+                            dag.ancestors_of(f).iter().any(|m| m.id == *p)
+                        })
+                    })
+            }
+        };
+        if !extends_focus {
+            self.chat_panel.push(
+                "system".into(),
+                "system".into(),
+                "new message on another branch — /branch tip for the newest".into(),
+                None,
+                None,
+            );
+            return;
+        }
+
+        // Drop the streaming preview of this message, if any — the
+        // authoritative copy renders next (same id, gossipsub-signed).
+        self.chat_panel.remove_stream_line(&msg.id);
+
+        self.render_message_line(&msg, db);
+        // The view follows messages that extend the current branch.
+        self.branch_cursors.insert(msg.topic.clone(), msg.id.clone());
+        self.update_status_line(db);
+    }
+
+    /// Local agents stream reply deltas while they generate; the final
+    /// gossipsub message (same id) replaces the preview when it lands.
+    fn handle_agent_stream(&mut self, ev: agent::AgentStream) {
+        match ev {
+            agent::AgentStream::Delta {
+                topic,
+                message_id,
+                being_id,
+                sender_name,
+                delta,
+            } => {
+                if topic != self.current_topic {
+                    return;
+                }
+                let avatar = self.known_peers.get(&being_id).and_then(|i| i.avatar.clone());
+                self.chat_panel
+                    .push_stream_delta(being_id, sender_name, avatar, &message_id, &delta);
+            }
+            agent::AgentStream::Retract { topic, message_id } => {
+                if topic != self.current_topic {
+                    return;
+                }
+                self.chat_panel.remove_stream_line(&message_id);
+            }
+        }
+    }
+
+    /// Render one chat message into the panel, by kind. Shared by live
+    /// delivery and by branch-view rebuilds (render_topic_view).
+    fn render_message_line(&mut self, msg: &ChatMessage, db: &Database) {
         let avatar = self
             .known_peers
             .get(&msg.sender_id)
@@ -599,8 +1253,13 @@ impl App {
 
         match msg.kind {
             MessageKind::Human | MessageKind::Agent => {
-                self.chat_panel
-                    .push(msg.sender_id, msg.sender_name, msg.content, avatar, None);
+                self.chat_panel.push(
+                    msg.sender_id.clone(),
+                    msg.sender_name.clone(),
+                    msg.content.clone(),
+                    avatar,
+                    None,
+                );
             }
 
             MessageKind::Media(ref attachment) => {
@@ -615,9 +1274,9 @@ impl App {
                     }
                 }
                 self.chat_panel.push(
-                    msg.sender_id,
-                    msg.sender_name,
-                    msg.content, // caption
+                    msg.sender_id.clone(),
+                    msg.sender_name.clone(),
+                    msg.content.clone(), // caption
                     avatar,
                     Some(attachment.clone()),
                 );
@@ -625,26 +1284,26 @@ impl App {
 
             MessageKind::System => {
                 self.chat_panel
-                    .push("system".into(), "system".into(), msg.content, None, None);
+                    .push("system".into(), "system".into(), msg.content.clone(), None, None);
             }
 
             // pi-style tool panels: pending on the call, then replaced in
             // place by the response (which points back via parent_id).
-            MessageKind::ToolCall { tool_name, arguments } => {
-                let block = ToolBlock::pending(msg.id.clone(), tool_name, &arguments);
+            MessageKind::ToolCall { ref tool_name, ref arguments } => {
+                let block = ToolBlock::pending(msg.id.clone(), tool_name.clone(), arguments);
                 self.chat_panel
-                    .push_tool(msg.sender_id, msg.sender_name, avatar, block);
+                    .push_tool(msg.sender_id.clone(), msg.sender_name.clone(), avatar, block);
             }
-            MessageKind::ToolResponse { tool_name, error, .. } => {
+            MessageKind::ToolResponse { ref tool_name, error, .. } => {
                 let block = ToolBlock::response(
                     msg.parent_id.clone(),
-                    tool_name,
+                    tool_name.clone(),
                     &msg.content,
                     error,
                 );
                 self.chat_panel.push_tool_response(
-                    msg.sender_id,
-                    msg.sender_name,
+                    msg.sender_id.clone(),
+                    msg.sender_name.clone(),
                     avatar,
                     msg.parent_id.as_deref(),
                     block,
@@ -674,6 +1333,61 @@ impl App {
         );
         // Presence may arrive after the peer's messages did.
         self.chat_panel.update_peer_name(&key, &presence.human_name);
+
+        // Another device of OUR account: dial its advertised addresses
+        // so the history-exchange protocol can sync the account across
+        // devices (over direct, hole-punched, or relay-circuit paths).
+        // Own devices always get dialed, mesh rules don't apply.
+        let their_machine = presence.machine_id.to_base58();
+        let is_own_device = !self.self_being_id.is_empty()
+            && presence.being_id == self.self_being_id
+            && their_machine != self.peer_id;
+        if is_own_device {
+            for addr in &presence.listen_addrs {
+                if self.dialed_self_addrs.insert(addr.clone()) {
+                    tracing::info!(%addr, "dialing own device");
+                    self.dial_addr(addr);
+                }
+            }
+            return;
+        }
+
+        // Grow the p2p mesh: as the group scales, members should sync
+        // history (and images) peer-to-peer instead of leaning on the
+        // relay. Deterministic direction keeps exactly ONE side dialing
+        // (halving connections on a full mesh); the cap bounds outbound
+        // connections on big groups.
+        if should_dial_for_mesh(
+            &self.peer_id,
+            &their_machine,
+            self.mesh_dialed.len(),
+            self.mesh_dialed.contains(&their_machine),
+            MESH_TARGET,
+        ) {
+            self.mesh_dialed.insert(their_machine.clone());
+            for addr in &presence.listen_addrs {
+                tracing::info!(%addr, machine = %their_machine, "mesh dialing peer");
+                self.dial_addr(addr);
+            }
+        }
+    }
+
+    /// Send one Dial command; unparsable addresses are skipped (logged).
+    fn dial_addr(&self, addr: &str) {
+        if let Some(tx) = &self.cmd_tx {
+            let parsed = match addr.parse() {
+                Ok(ma) => ma,
+                Err(_) => {
+                    tracing::warn!(%addr, "unparsable presence address");
+                    return;
+                }
+            };
+            let _ = tx
+                .clone()
+                .try_send(llung_core::network::command::NetworkCommand::Dial {
+                    multiaddr: parsed,
+                });
+        }
     }
 
     fn handle_raw_text(&mut self, sender: PeerId, topic: String, text: String, db: &Database) {
@@ -720,7 +1434,9 @@ impl App {
         let taffy_ui = &mut self.taffy_ui;
         let chat_panel = &mut self.chat_panel;
         let registration = &mut self.registration;
-        let input_text = &self.input_text;
+        let input_text = &self.input.text;
+        let input_cursor = self.input.cursor;
+        let status_line = &self.status_line;
         let screen = self.screen;
         let sidebar_mode = self.sidebar_mode;
         let peers = &self.known_peers;
@@ -728,6 +1444,9 @@ impl App {
         let current_topic = &self.current_topic;
         let theme = &self.theme;
 
+        // The editing cursor's cell (set at the end of the draw, once
+        // the buffer borrow ends).
+        let mut cursor_pos: Option<(u16, u16)> = None;
         // Upload newly decoded Kitty images before the frame that shows
         // their placeholders. Order doesn't strictly matter (the terminal
         // renders placeholders once the image arrives), but this avoids a
@@ -759,7 +1478,16 @@ impl App {
                 }
                 AppScreen::Chat => {
                     chat_panel.render(buf, chat_rect, theme);
-                    Self::render_input_buf(buf, input_rect, input_text, theme);
+                    // Cursor position is applied at the end of the
+                    // closure (the buffer borrow must end first).
+                    cursor_pos = Self::render_input_buf(
+                        buf,
+                        input_rect,
+                        input_text,
+                        input_cursor,
+                        status_line,
+                        theme,
+                    );
                     Self::render_sidebar_buf(
                         buf,
                         sidebar_rect,
@@ -769,6 +1497,14 @@ impl App {
                         current_topic,
                         theme,
                     );
+                }
+            }
+            // Position the editing cursor last, once the buffer borrow
+            // has ended. (Only meaningful on the Chat screen; harmless
+            // elsewhere since other screens don't read it.)
+            if screen == AppScreen::Chat {
+                if let Some((cx, cy)) = cursor_pos {
+                    frame.set_cursor_position(ratatui::layout::Position::new(cx, cy));
                 }
             }
         })?;
@@ -855,12 +1591,19 @@ impl App {
             .unwrap_or_else(|| id[..8.min(id.len())].to_string())
     }
 
+    /// The input box: top border, wrapped text, bottom border, then the
+    /// status row (pi-style). With fewer than 3 rows the bottom border
+    /// and status row are dropped and only the top border is drawn.
+    /// Returns the cell the editing cursor sits on (byte index into
+    /// `text`), so the caller can position the terminal cursor.
     fn render_input_buf(
         buf: &mut ratatui::buffer::Buffer,
         area: Rect,
         text: &str,
+        cursor: usize,
+        status: &str,
         theme: &Theme,
-    ) {
+    ) -> Option<(u16, u16)> {
         let canvas_bg = theme.bg(Role::Canvas);
         let border = theme.style(Role::BorderMuted);
         let buf_area = buf.area().clone();
@@ -886,24 +1629,70 @@ impl App {
             }
         }
 
-        if text.is_empty() || y0 + 1 >= y1 {
-            return;
+        let has_status_row = y1.saturating_sub(y0) >= 3;
+        let text_end = if has_status_row { y1 - 2 } else { y1 };
+        let max_lines = (text_end.saturating_sub(y0 + 1)) as usize;
+
+        // Which wrapped line holds the cursor (byte offset within it).
+        let pt = PrefixText::new(text.to_string());
+        let lines: Vec<&str> = pt.wrap_lines((x1 - x0).saturating_sub(2)).collect();
+        let mut cursor_line = 0usize;
+        let mut cursor_col = 0usize; // byte offset within the line
+        if !lines.is_empty() {
+            let mut acc = 0usize;
+            for (i, l) in lines.iter().enumerate() {
+                if cursor <= acc + l.len() {
+                    cursor_line = i;
+                    cursor_col = cursor.saturating_sub(acc);
+                    break;
+                }
+                acc += l.len() + 1; // implied '\n'
+            }
         }
+        // Keep the cursor visible: if it scrolled out of the tail window,
+        // shift the window to show it.
+        let start = lines
+            .len()
+            .saturating_sub(max_lines)
+            .min(cursor_line);
 
-        let inner_width = (x1 - x0).saturating_sub(2);
-        let prefix = PrefixText::new(text.to_string());
-
-        let max_lines = (y1 - y0 - 1) as usize;
-        let lines: Vec<&str> = prefix.wrap_lines(inner_width).collect();
-        let start = lines.len().saturating_sub(max_lines);
-        let visible = &lines[start..];
-
-        for (i, line) in visible.iter().enumerate() {
+        for (i, line) in lines[start..].iter().enumerate() {
             let y = y0 + 1 + i as u16;
-            if y >= y1 {
+            if y >= text_end {
                 break;
             }
             buf.set_string(x0 + 1, y, line, theme.style(Role::Text));
+        }
+
+        // Cursor cell: column = display width of the line before the
+        // cursor; row = the cursor's wrapped line (clamped visible).
+        let (cursor_x, cursor_y) = {
+            use unicode_width::UnicodeWidthStr;
+            let line = lines.get(cursor_line).copied().unwrap_or("");
+            let col = line[..cursor_col.min(line.len())].width() as u16;
+            (
+                (x0 + 1).saturating_add(col),
+                (y0 + 1).saturating_add(cursor_line.saturating_sub(start) as u16),
+            )
+        };
+
+        if has_status_row {
+            // Bottom border demarcating the input, status row under it.
+            for x in x0..x1 {
+                if let Some(cell) = buf.cell_mut((x, y1 - 2)) {
+                    cell.set_symbol("─");
+                    cell.set_style(border);
+                }
+            }
+            let width = (x1 - x0) as usize;
+            let shown: String = status.chars().take(width.saturating_sub(2)).collect();
+            buf.set_string(x0 + 1, y1 - 1, &shown, theme.style(Role::Dim));
+        }
+
+        if cursor_y < text_end {
+            Some((cursor_x, cursor_y))
+        } else {
+            None
         }
     }
 
@@ -1036,7 +1825,7 @@ impl App {
             "/media" => self.toggle_sidebar(SidebarMode::Media),
             "/theme" => self.handle_theme_command(args),
             "/invite" => {
-                if let Err(e) = self.handle_invite_command(args).await {
+                if let Err(e) = self.handle_invite_command(args, db).await {
                     self.chat_panel
                         .push("system".to_string(), "system".to_string(), e, None, None);
                 }
@@ -1057,6 +1846,7 @@ impl App {
                     );
                 } else {
                     self.join_topic(topic_id);
+                    self.render_topic_view(db);
                     self.chat_panel.push(
                         "system".to_string(),
                         "system".to_string(),
@@ -1067,6 +1857,8 @@ impl App {
                 }
             }
 
+            "/branch" => self.handle_branch_command(args, db),
+
             "/agent" => {
                 let mut parts = args.split_whitespace();
                 let sub = parts.next().unwrap_or("");
@@ -1076,11 +1868,86 @@ impl App {
                         if name.is_empty() {
                             self.chat_panel.push(
                                 "system".into(), "system".into(),
-                                "Usage: /agent spawn <name>".into(),
+                                "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high]".into(),
                                 None, None,
                             );
                             return Ok(());
                         }
+
+                        // A name collision leaves two agent loops answering
+                        // the same @mention (e.g. one with a dead backend,
+                        // one healthy) — confusing at best. Require a fresh
+                        // name per spawn.
+                        if self.agent_cmd_txs.contains_key(&name) {
+                            self.chat_panel.push(
+                                "system".into(), "system".into(),
+                                format!("Agent '{name}' already exists. Pick another name (or restart to respawn)."),
+                                None, None,
+                            );
+                            return Ok(());
+                        }
+
+                        // Optional terms after the name, e.g.
+                        // `/agent spawn helper backend=lemonade` or
+                        // `/agent spawn scout backend=kimi model=kimi-k2-thinking thinking=high`.
+                        const SPAWN_USAGE: &str = "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high]";
+                        let mut backend_kind = agent::config::BackendKind::default();
+                        let mut model: Option<String> = None;
+                        let mut thinking: Option<agent::config::ThinkingLevel> = None;
+                        for term in parts {
+                            if let Some(value) = term.strip_prefix("backend=") {
+                                match agent::config::BackendKind::parse(value) {
+                                    Some(kind) => backend_kind = kind,
+                                    None => {
+                                        self.chat_panel.push(
+                                            "system".into(), "system".into(),
+                                            format!("Unknown backend '{value}'. Try: llamacpp, lemonade, kimi, kimi-coding"),
+                                            None, None,
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            } else if let Some(value) = term.strip_prefix("model=") {
+                                model = Some(value.to_string());
+                            } else if let Some(value) = term.strip_prefix("thinking=") {
+                                match agent::config::ThinkingLevel::parse(value) {
+                                    Some(level) => thinking = Some(level),
+                                    None => {
+                                        self.chat_panel.push(
+                                            "system".into(), "system".into(),
+                                            format!("Unknown thinking level '{value}'. Try: low, medium, high"),
+                                            None, None,
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                self.chat_panel.push(
+                                    "system".into(), "system".into(),
+                                    format!("Unknown term '{term}'. {SPAWN_USAGE}"),
+                                    None, None,
+                                );
+                                return Ok(());
+                            }
+                        }
+
+                        // Cloud backends need an API key BEFORE we
+                        // provision anything — resolving it late would
+                        // leave an orphan Being in the DB.
+                        let api_key = match backend_kind.key_provider() {
+                            Some(provider) => match llung_core::secrets::load_api_key(provider).await {
+                                Ok(key) => Some(key),
+                                Err(e) => {
+                                    self.chat_panel.push(
+                                        "system".into(), "system".into(),
+                                        format!("Kimi backend needs an API key: {e}"),
+                                        None, None,
+                                    );
+                                    return Ok(());
+                                }
+                            },
+                            None => None,
+                        };
 
                         // Provision in DB: new Being + new Machine
                         let agent_id = agent::provision_agent(db, &name)?;
@@ -1090,6 +1957,7 @@ impl App {
                             CoreConfig {
                                 db_path: self.config.db_path.clone(),
                                 chat_topic: self.current_topic.clone(),
+                                relays: CoreConfig::relays_from_env(),
                             },
                             agent_id.machine,
                             agent_id.being.clone(),
@@ -1100,9 +1968,74 @@ impl App {
                         // history compressor shares the agent's model
                         // backend (with a compressor system prompt).
                         let agent_cmd_tx = agent_app.command_tx();
-                        let agent_config =
-                            AgentConfig { name: name.clone(), ..Default::default() };
-                        let backend = OpenAiCompatible::from_config(&agent_config);
+
+                        // Permission prompts arrive on the app-wide
+                        // `perm_tx` (created in `run`); our answer goes
+                        // back on the request's oneshot. `/grant`
+                        // commands travel the parallel cmd channel.
+                        let (grant_tx, grant_cmd_rx) = mpsc::channel::<agent::AgentCommand>(8);
+
+                        // Same-process wiring: our node and the agent's
+                        // node never discover each other when the host
+                        // filters multicast (broken mDNS), so hand the
+                        // agent our listen addresses and have it dial us
+                        // directly. Without this every topic publish dies
+                        // with NoPeersSubscribedToTopic.
+                        if let Some(our_tx) = &self.cmd_tx {
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                            if our_tx
+                                .send(NetworkCommand::GetListenAddrs { responder: resp_tx })
+                                .await
+                                .is_ok()
+                            {
+                                if let Ok(addrs) = resp_rx.await {
+                                    for addr in addrs {
+                                        let _ = agent_cmd_tx
+                                            .send(NetworkCommand::Dial { multiaddr: addr })
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                        // Model default is backend-specific: a Kimi
+                        // spawn without model= gets the Kimi default.
+                        let agent_config = AgentConfig {
+                            name: name.clone(),
+                            model: model.clone().unwrap_or_else(|| match backend_kind {
+                                agent::config::BackendKind::Kimi => "kimi-k2-0905-preview".to_string(),
+                                agent::config::BackendKind::KimiCoding => "kimi-for-coding".to_string(),
+                                _ => AgentConfig::default().model,
+                            }),
+                            backend: backend_kind,
+                            thinking,
+                            ..Default::default()
+                        };
+                        let mut backend = OpenAiCompatible::from_config(&agent_config);
+                        if let Some(key) = api_key {
+                            backend = backend.with_api_key(key);
+                        }
+
+                        // Warn early when the model server isn't there —
+                        // otherwise the agent simply never answers and it
+                        // looks like a hang.
+                        if let Err(e) = backend.probe().await {
+                            self.chat_panel.push(
+                                "system".into(), "system".into(),
+                                format!(
+                                    "Warning: model backend {backend_kind:?} unreachable ({e}). \
+                                     The agent will fail until it is up — or respawn with backend=..."
+                                ),
+                                None, None,
+                            );
+                        }
+                        let stream_tx = self
+                            .stream_tx
+                            .clone()
+                            .ok_or("streaming channel not initialized")?;
+                        let perm_tx = self
+                            .perm_tx
+                            .clone()
+                            .ok_or("permission channel not initialized")?;
                         let ctx = AgentLoopContext::new(
                             agent_config.clone(),
                             Box::new(backend.clone()),
@@ -1117,8 +2050,10 @@ impl App {
                             self.current_topic.clone(),
                             agent_id.being.being_id.clone(),
                             name.clone(),
+                            stream_tx,
+                            perm_tx,
                         );
-                        tokio::spawn(run_agent_loop(ctx, agent_event_rx));
+                        tokio::spawn(run_agent_loop(ctx, agent_event_rx, grant_cmd_rx));
 
                         // The agent's Being is already a peer (its own
                         // machine + being in the DB, listed in known_peers
@@ -1127,6 +2062,7 @@ impl App {
                         self.agent_cmd_txs.insert(name.clone(), agent_cmd_tx);
 
                         // Also add to known_peers so presence rendering works
+                        self.agent_grant_txs.insert(name.clone(), grant_tx);
                         self.known_peers.insert(
                             agent_id.being.being_id.clone(),
                             PeerInfo {
@@ -1139,14 +2075,15 @@ impl App {
 
                         self.chat_panel.push(
                             "system".into(), "system".into(),
-                            format!("Agent '{name}' is ready. Invite it with: /invite {name} #{}", self.current_topic),
+                            format!("Agent '{name}' is ready (backend: {backend_kind:?}). Invite it with: /invite {name} #{}", self.current_topic),
                             None, None,
                         );
+                        self.update_status_line(db);
                     }
                     _ => {
                         self.chat_panel.push(
                             "system".into(), "system".into(),
-                            "Unknown /agent subcommand. Try: /agent spawn <name>".into(),
+                            "Unknown /agent subcommand. Try: /agent spawn <name> [backend=llamacpp|lemonade]".into(),
                             None, None,
                         );
                     }
@@ -1219,9 +2156,268 @@ impl App {
                     );
                 }
             }
-            _ => {}
+            "/plot" => {
+                // /plot <path> [kind=scatter] [x=col] [y=col] [z=col] [bins=N]
+                // Run plot_device on a CSV file directly — the pending
+                // panel spins while the wasm tool runs.
+                let mut parts = args.split_whitespace();
+                let Some(path) = parts.next() else {
+                    self.chat_panel.push(
+                        "system".into(), "system".into(),
+                        "Usage: /plot <csv-path> [kind=scatter|histogram|cdf] [x=col] [y=col] [z=col] [bins=N]".into(),
+                        None, None,
+                    );
+                    return Ok(());
+                };
+                let mut map = serde_json::json!({
+                    "path": normalize_plot_path(path),
+                });
+                for kv in parts {
+                    let Some((k, v)) = kv.split_once('=') else {
+                        self.chat_panel.push(
+                            "system".into(), "system".into(),
+                            format!("Usage: /plot <csv-path> [kind=…] [x=col] [y=col] [z=col] [bins=N] — '{kv}' is not key=value"),
+                            None, None,
+                        );
+                        return Ok(());
+                    };
+                    map[k] = serde_json::Value::String(v.to_string());
+                }
+                let arguments = map.to_string();
+                let call_id = generate_cid_from_bytes(
+                    &(self.peer_id.clone() + &arguments).as_bytes(),
+                )
+                .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                self.chat_panel.push_tool(
+                    self.peer_id.clone(),
+                    self.my_name.clone(),
+                    None,
+                    ToolBlock::pending(call_id.clone(), "plot_device".into(), &arguments),
+                );
+                match agent::tools::run_tool_locally("plot_device", &arguments).await {
+                    Ok(output) => {
+                        let block = ToolBlock::response(
+                            Some(call_id.clone()),
+                            "plot_device".into(),
+                            &output,
+                            false,
+                        );
+                        self.chat_panel.push_tool_response(
+                            self.peer_id.clone(),
+                            self.my_name.clone(),
+                            None,
+                            Some(&call_id),
+                            block,
+                        );
+                    }
+                    Err(e) => {
+                        let block = ToolBlock::response(
+                            Some(call_id.clone()),
+                            "plot_device".into(),
+                            &e,
+                            true,
+                        );
+                        self.chat_panel.push_tool_response(
+                            self.peer_id.clone(),
+                            self.my_name.clone(),
+                            None,
+                            Some(&call_id),
+                            block,
+                        );
+                    }
+                }
+            }
+            "/tools" => {
+                for line in Self::format_tool_listing(args.trim()) {
+                    self.chat_panel
+                        .push("system".into(), "system".into(), line, None, None);
+                }
+            }
+            "/grant" => {
+                match parse_grant_command(args) {
+                    Err(usage) => self.system(usage),
+                    Ok(GrantCommand::Pending) => {
+                        if let Some(req) = &self.pending_perm {
+                            self.system(format!(
+                                "pending: {} asks `{}`{} — answer with y/Y/n",
+                                req.agent_name,
+                                req.effect,
+                                tier_label(req.tier)
+                            ));
+                        } else if !self.perm_queue.is_empty() {
+                            self.system(format!("{} permission request(s) queued", self.perm_queue.len()));
+                        } else {
+                            self.system("no pending permission requests");
+                        }
+                    }
+                    Ok(GrantCommand::List) => self.grant_list().await,
+                    Ok(GrantCommand::Grant { effect, agent }) => {
+                        self.grant_change(effect, agent, true).await;
+                    }
+                    Ok(GrantCommand::Revoke { effect, agent }) => {
+                        self.grant_change(effect, agent, false).await;
+                    }
+                }
+            }
+            "/help" | "/h" | "/?" => {
+                for line in Self::help_text() {
+                    self.chat_panel
+                        .push("system".into(), "system".into(), line, None, None);
+                }
+            }
+            _ => {
+                self.chat_panel.push(
+                    "system".into(),
+                    "system".into(),
+                    format!("Unknown command '{name}' — try /help"),
+                    None,
+                    None,
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Drain one relay-fetched image result: cache it, drop the inflight
+    /// marker, redraw.
+    fn handle_image_result(
+        &mut self,
+        db: &Database,
+        cid: String,
+        result: Option<(String, Vec<u8>)>,
+    ) {
+        self.pending_image_fetches.remove(&cid);
+        match result {
+            Some((_mime, data)) => self.on_image_fetched(db, &cid, &data),
+            None => tracing::debug!(%cid, "image not on any relay (yet)"),
+        }
+    }
+
+    /// `/grant list`: standing grants per local agent (round-trips into
+    /// each agent's orchestrator loop).
+    async fn grant_list(&mut self) {
+        if self.agent_grant_txs.is_empty() {
+            self.system("no local agents — spawn one with /agent spawn");
+            return;
+        }
+        let mut names: Vec<String> = self.agent_grant_txs.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let tx = self.agent_grant_txs.get(&name).expect("key from keys");
+            let (respond, rx) = tokio::sync::oneshot::channel();
+            if tx.send(agent::AgentCommand::ListGrants { respond }).await.is_err() {
+                self.system(format!("{name}: agent loop unreachable"));
+                continue;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+                Ok(Ok(effects)) if effects.is_empty() => {
+                    self.system(format!("{name}: (no standing grants)"));
+                }
+                Ok(Ok(effects)) => {
+                    self.system(format!("{name}: {}", effects.join(", ")));
+                }
+                Ok(Err(_)) => self.system(format!("{name}: grant list dropped")),
+                Err(_) => self.system(format!("{name}: grant list timed out")),
+            }
+        }
+    }
+
+    /// `/grant <effect> perpetual [agent]` / `revoke`: add or remove a
+    /// standing grant. Without `agent`, applies to every local agent.
+    async fn grant_change(&mut self, effect: String, agent: Option<String>, grant: bool) {
+        let targets: Vec<String> = match &agent {
+            Some(a) => vec![a.clone()],
+            None => {
+                let mut all: Vec<String> = self.agent_grant_txs.keys().cloned().collect();
+                all.sort();
+                all
+            }
+        };
+        if targets.is_empty() {
+            self.system("no local agents — spawn one with /agent spawn");
+            return;
+        }
+        for name in targets {
+            let Some(tx) = self.agent_grant_txs.get(&name) else {
+                self.system(format!("no local agent named '{name}'"));
+                continue;
+            };
+            let cmd = if grant {
+                agent::AgentCommand::GrantStanding { effect: effect.clone() }
+            } else {
+                agent::AgentCommand::Revoke { effect: effect.clone() }
+            };
+            if tx.send(cmd).await.is_err() {
+                self.system(format!("{name}: agent loop unreachable"));
+            } else {
+                let verb = if grant { "granted (perpetual)" } else { "revoked" };
+                self.system(format!("{name}: `{effect}` {verb}"));
+            }
+        }
+    }
+
+    /// `/tools` output: every tool (no arg), or one tool's description,
+    /// usage, and argument schema (`/tools <name>`).
+    fn format_tool_listing(name: &str) -> Vec<String> {
+        let catalog = agent::tools::tool_catalog();
+        if name.is_empty() {
+            let mut lines = vec!["Tools:".to_string()];
+            for spec in catalog {
+                lines.push(format!("  {} — {}", spec.name, spec.description));
+            }
+            lines.push("Usage: /tools <name> — full description and arguments".into());
+            return lines;
+        }
+        let Some(spec) = catalog.iter().find(|t| t.name == name) else {
+            return vec![format!(
+                "Unknown tool '{name}' — try /tools for the list"
+            )];
+        };
+        let mut lines = vec![
+            format!("{} — {}", spec.name, spec.description),
+            format!("usage: {}", spec.usage),
+        ];
+        if let Ok(schema) = serde_json::from_str::<serde_json::Value>(spec.schema) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&schema) {
+                lines.push("arguments (JSON schema):".into());
+                lines.extend(pretty.lines().map(str::to_string));
+            }
+        }
+        lines
+    }
+
+    /// Every slash command, one per line, for `/help`.
+    fn help_text() -> Vec<String> {
+        vec![
+            "Commands:".into(),
+            "  /join #<topic> — switch to a topic (and subscribe)".into(),
+            "  /invite <peer> [peer...] [#<topic>] [display name] — invite peers to a topic (default: current chat)".into(),
+            "  /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high] — spawn a local agent, then invite it like any peer".into(),
+            "  kimi needs an API key once: `llung-cli key set kimi` (login keyring) or LLUNG_KIMI_API_KEY".into(),
+            "  /branch — where am I in the chat tree?".into(),
+            "  /branch <n> — focus the message n-back; your next message forks the chat there".into(),
+            "  /branch up|down — walk to the parent / most recent child message".into(),
+            "  /branch next|prev — switch to a sibling branch at the same fork".into(),
+            "  /branch tip — return to the newest branch".into(),
+            "  /tools [name] — list tools, or show one tool's description and arguments".into(),
+            "  /grant list — standing tool grants per local agent".into(),
+            "  /grant <effect> perpetual [agent] — pre-authorize a tool tier (e.g. bash, repl); agent defaults to all".into(),
+            "  /grant revoke <effect> [agent] — remove a standing grant".into(),
+            "  /grant pending — show the permission prompt queue".into(),
+            "  /plot <csv-path> [kind=scatter|histogram|cdf] [x=col] [y=col] [z=col] — run plot_device on a file yourself".into(),
+            "  /attach <path> [caption] — send an image".into(),
+            "  /peers · /chats · /media — toggle the sidebars".into(),
+            "  /theme <name | light/dark | path.json> · /theme reload — theme picker".into(),
+            "  /quit — exit".into(),
+            "Example — spawn an agent and ask it to plot:".into(),
+            "  /agent spawn plotter backend=lemonade".into(),
+            "  /invite plotter #introductions".into(),
+            "  @plotter plot cos(x)*sin(y)".into(),
+            "Example — fork the conversation:".into(),
+            "  /branch 3          (next message replies 3 messages back)".into(),
+            "  actually, let's talk about Y".into(),
+            "  /branch tip        (back to the newest branch)".into(),
+        ]
     }
 
     async fn send_attachment(
@@ -1240,6 +2436,20 @@ impl App {
         if let Some(tx) = &self.cmd_tx {
             tx.send(NetworkCommand::ProvideMediaCid { cid: cid.clone() })
                 .await?;
+            // Lightweight images (avatars, message images ≤512KB) also
+            // go into the relay caches, so peers behind NATs and your
+            // other devices can fetch them later.
+            let mime = attachment.mime_type.clone();
+            if attachment.kind == AttachmentKind::Image
+                && bytes.len() <= llung_core::media::image::MAX_IMAGE_BYTES
+            {
+                tx.send(NetworkCommand::PublishImage {
+                    cid: cid.clone(),
+                    mime_type: mime,
+                    data: bytes.clone(),
+                })
+                .await?;
+            }
         }
 
         let my_avatar = self
@@ -1291,8 +2501,13 @@ impl App {
         Ok(())
     }
 
-    async fn handle_invite_command(&mut self, args: &str) -> std::result::Result<(), String> {
-        let (peer_queries, topic_id, display_name) = parse_invite_args(args)?;
+    async fn handle_invite_command(
+        &mut self,
+        args: &str,
+        db: &Database,
+    ) -> std::result::Result<(), String> {
+        let (peer_queries, topic_id, display_name) =
+            parse_invite_args(args, &self.current_topic)?;
 
         let mut remote_targets: Vec<PeerId> = Vec::new();
 
@@ -1338,6 +2553,7 @@ impl App {
 
         // Join the topic ourselves
         self.join_topic(&topic_id);
+        self.render_topic_view(db);
 
         let invited_names = peer_queries.join(", ");
         self.chat_panel.push(
@@ -1359,30 +2575,203 @@ impl App {
     }
 }
 
+/// `/grant` subcommands, parsed for `handle_command`.
+#[derive(Debug, PartialEq)]
+enum GrantCommand {
+    List,
+    Pending,
+    Grant { effect: String, agent: Option<String> },
+    Revoke { effect: String, agent: Option<String> },
+}
+
+const GRANT_USAGE: &str = "Usage: /grant list | /grant <effect> perpetual [agent] | /grant revoke <effect> [agent] | /grant pending";
+
+/// Effects are keyed by the bare tool name used in manifests
+/// (`bash`, `repl`, `gpu:futhark`). `agent` defaults to all local agents.
+fn parse_grant_command(args: &str) -> Result<GrantCommand, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        ["list"] => Ok(GrantCommand::List),
+        ["pending"] => Ok(GrantCommand::Pending),
+        ["revoke", effect] => Ok(GrantCommand::Revoke {
+            effect: effect.to_string(),
+            agent: None,
+        }),
+        ["revoke", effect, agent] => Ok(GrantCommand::Revoke {
+            effect: effect.to_string(),
+            agent: Some(agent.to_string()),
+        }),
+        [effect, "perpetual"] => Ok(GrantCommand::Grant {
+            effect: effect.to_string(),
+            agent: None,
+        }),
+        [effect, "perpetual", agent] => Ok(GrantCommand::Grant {
+            effect: effect.to_string(),
+            agent: Some(agent.to_string()),
+        }),
+        _ => Err(GRANT_USAGE.into()),
+    }
+}
+
+/// Target number of mesh-dialed peers (outbound p2p connections). With
+/// deterministic single-direction dialing, a group of N members forms
+/// ~N/2 outbound + N/2 inbound links per node; gossipsub's own mesh
+/// targets ~6 peers, so this sits comfortably above it.
+const MESH_TARGET: usize = 8;
+
+/// Should we dial this presence-advertising peer to grow the p2p mesh?
+/// Pure decision — unit tested.
+///
+/// - Deterministic direction (`own_machine < their_machine`): exactly
+///   one side dials, halving full-mesh connections.
+/// - Cap: bounds outbound connections as the group scales.
+/// - Dedup: never re-dial a machine (presence repeats every 15s).
+fn should_dial_for_mesh(
+    own_machine: &str,
+    their_machine: &str,
+    mesh_dialed_count: usize,
+    already_dialed: bool,
+    target: usize,
+) -> bool {
+    !already_dialed && own_machine < their_machine && mesh_dialed_count < target
+}
+
+/// Human description of an effect tier for permission prompts.
+fn tier_label(tier: agent::effects::Tier) -> &'static str {
+    use agent::effects::Tier;
+    match tier {
+        Tier::Wasm => "",
+        Tier::FsRead => " (filesystem read)",
+        Tier::Edit => " (file edit)",
+        Tier::ProcBash => " (sandboxed shell)",
+        Tier::Repl => " (interpreter)",
+        Tier::Gpu => " (GPU)",
+    }
+}
+
+/// `/plot` paths accept the mention form too: strip a leading `@`,
+/// expand `~`.
+fn normalize_plot_path(token: &str) -> String {
+    shellexpand::tilde(token.strip_prefix('@').unwrap_or(token)).to_string()
+}
+
+/// pi-style file mentions: tokens like `@/path/to.csv` or `@~/data.csv`
+/// expand to the plain absolute path plus a small descriptor (CSV
+/// shape, or byte size) so the model can call file-reading tools
+/// (`plot_device`) with the path instead of transcribing the data.
+fn expand_file_mentions(text: &str) -> String {
+    text.split(' ').map(expand_one_mention).collect::<Vec<_>>().join(" ")
+}
+
+fn expand_one_mention(token: &str) -> String {
+    let Some(rest) = token
+        .strip_prefix('@')
+        .filter(|r| r.starts_with('/') || r.starts_with('~'))
+    else {
+        return token.to_string();
+    };
+    let expanded = shellexpand::tilde(rest).to_string();
+    let Ok(meta) = std::fs::metadata(&expanded) else {
+        return token.to_string();
+    };
+    if !meta.is_file() {
+        return token.to_string();
+    }
+    let desc = if rest.ends_with(".csv") {
+        csv_file_desc(&expanded)
+    } else {
+        format!("{} bytes", meta.len())
+    };
+    format!("{expanded} (file: {desc})")
+}
+
+fn csv_file_desc(path: &str) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return "unreadable".into();
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(header) = lines.first() else {
+        return "empty csv".into();
+    };
+    let cols = header.split(',').count();
+    let rows = lines.len().saturating_sub(1);
+    format!("csv, {cols} columns, {rows} rows")
+}
+
+/// Bytes of the budgeted summary-tree view an agent would read for
+/// `messages` — a dry-run with the rule-based summarizer (no model
+/// calls, so the status row stays instant). Returns None when the
+/// compressor cannot run (shouldn't happen; the caller falls back).
+fn compressed_view_bytes(messages: &[llung_core::network::message::ChatMessage], budget: usize) -> Option<usize> {
+    use agent::history::{HeadlineSummarizer, HistoryCompressor};
+    let compressor = HistoryCompressor::new(Box::new(HeadlineSummarizer::new()), budget);
+    let tree = futures::executor::block_on(compressor.compress(messages));
+    let view = compressor.flatten_budgeted(&tree, budget);
+    Some(view.len())
+}
+
+/// 950 → "950", 3456 → "3.5k", 1_234_567 → "1.2M".
+fn human_len(n: usize) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
 /// Parse `/invite` arguments into `(peer queries, topic id, display name)`.
 /// The first `#`-prefixed token splits peers from the topic; any remaining
 /// tokens become the display name (falling back to the topic id).
-fn parse_invite_args(args: &str) -> std::result::Result<(Vec<String>, String, String), String> {
+/// Split `/invite` args into `(peers, topic id, display name)`. The
+/// `#<topic>` token is optional: without it the invite targets
+/// `default_topic` (the current chat).
+fn parse_invite_args(
+    args: &str,
+    default_topic: &str,
+) -> std::result::Result<(Vec<String>, String, String), String> {
     let tokens: Vec<&str> = args.split_whitespace().collect();
-    let Some(hash_pos) = tokens.iter().position(|t| t.starts_with('#')) else {
-        return Err("usage: /invite <peer> [peer...] #<topic> [display name]".into());
+    let hash_pos = tokens.iter().position(|t| t.starts_with('#'));
+    let (peers, topic_id, display_name) = match hash_pos {
+        Some(pos) => {
+            if pos == 0 {
+                return Err("name at least one peer to invite (see /peers)".into());
+            }
+            let topic_id = tokens[pos].trim_start_matches('#').to_string();
+            if topic_id.is_empty() {
+                return Err("topic name cannot be empty".into());
+            }
+            let display_name = if tokens.len() > pos + 1 {
+                tokens[pos + 1..].join(" ")
+            } else {
+                topic_id.clone()
+            };
+            (
+                tokens[..pos].iter().map(|s| s.to_string()).collect(),
+                topic_id,
+                display_name,
+            )
+        }
+        None => {
+            if tokens.is_empty() {
+                return Err("usage: /invite <peer> [peer...] [#<topic>] [display name]".into());
+            }
+            // No #topic: invite to the current chat. (A custom display
+            // name requires an explicit topic, since everything here is
+            // peer names.)
+            let topic_id = default_topic.trim_start_matches('#').to_string();
+            if topic_id.is_empty() {
+                return Err("no current topic — use /invite <peer> #<topic>".into());
+            }
+            let display_name = topic_id.clone();
+            (
+                tokens.iter().map(|s| s.to_string()).collect(),
+                topic_id,
+                display_name,
+            )
+        }
     };
-    if hash_pos == 0 {
-        return Err("name at least one peer to invite (see /peers)".into());
-    }
-
-    let topic_id = tokens[hash_pos].trim_start_matches('#').to_string();
-    if topic_id.is_empty() {
-        return Err("topic name cannot be empty".into());
-    }
-
-    let display_name = if tokens.len() > hash_pos + 1 {
-        tokens[hash_pos + 1..].join(" ")
-    } else {
-        topic_id.clone()
-    };
-
-    let peers = tokens[..hash_pos].iter().map(|s| s.to_string()).collect();
     Ok((peers, topic_id, display_name))
 }
 
@@ -1401,8 +2790,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grant_command_parsing() {
+        assert_eq!(parse_grant_command("list"), Ok(GrantCommand::List));
+        assert_eq!(parse_grant_command("pending"), Ok(GrantCommand::Pending));
+        assert_eq!(
+            parse_grant_command("bash perpetual"),
+            Ok(GrantCommand::Grant { effect: "bash".into(), agent: None })
+        );
+        assert_eq!(
+            parse_grant_command("repl perpetual plotter"),
+            Ok(GrantCommand::Grant { effect: "repl".into(), agent: Some("plotter".into()) })
+        );
+        assert_eq!(
+            parse_grant_command("revoke bash"),
+            Ok(GrantCommand::Revoke { effect: "bash".into(), agent: None })
+        );
+        assert_eq!(
+            parse_grant_command("revoke gpu:futhark plotter"),
+            Ok(GrantCommand::Revoke {
+                effect: "gpu:futhark".into(),
+                agent: Some("plotter".into())
+            })
+        );
+        assert!(parse_grant_command("").unwrap_err().contains("Usage"));
+        assert!(parse_grant_command("bash").unwrap_err().contains("Usage"));
+        assert!(parse_grant_command("bash forever").unwrap_err().contains("Usage"));
+    }
+
+    #[test]
+    fn mesh_dialing_is_directional_capped_and_deduped() {
+        // Direction: exactly one side dials.
+        assert!(should_dial_for_mesh("aaa", "bbb", 0, false, 8));
+        assert!(!should_dial_for_mesh("bbb", "aaa", 0, false, 8));
+        assert!(!should_dial_for_mesh("aaa", "aaa", 0, false, 8), "never dial self");
+        // Dedup.
+        assert!(!should_dial_for_mesh("aaa", "bbb", 1, true, 8));
+        // Cap.
+        assert!(!should_dial_for_mesh("aaa", "zzz", 8, false, 8));
+        assert!(should_dial_for_mesh("aaa", "zzz", 7, false, 8));
+    }
+
+    #[test]
+    fn tier_labels_describe_effect_classes() {
+        assert_eq!(tier_label(agent::effects::Tier::Wasm), "");
+        assert_eq!(tier_label(agent::effects::Tier::ProcBash), " (sandboxed shell)");
+        assert_eq!(tier_label(agent::effects::Tier::Gpu), " (GPU)");
+    }
+
+    #[test]
     fn parse_invite_basic() {
-        let (peers, topic, display) = parse_invite_args("alice bob #book-club").unwrap();
+        let (peers, topic, display) = parse_invite_args("alice bob #book-club", "default").unwrap();
         assert_eq!(peers, vec!["alice", "bob"]);
         assert_eq!(topic, "book-club");
         assert_eq!(display, "book-club");
@@ -1410,25 +2847,52 @@ mod tests {
 
     #[test]
     fn parse_invite_with_display_name() {
-        let (peers, topic, display) = parse_invite_args("agent1 #book-club The Book Club").unwrap();
+        let (peers, topic, display) =
+            parse_invite_args("agent1 #book-club The Book Club", "default").unwrap();
         assert_eq!(peers, vec!["agent1"]);
         assert_eq!(topic, "book-club");
         assert_eq!(display, "The Book Club");
     }
 
     #[test]
-    fn parse_invite_requires_sigil() {
+    fn parse_invite_defaults_to_current_topic() {
+        let (peers, topic, display) = parse_invite_args("plotter", "introductions").unwrap();
+        assert_eq!(peers, vec!["plotter"]);
+        assert_eq!(topic, "introductions");
+        assert_eq!(display, "introductions");
+
+        // A stray '#' on the default topic must not break anything.
+        let (_, topic, _) = parse_invite_args("plotter helper", "#introductions").unwrap();
+        assert_eq!(topic, "introductions");
+    }
+
+    #[test]
+    fn parse_invite_requires_args() {
         assert!(
-            parse_invite_args("alice bob")
+            parse_invite_args("", "introductions")
                 .unwrap_err()
                 .contains("usage")
+        );
+        // No topic given and no current topic to fall back on.
+        assert!(
+            parse_invite_args("alice", "")
+                .unwrap_err()
+                .contains("no current topic")
         );
     }
 
     #[test]
     fn parse_invite_requires_peers_and_topic() {
-        assert!(parse_invite_args("#topic").unwrap_err().contains("peer"));
-        assert!(parse_invite_args("alice #").unwrap_err().contains("empty"));
+        assert!(
+            parse_invite_args("#topic", "default")
+                .unwrap_err()
+                .contains("peer")
+        );
+        assert!(
+            parse_invite_args("alice #", "default")
+                .unwrap_err()
+                .contains("empty")
+        );
     }
 
     #[test]
@@ -1436,5 +2900,76 @@ mod tests {
         let key = random_hex_key();
         assert_eq!(key.len(), 64);
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn input_box_has_two_borders_and_a_status_row() {
+        let theme = crate::theme::Theme::default();
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 4));
+        App::render_input_buf(&mut buf, ratatui::layout::Rect::new(0, 0, 40, 4), "hi", 2, "#t · ctx 1 msgs / 2", &theme);
+        // Row 0 and row 2 are the demarcating lines; row 3 is the status.
+        assert!(buf[(0, 0)].symbol() == "─");
+        assert!(buf[(39, 0)].symbol() == "─");
+        assert_eq!(buf[(1, 1)].symbol(), "h");
+        assert!(buf[(0, 2)].symbol() == "─");
+        assert!(buf[(39, 2)].symbol() == "─");
+        assert!(buf[(1, 3)].symbol() == "#");
+    }
+
+    #[test]
+    fn plot_paths_accept_mentions_and_tilde() {
+        assert_eq!(normalize_plot_path("@~/Documents/flights.csv"), shellexpand::tilde("~/Documents/flights.csv").to_string());
+        assert_eq!(normalize_plot_path("~/Documents/flights.csv"), shellexpand::tilde("~/Documents/flights.csv").to_string());
+        assert_eq!(normalize_plot_path("/tmp/x.csv"), "/tmp/x.csv");
+    }
+
+    #[test]
+    fn file_mentions_expand_with_csv_shape() {
+        let dir = std::env::temp_dir();
+        let csv = dir.join("llung-mention-test.csv");
+        std::fs::write(&csv, "age,height\n30,170\n40,180\n").unwrap();
+
+        let out = expand_file_mentions(&format!("plot @{} please", csv.display()));
+        assert!(out.contains(csv.to_str().unwrap()), "{out}");
+        assert!(out.contains("csv, 2 columns, 2 rows"), "{out}");
+
+        // Agent mentions (@name) and non-files pass through untouched.
+        assert_eq!(expand_file_mentions("@plotter hi"), "@plotter hi");
+        assert_eq!(expand_file_mentions("@/no/such/file.csv ok"), "@/no/such/file.csv ok");
+
+        std::fs::remove_file(&csv).ok();
+    }
+
+    #[test]
+    fn tools_listing_shows_every_tool_then_details() {
+        let lines = App::format_tool_listing("");
+        assert!(lines[0].starts_with("Tools:"));
+        for spec in agent::tools::tool_catalog() {
+            assert!(
+                lines.iter().any(|l| l.contains(spec.name)),
+                "listing must include {}",
+                spec.name
+            );
+        }
+
+        // Detail view: description, usage, and the argument schema.
+        let lines = App::format_tool_listing("artist");
+        assert!(lines[0].starts_with("artist — "));
+        assert!(lines.iter().any(|l| l.starts_with("usage: ")));
+        let schema = lines
+            .iter()
+            .position(|l| l.starts_with("arguments (JSON schema):"))
+            .expect("schema section");
+        assert!(lines[schema + 1..].iter().any(|l| l.contains("\"seed\"")));
+        assert!(lines[schema + 1..].iter().any(|l| l.contains("\"style\"")));
+
+        assert!(App::format_tool_listing("nope")[0].contains("Unknown tool"));
+    }
+
+    #[test]
+    fn human_len_scales() {
+        assert_eq!(human_len(950), "950");
+        assert_eq!(human_len(3_456), "3.5k");
+        assert_eq!(human_len(1_234_567), "1.2M");
     }
 }

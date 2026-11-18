@@ -5,7 +5,7 @@
 //! are no side effects, no I/O, no recursion, and evaluation cost is
 //! bounded by the mesh size the host chooses.
 
-/// An parsed expression over the variables `x` and `y`.
+/// An parsed expression over the variables `x`, `y`, and optionally `z`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Const(f64),
@@ -19,6 +19,7 @@ pub enum Expr {
 pub enum Var {
     X,
     Y,
+    Z,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,14 +125,15 @@ impl Expr {
         Ok(expr)
     }
 
-    pub fn eval(&self, x: f64, y: f64) -> f64 {
+    pub fn eval(&self, x: f64, y: f64, z: f64) -> f64 {
         match self {
             Self::Const(c) => *c,
             Self::Var(Var::X) => x,
             Self::Var(Var::Y) => y,
-            Self::Neg(e) => -e.eval(x, y),
+            Self::Var(Var::Z) => z,
+            Self::Neg(e) => -e.eval(x, y, z),
             Self::Binary(op, l, r) => {
-                let (l, r) = (l.eval(x, y), r.eval(x, y));
+                let (l, r) = (l.eval(x, y, z), r.eval(x, y, z));
                 match op {
                     BinOp::Add => l + r,
                     BinOp::Sub => l - r,
@@ -142,9 +144,23 @@ impl Expr {
                 }
             }
             Self::Call(f, args) => {
-                let vals: Vec<f64> = args.iter().map(|a| a.eval(x, y)).collect();
+                let vals: Vec<f64> = args.iter().map(|a| a.eval(x, y, z)).collect();
                 f.call(&vals)
             }
+        }
+    }
+
+    /// True when the expression references `z` — the host then renders
+    /// the IMPLICIT surface `expr(x,y,z) = 0` instead of the heightfield
+    /// `z = f(x,y)`.
+    pub fn uses_z(&self) -> bool {
+        match self {
+            Self::Const(_) => false,
+            Self::Var(Var::Z) => true,
+            Self::Var(_) => false,
+            Self::Neg(e) => e.uses_z(),
+            Self::Binary(_, l, r) => l.uses_z() || r.uses_z(),
+            Self::Call(_, args) => args.iter().any(|a| a.uses_z()),
         }
     }
 }
@@ -328,6 +344,7 @@ impl Parser {
                 Ok(match name.as_str() {
                     "x" | "X" => Expr::Var(Var::X),
                     "y" | "Y" => Expr::Var(Var::Y),
+                    "z" | "Z" => Expr::Var(Var::Z),
                     "pi" | "PI" => Expr::Const(std::f64::consts::PI),
                     "tau" | "TAU" => Expr::Const(std::f64::consts::TAU),
                     "e" | "E" => Expr::Const(std::f64::consts::E),
@@ -351,7 +368,20 @@ mod tests {
     use super::*;
 
     fn eval(src: &str, x: f64, y: f64) -> f64 {
-        Expr::parse(src).unwrap().eval(x, y)
+        Expr::parse(src).unwrap().eval(x, y, 0.0)
+    }
+
+    #[test]
+    fn z_variable_and_detection() {
+        let e = Expr::parse("x^2 + y^2 + z^2 - 1").unwrap();
+        assert!(e.uses_z());
+        assert_eq!(e.eval(1.0, 0.0, 0.0), 0.0);
+        assert_eq!(e.eval(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(e.eval(0.0, 0.0, 0.0), -1.0);
+        // No z: heightfield mode.
+        assert!(!Expr::parse("sin(x)*cos(y)").unwrap().uses_z());
+        // z nested inside a call still counts.
+        assert!(Expr::parse("sqrt(x^2+z^2)").unwrap().uses_z());
     }
 
     #[test]

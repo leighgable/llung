@@ -1,11 +1,14 @@
 pub mod aukora;
 pub mod config;
+pub mod effects;
 pub mod history;
 pub mod interface;
 pub mod orchestrator;
+pub mod permissions;
+pub mod sandbox;
 pub mod tools;
 
-pub use orchestrator::{AgentLoopContext, run_agent_loop};
+pub use orchestrator::{AgentCommand, AgentLoopContext, AgentStream, run_agent_loop};
 
 use llung_core::{
     identity::being::{Being, BeingKind},

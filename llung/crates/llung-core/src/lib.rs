@@ -5,5 +5,6 @@ pub mod identity;
 pub mod media;
 pub mod network;
 pub mod protocol;
+pub mod secrets;
 pub mod storage;
 pub mod utils;

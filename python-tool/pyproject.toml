@@ -1,0 +1,8 @@
+[project]
+name = "llung-python-tool"
+version = "0.1.0"
+description = "Python environment for the llung repl tool (sandboxed agent interpreter)"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy",
+]

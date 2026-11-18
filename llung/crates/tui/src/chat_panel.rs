@@ -1,10 +1,11 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use crate::theme::{Role, Theme};
+use crate::theme::{Role, Theme, ToolState};
 use crate::tool_panel::{ImageRow, ToolBlock};
 use unicode_width::UnicodeWidthStr;
 
 use crate::avatar::{AvatarThumbnail, render_avatar};
+use crate::md;
 use crate::prefix_text::PrefixText;
 use llung_core::network::message::{Attachment, AttachmentKind};
 use std::collections::HashMap;
@@ -35,6 +36,9 @@ pub struct ChatLine {
     pub attachment: Option<Attachment>,
     /// Tool run shown as a panel instead of `content`.
     pub tool: Option<ToolBlock>,
+    /// Set while this line is a streaming preview: the id the final
+    /// gossipsub message will carry, so it can replace this line.
+    pub stream_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -129,6 +133,7 @@ impl ChatPanel {
             avatar,
             attachment,
             tool: None,
+            stream_id: None,
         });
         self.cache.clear();
         self.cached_width = 0;
@@ -151,8 +156,58 @@ impl ChatPanel {
             avatar,
             attachment: None,
             tool: Some(block),
+            stream_id: None,
         });
         self.invalidate();
+    }
+
+    /// Append a streaming delta to the in-progress reply `stream_id`,
+    /// starting the line on first delta. The final gossipsub message
+    /// carries the same id and replaces the preview via
+    /// [`Self::remove_stream_line`].
+    pub fn push_stream_delta(
+        &mut self,
+        sender_id: String,
+        sender: String,
+        avatar: Option<AvatarThumbnail>,
+        stream_id: &str,
+        delta: &str,
+    ) {
+        if let Some(line) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.stream_id.as_deref() == Some(stream_id))
+        {
+            line.content.append(delta);
+        } else {
+            let is_me = sender.trim() == self.my_name.trim();
+            self.messages.push(ChatLine {
+                sender_id,
+                sender,
+                content: PrefixText::new(delta.to_string()),
+                is_me,
+                avatar,
+                attachment: None,
+                tool: None,
+                stream_id: Some(stream_id.to_string()),
+            });
+        }
+        self.invalidate();
+    }
+
+    /// Remove a streaming preview line (the reply became a tool call, or
+    /// the final message with the same id is about to render). Returns
+    /// true when a line was removed.
+    pub fn remove_stream_line(&mut self, stream_id: &str) -> bool {
+        let before = self.messages.len();
+        self.messages
+            .retain(|m| m.stream_id.as_deref() != Some(stream_id));
+        let removed = self.messages.len() != before;
+        if removed {
+            self.invalidate();
+        }
+        removed
     }
 
     /// A tool response: replaces the pending panel of the call it answers
@@ -178,6 +233,22 @@ impl ChatPanel {
             }
             None => self.push_tool(sender_id, sender, avatar, block),
         }
+    }
+
+    /// True while any tool panel is still running — the signal for the
+    /// tick loop to keep invalidating the layout so the spinner animates.
+    pub fn has_running_tools(&self) -> bool {
+        self.messages.iter().any(|m| {
+            m.tool.as_ref().is_some_and(|t| t.state == ToolState::Pending)
+        })
+    }
+
+    /// Remove every line (branch views rebuild the panel from the DAG).
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.invalidate();
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
     }
 
     /// Drop the layout cache, e.g. after a theme change (Kitty plot images
@@ -271,6 +342,20 @@ impl ChatPanel {
                         ..Default::default()
                     });
                 }
+                continue;
+            }
+
+            if md::has_markdown(msg.content.as_str()) {
+                // ── MARKDOWN: blocks with structure and styles ──
+                let lines = Self::markdown_lines(
+                    i,
+                    msg,
+                    md::blocks(msg.content.as_str()),
+                    width,
+                    max_block_width,
+                );
+                self.cache.extend(lines);
+                last_was_me = msg.is_me;
                 continue;
             }
 
@@ -386,6 +471,166 @@ impl ChatPanel {
                 }
             }
         }
+    }
+
+    /// Markdown path: emit blocks (headings, code panels, quotes,
+    /// lists, rules, inline styles) instead of the plain bubble.
+    fn markdown_lines(
+        i: usize,
+        msg: &ChatLine,
+        blocks: Vec<md::Block>,
+        width: u16,
+        max_block_width: u16,
+    ) -> Vec<VisualLine> {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut out: Vec<VisualLine> = Vec::new();
+
+        let base = if msg.is_me { Role::MyMessage } else { Role::PeerMessage };
+        let avatar_pad = msg.avatar.as_ref().map(|a| a.width() + 1).unwrap_or(0);
+        let right_margin = 2u16;
+        let left_margin = 2 + avatar_pad;
+        let max_content = max_block_width.saturating_sub(left_margin.max(right_margin) + 2);
+
+        // Sender header on its own line (plain path prefixes the first
+        // wrapped line; blocks make that accounting not worth it).
+        if !msg.is_me && msg.avatar.is_none() {
+            out.push(VisualLine {
+                text: msg.sender.clone(),
+                x_offset: left_margin,
+                role: Role::PeerName,
+                msg_index: i,
+                ..Default::default()
+            });
+        }
+
+        // Right-alignment for my messages, per line width.
+        let mut place = |line: VisualLine, plain_w: usize| {
+            let mut line = line;
+            if msg.is_me {
+                line.x_offset = width.saturating_sub(plain_w as u16 + right_margin);
+            }
+            line.msg_index = i;
+            out.push(line);
+        };
+
+        for block in blocks {
+            match block {
+                md::Block::Heading(_, text) => {
+                    let pt = PrefixText::new(text);
+                    for l in pt.wrap_lines(max_content) {
+                        let w = l.width();
+                        place(
+                            VisualLine {
+                                segments: md::inline(l, Role::MdHeading),
+                                ..Default::default()
+                            },
+                            w,
+                        );
+                    }
+                }
+                md::Block::Para(text) => {
+                    let pt = PrefixText::new(text);
+                    for l in pt.wrap_lines(max_content) {
+                        let w = l.width();
+                        place(
+                            VisualLine {
+                                segments: md::inline(l, base),
+                                ..Default::default()
+                            },
+                            w,
+                        );
+                    }
+                }
+                md::Block::Quote(text) => {
+                    let pt = PrefixText::new(text);
+                    let inner = max_content.saturating_sub(2);
+                    for l in pt.wrap_lines(inner) {
+                        let w = l.width() + 2;
+                        let mut segments = vec![("▎ ".to_string(), Role::MdQuoteBorder)];
+                        segments.extend(md::inline(l, Role::MdQuote));
+                        place(
+                            VisualLine {
+                                segments,
+                                ..Default::default()
+                            },
+                            w,
+                        );
+                    }
+                }
+                md::Block::List { marker, text } => {
+                    let bullet = format!("{marker} ");
+                    let bullet_w = bullet.width();
+                    let pt = PrefixText::new(text);
+                    let inner = max_content.saturating_sub(bullet_w as u16);
+                    let mut first = true;
+                    for l in pt.wrap_lines(inner) {
+                        let w = l.width() + bullet_w;
+                        let mut segments = Vec::new();
+                        if first {
+                            segments.push((bullet.clone(), Role::MdListBullet));
+                        } else {
+                            segments.push((" ".repeat(bullet_w), base));
+                        }
+                        segments.extend(md::inline(l, base));
+                        place(
+                            VisualLine {
+                                segments,
+                                ..Default::default()
+                            },
+                            w,
+                        );
+                        first = false;
+                    }
+                }
+                md::Block::Hr => {
+                    let bar: String = "─".repeat(max_content as usize);
+                    place(
+                        VisualLine {
+                            text: bar,
+                            role: Role::MdHr,
+                            ..Default::default()
+                        },
+                        max_content as usize,
+                    );
+                }
+                md::Block::Code(code) => {
+                    let lines: Vec<&str> = code.lines().collect();
+                    let longest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+                    let w = (longest + 2).clamp(8, max_content as usize).max(8);
+                    let border: String = "─".repeat(w.saturating_sub(2));
+                    place(
+                        VisualLine {
+                            text: format!("╭{border}╮"),
+                            role: Role::MdCodeBlockBorder,
+                            ..Default::default()
+                        },
+                        w,
+                    );
+                    for l in lines {
+                        let shown: String = l.chars().take(w - 2).collect();
+                        let pad = (w - 2).saturating_sub(shown.chars().count());
+                        place(
+                            VisualLine {
+                                text: format!(" {shown}{} ", " ".repeat(pad)),
+                                role: Role::MdCodeBlock,
+                                ..Default::default()
+                            },
+                            w,
+                        );
+                    }
+                    place(
+                        VisualLine {
+                            text: format!("╰{border}╯"),
+                            role: Role::MdCodeBlockBorder,
+                            ..Default::default()
+                        },
+                        w,
+                    );
+                }
+            }
+        }
+        out
     }
 
     pub fn render(&mut self, buf: &mut Buffer, area: Rect, theme: &Theme) {
@@ -588,6 +833,53 @@ impl ChatPanel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn markdown_messages_emit_styled_blocks() {
+        let mut panel = ChatPanel::new("me".into());
+        panel.push(
+            "p".into(),
+            "plotter".into(),
+            "## Result\n\nHere is `cos(x)*sin(y)`:\n\n```\nlet z = cos(x) * sin(y);\n```\n\n- one\n- two\n".into(),
+            None,
+            None,
+        );
+        panel.invalidate();
+        let theme = crate::theme::Theme::default();
+        panel.rewrap(80, &theme);
+
+        // A code block: tinted body lines + border lines.
+        assert!(panel.cache.iter().any(|l| l.role == Role::MdCodeBlock
+            && l.text.contains("let z = cos(x)")));
+        assert!(panel.cache.iter().any(|l| l.role == Role::MdCodeBlockBorder
+            && l.text.starts_with('╭')));
+        // A heading line (segments styled MdHeading).
+        assert!(panel.cache.iter().any(|l| l.segments.iter().any(|(_, r)| *r == Role::MdHeading)));
+        // Inline code segment in the paragraph.
+        assert!(panel.cache.iter().any(|l| l.segments.iter().any(|(t, r)| *r == Role::MdCode && t.contains("cos(x)*sin(y)"))));
+        // List bullet styling.
+        assert!(panel.cache.iter().any(|l| l.segments.iter().any(|(_, r)| *r == Role::MdListBullet)));
+        // Word-aware wrap: no mid-word "## " mangling, header on own line.
+        assert!(panel.cache.iter().any(|l| l.role == Role::PeerName && l.text == "plotter"));
+    }
+
+    #[test]
+    fn stream_deltas_append_to_one_line_and_finalize() {
+        let mut panel = ChatPanel::new("me".into());
+        panel.push_stream_delta("p".into(), "plotter".into(), None, "m1", "Here ");
+        panel.push_stream_delta("p".into(), "plotter".into(), None, "m1", "is the plot");
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].stream_id.as_deref(), Some("m1"));
+
+        // A different stream starts a new line.
+        panel.push_stream_delta("p".into(), "plotter".into(), None, "m2", "…");
+        assert_eq!(panel.messages.len(), 2);
+
+        // The final message replaces the preview.
+        assert!(panel.remove_stream_line("m1"));
+        assert_eq!(panel.messages.len(), 1);
+        assert!(!panel.remove_stream_line("m1"), "second removal is a no-op");
+        assert!(!panel.remove_stream_line("missing"));
+    }
     use super::*;
     use crate::avatar::decode_avatar_hex;
 

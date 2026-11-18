@@ -59,11 +59,12 @@ impl TaffyUi {
             })
             .unwrap();
 
+        // Input: top border, two text rows, bottom border, status row.
         let input = taffy
             .new_leaf(TaffyStyle {
                 size: Size {
                     width: Dimension::percent(1.0),
-                    height: Dimension::length(3.0),
+                    height: Dimension::length(4.0),
                 },
                 ..Default::default()
             })

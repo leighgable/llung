@@ -11,7 +11,7 @@ use libp2p::{PeerId, identity::Keypair};
 // use rand_core::os_rng;
 use rand::rngs::SysRng;
 use rand_core::UnwrapErr;
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, params};
 use std::{
     error::Error,
     time::{SystemTime, UNIX_EPOCH},
@@ -414,6 +414,193 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// The account's Aukora supervisor key seed, creating it on first
+    /// use (i.e. at account setup). Persisting the seed means every
+    /// agent spawned on this account signs grants with the SAME
+    /// supervisor identity across restarts and devices.
+    pub fn get_or_create_supervisor_seed(&self) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        if let Some(seed) = self
+            .conn
+            .query_row("SELECT seed_bytes FROM aukora_supervisor WHERE id = 1", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()?
+        {
+            return seed
+                .try_into()
+                .map_err(|_| "aukora_supervisor seed is not 32 bytes".into());
+        }
+        let mut rng = UnwrapErr(SysRng);
+        let seed = StaticSecret::random_from_rng(&mut rng).to_bytes();
+        self.conn.execute(
+            "INSERT INTO aukora_supervisor (id, seed_bytes) VALUES (1, ?1)",
+            [&seed.to_vec()],
+        )?;
+        Ok(seed)
+    }
+
+    // ── Aukora kernel state persistence ──
+    //
+    // The agent crate owns the KernelState type; the DB stores the raw
+    // pieces (merkle root, nonce counter, consumed nonces, pinned key
+    // pins) keyed by agent being-id, so anti-replay and the receipt
+    // chain survive process restarts.
+
+    /// Upsert the per-agent kernel row: current history merkle root and
+    /// the monotonic nonce allocation counter.
+    pub fn kernel_save_snapshot(
+        &self,
+        agent_id: &str,
+        history_root: &[u8; 32],
+        next_nonce: u64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO kernel_state (agent_id, history_root, next_nonce)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 history_root = excluded.history_root,
+                 next_nonce = excluded.next_nonce",
+            params![agent_id, history_root.as_slice(), next_nonce as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Load the persisted (history_root, next_nonce), if any.
+    pub fn kernel_load_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> rusqlite::Result<Option<([u8; 32], u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT history_root, next_nonce FROM kernel_state WHERE agent_id = ?1")?;
+        let row = stmt
+            .query_map([agent_id], |row| {
+                let root: Vec<u8> = row.get(0)?;
+                let next_nonce: i64 = row.get(1)?;
+                Ok((root, next_nonce))
+            })?
+            .next();
+        match row {
+            Some(Ok((root, next_nonce))) => {
+                let root: [u8; 32] = root.try_into().unwrap_or([0u8; 32]);
+                Ok(Some((root, next_nonce.max(0) as u64)))
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a consumed anti-replay nonce (idempotent).
+    pub fn kernel_record_nonce(
+        &self,
+        agent_id: &str,
+        nonce: u64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO kernel_nonces (agent_id, nonce) VALUES (?1, ?2)",
+            params![agent_id, nonce as i64],
+        )?;
+        Ok(())
+    }
+
+    /// All consumed nonces for an agent (empty for a fresh agent).
+    pub fn kernel_consumed_nonces(&self, agent_id: &str) -> rusqlite::Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT nonce FROM kernel_nonces WHERE agent_id = ?1")?;
+        let rows = stmt.query_map([agent_id], |row| row.get::<_, i64>(0))?;
+        rows.map(|r| r.map(|n: i64| n.max(0) as u64)).collect()
+    }
+
+    /// Pin a supervisor public key for an agent (idempotent).
+    pub fn kernel_add_pinned_key(
+        &self,
+        agent_id: &str,
+        key_pin: &[u8; 32],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO kernel_pinned_keys (agent_id, key_pin) VALUES (?1, ?2)",
+            params![agent_id, key_pin.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Add a standing grant rule (idempotent on the PK).
+    pub fn kernel_add_standing(
+        &self,
+        agent_id: &str,
+        effect: &str,
+        authorized_by: &[u8; 32],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO kernel_standing (agent_id, effect, authorized_by)
+             VALUES (?1, ?2, ?3)",
+            params![agent_id, effect, authorized_by.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete ALL standing grant rules for an agent (save syncs by
+    /// clearing then re-inserting the kernel's current rules, so
+    /// revocations survive a restart).
+    pub fn kernel_clear_standing(&self, agent_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM kernel_standing WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a standing grant rule; true when a row was deleted.
+    pub fn kernel_remove_standing(
+        &self,
+        agent_id: &str,
+        effect: &str,
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM kernel_standing WHERE agent_id = ?1 AND effect = ?2",
+            params![agent_id, effect],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All standing grant rules for an agent: (effect, authorized_by).
+    pub fn kernel_standing(&self, agent_id: &str) -> rusqlite::Result<Vec<(String, [u8; 32])>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT effect, authorized_by FROM kernel_standing WHERE agent_id = ?1")?;
+        let rows = stmt.query_map([agent_id], |row| {
+            let effect: String = row.get(0)?;
+            let pin: Vec<u8> = row.get(1)?;
+            Ok((effect, pin))
+        })?;
+        rows.map(|r| {
+            r.and_then(|(effect, pin)| {
+                let pin: [u8; 32] = pin
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+                Ok((effect, pin))
+            })
+        })
+        .collect()
+    }
+
+    /// All pinned supervisor key pins for an agent.
+    pub fn kernel_pinned_keys(&self, agent_id: &str) -> rusqlite::Result<Vec<[u8; 32]>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key_pin FROM kernel_pinned_keys WHERE agent_id = ?1")?;
+        let rows = stmt.query_map([agent_id], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|r| {
+            r.and_then(|bytes: Vec<u8>| {
+                bytes
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))
+            })
+        })
+        .collect()
     }
 
     pub fn load_dag(&self) -> Result<ChatDag, Box<dyn std::error::Error>> {

@@ -26,6 +26,7 @@ fn ios_init(db_path: String) -> std::result::Result<Arc<IosBridge>, String> {
             CoreConfig {
                 db_path: db_path.into(),
                 chat_topic: "introductions".into(),
+                relays: Vec::new(),
             },
             machine,
             being,

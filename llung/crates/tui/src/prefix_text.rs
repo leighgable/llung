@@ -15,6 +15,18 @@ pub struct PrefixText {
 }
 
 impl PrefixText {
+    /// Append text in place (streaming replies). Rebuilds the index —
+    /// fine at chat-message rates, not in a hot loop.
+    pub fn append(&mut self, more: &str) {
+        let mut text = std::mem::take(&mut self.text);
+        text.push_str(more);
+        *self = PrefixText::new(text);
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
     pub fn new(text: String) -> Self {
         let mut char_indices = Vec::with_capacity(text.len());
         let mut cumulative = vec![0u16];
@@ -69,6 +81,10 @@ impl PrefixText {
     /// Iterate over visual lines wrapped to `max_width` columns. Lines
     /// never contain `'\n'`; empty paragraphs yield empty lines, and a
     /// single trailing newline doesn't add one.
+    ///
+    /// Breaks are word-aware: a line breaks at the last space that fits
+    /// (the space is consumed); only words longer than `max_width` are
+    /// broken mid-word.
     pub fn wrap_lines(&self, max_width: u16) -> impl Iterator<Item = &str> + '_ {
         let mut start = 0usize;
         let char_count = self.char_indices.len();
@@ -83,10 +99,23 @@ impl PrefixText {
                 start += 1;
                 return Some("");
             }
-            let end = self.fit_chars(start, para_end, max_width);
+            let fitted = self.fit_chars(start, para_end, max_width);
+            let mut end = fitted;
+            let mut next = end;
+            if end < para_end {
+                // Backtrack to the last space inside the fitted range;
+                // the space itself is consumed by the break.
+                for k in (start..end).rev() {
+                    if self.slice(k, k + 1) == " " {
+                        end = k;
+                        next = k + 1;
+                        break;
+                    }
+                }
+            }
             let line = self.slice(start, end);
             // Step over the paragraph's '\n' once its last line is emitted.
-            start = if end == para_end && para_end < char_count { end + 1 } else { end };
+            start = if next == para_end && para_end < char_count { next + 1 } else { next };
             Some(line)
         })
     }
@@ -101,6 +130,28 @@ mod tests {
     }
 
     #[test]
+    fn append_grows_text_and_stays_wrappable() {
+        let mut t = PrefixText::new("Hel".into());
+        t.append("lo, w");
+        t.append("orld!");
+        assert_eq!(t.as_str(), "Hello, world!");
+        assert_eq!(lines(t.as_str(), 80), vec!["Hello, world!"]);
+        // Word-aware: break at the space, never mid-word.
+        assert_eq!(lines(t.as_str(), 8), vec!["Hello,", "world!"]);
+    }
+
+    #[test]
+    fn wraps_break_at_spaces_not_mid_word() {
+        assert_eq!(lines("the quick brown fox", 10), ["the quick", "brown fox"]);
+        // A word longer than the line still has to break mid-word.
+        assert_eq!(lines("supercalifragilistic", 5), ["super", "calif", "ragil", "istic"]);
+        // Leading space after a break is consumed, not wrapped.
+        assert_eq!(lines("ab cd", 3), ["ab", "cd"]);
+        // No spaces anywhere: same as before.
+        assert_eq!(lines("abcdefgh", 3), ["abc", "def", "gh"]);
+    }
+
+    #[test]
     fn wraps_at_width_exactly() {
         // Regression: fit_chars used to return one char too many.
         assert_eq!(lines("abcdefgh", 3), ["abc", "def", "gh"]);
@@ -111,7 +162,9 @@ mod tests {
     #[test]
     fn newlines_are_hard_breaks() {
         assert_eq!(lines("ab\ncd", 10), ["ab", "cd"]);
+        // Word-aware within a hard-broken paragraph.
         assert_eq!(lines("abcd\nef", 2), ["ab", "cd", "ef"]);
+        assert_eq!(lines("ab cd\nef gh", 4), ["ab", "cd", "ef", "gh"]);
         assert_eq!(lines("a\n\nb", 10), ["a", "", "b"]);
         assert_eq!(lines("a\n", 10), ["a"]);
         assert_eq!(lines("\na", 10), ["", "a"]);

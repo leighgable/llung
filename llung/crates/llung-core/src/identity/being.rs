@@ -144,6 +144,12 @@ pub struct PresenceMessage {
     /// X25519 public key for encrypted direct messages (invites, etc.).
     /// Learned from presence since gossipsub messages only carry a PeerId.
     pub enc_public_key: Option<[u8; 32]>,
+    /// Where this device is reachable — direct listeners plus
+    /// relay-circuit addresses. Devices of ONE account use these to dial
+    /// each other (through the relay) and exchange history. Empty for
+    /// peers on old versions.
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
 }
 
 impl PresenceMessage {
@@ -160,6 +166,7 @@ impl PresenceMessage {
             status: being.status.clone(),
             avatar_cid: being.avatar_cid.clone(),
             enc_public_key,
+            listen_addrs: Vec::new(),
         }
     }
 }

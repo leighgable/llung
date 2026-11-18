@@ -15,3 +15,11 @@ libp2p = { workspace = true }
 bincode = "1.3.3"
 tracing = "0.1.44"
 rand = "0.10.3"
+shellexpand = "3"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+ignore = "0.4"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+similar = "2"
+libc = "0.2"

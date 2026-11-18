@@ -33,6 +33,7 @@ pub struct Env {
     pub term_program: Option<String>,
     pub kitty_window_id: Option<String>,
     pub tmux: Option<String>,
+    pub zellij: Option<String>,
 }
 
 impl Env {
@@ -44,6 +45,7 @@ impl Env {
             term_program: var("TERM_PROGRAM"),
             kitty_window_id: var("KITTY_WINDOW_ID"),
             tmux: var("TMUX"),
+            zellij: var("ZELLIJ").or_else(|| var("ZELLIJ_SESSION_NAME")),
         }
     }
 }
@@ -69,6 +71,13 @@ pub fn decide(env: &Env, kitty_ok: bool) -> (Graphics, String) {
     // not supported (yet).
     if env.tmux.is_some() || term.starts_with("tmux") || term.starts_with("screen") {
         return (Graphics::HalfBlocks, "inside tmux/screen".into());
+    }
+    // Zellij proxies the kitty graphics query and TERM passes through,
+    // but its parser rejects U=1 ("unicode placeholders are not
+    // supported") — every image upload fails and the error responses
+    // leak into the input line as text.
+    if env.zellij.is_some() {
+        return (Graphics::HalfBlocks, "inside Zellij (no Unicode placeholder support)".into());
     }
     if !kitty_ok {
         return (Graphics::HalfBlocks, "terminal did not answer the Kitty graphics query".into());
@@ -120,6 +129,15 @@ mod tests {
     #[test]
     fn unknown_terminal_is_conservative() {
         assert_eq!(decide(&env("xterm-256color"), true).0, Graphics::HalfBlocks);
+    }
+
+    #[test]
+    fn zellij_falls_back() {
+        // Even with Ghostty's TERM and a positive query answer: Zellij
+        // rejects U=1, so images must fall back to text.
+        let e = Env { zellij: Some("0".into()), ..env("xterm-ghostty") };
+        assert_eq!(decide(&e, true).0, Graphics::HalfBlocks);
+        assert_eq!(decide(&env("xterm-ghostty"), true).0, Graphics::Kitty);
     }
 
     #[test]

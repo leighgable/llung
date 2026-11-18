@@ -152,6 +152,102 @@ mod tests {
         assert!(output.lines().count() <= 16);
     }
 
+    /// Same host path, for the artist component.
+    #[tokio::test]
+    async fn artist_component_executes() {
+        let wasm = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime-tools/artist.wasm");
+        if !wasm.exists() {
+            eprintln!("{} not built; skipping", wasm.display());
+            return;
+        }
+
+        let tx = spawn_wasm_worker();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(ToolRequest {
+            wasm_path: wasm,
+            arguments_json: r#"{"seed": 7, "style": "rings", "width": 40, "height": 16}"#.into(),
+            response_tx: resp_tx,
+        })
+        .await
+        .expect("worker channel open");
+
+        let output = resp_rx
+            .await
+            .expect("worker responded")
+            .expect("tool executed");
+
+        let doc: serde_json::Value = serde_json::from_str(&output).expect("valid render doc");
+        assert_eq!(doc["render"], "braille-v1");
+        assert!(doc["title"].as_str().unwrap().starts_with("artist:rings:"));
+        assert!(
+            output.chars().any(is_braille),
+            "expected braille art, got: {output}"
+        );
+    }
+
+    /// Same host path, for the diagram component.
+    #[tokio::test]
+    async fn diagram_component_executes() {
+        let wasm = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime-tools/diagram.wasm");
+        if !wasm.exists() {
+            eprintln!("{} not built; skipping", wasm.display());
+            return;
+        }
+
+        let tx = spawn_wasm_worker();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(ToolRequest {
+            wasm_path: wasm,
+            arguments_json: r#"{"graph": "A: Start\nB: End\nA -> B: go\n", "width": 40}"#.into(),
+            response_tx: resp_tx,
+        })
+        .await
+        .expect("worker channel open");
+
+        let output = resp_rx
+            .await
+            .expect("worker responded")
+            .expect("tool executed");
+
+        assert!(output.contains("Start"), "got: {output}");
+        assert!(output.contains("End"), "got: {output}");
+        assert!(output.contains('▼'), "arrow drawn: {output}");
+        assert!(output.lines().all(|l| l.chars().count() <= 40));
+    }
+
+    /// Same host path, for the plot_device component.
+    #[tokio::test]
+    async fn plot_device_component_executes() {
+        let wasm = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime-tools/plot_device.wasm");
+        if !wasm.exists() {
+            eprintln!("{} not built; skipping", wasm.display());
+            return;
+        }
+
+        let tx = spawn_wasm_worker();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(ToolRequest {
+            wasm_path: wasm,
+            arguments_json: r#"{"csv": "a,b\n1,2\n2,4\n3,9\n4,16\n", "kind": "scatter", "width": 40, "height": 16}"#.into(),
+            response_tx: resp_tx,
+        })
+        .await
+        .expect("worker channel open");
+
+        let output = resp_rx
+            .await
+            .expect("worker responded")
+            .expect("tool executed");
+
+        let doc: serde_json::Value = serde_json::from_str(&output).expect("valid render doc");
+        assert_eq!(doc["render"], "braille-v1");
+        assert!(doc["title"].as_str().unwrap().contains("scatter"));
+        assert!(output.chars().any(is_braille));
+    }
+
     #[tokio::test]
     async fn missing_component_is_a_clean_error() {
         let tx = spawn_wasm_worker();

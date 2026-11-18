@@ -30,12 +30,12 @@ const INPUT_SCHEMA: &str = r#"{
       "default": "cos(sqrt(x^2+y^2)*3)*0.4",
       "description": "f(x,y) expression. Variables: x, y. Operators: + - * / % ^. Functions: sin cos tan asin acos atan atan2 sqrt abs exp ln log2 log10 floor ceil round min max. Constants: pi tau e."
     },
-    "pitch": {"type": "number", "default": 40, "description": "Camera pitch in degrees (looking down)"},
-    "yaw": {"type": "number", "default": 35, "description": "Camera yaw in degrees"},
-    "distance": {"type": "number", "default": 3.5, "description": "Camera distance (must be > 0)"},
-    "grid": {"type": "integer", "default": 15, "description": "Mesh resolution, 4..=200"},
-    "width": {"type": "integer", "default": 120, "description": "Output width in characters, 8..=400 (width*height is capped at 10000 cells)"},
-    "height": {"type": "integer", "default": 60, "description": "Output height in characters, 4..=200 (width*height is capped at 10000 cells)"}
+    "pitch": {"type": "number", "default": 40, "description": "OPTIONAL camera pitch in degrees (looking down). Omit unless the user asks to adjust the view; values near 0 look edge-on and unreadable."},
+    "yaw": {"type": "number", "default": 35, "description": "OPTIONAL camera yaw in degrees. Omit unless asked."},
+    "distance": {"type": "number", "default": 3.5, "description": "OPTIONAL camera distance (must be > 0). Omit unless asked; values near 1 give extreme distortion."},
+    "grid": {"type": "integer", "default": 15, "description": "OPTIONAL mesh resolution: 4..=200 for heightfield mode; 4..=64 for implicit (z) mode, where it applies PER AXIS — keep it modest (25-40). Omit unless asked."},
+    "width": {"type": "integer", "default": 120, "description": "OPTIONAL output width in characters, 8..=400 (width*height is capped at 10000 cells). Omit unless asked."},
+    "height": {"type": "integer", "default": 60, "description": "OPTIONAL output height in characters, 4..=200 (width*height is capped at 10000 cells). Omit unless asked."}
   }
 }"#;
 
@@ -69,6 +69,103 @@ impl Guest for Landscape {
 
 #[cfg(target_arch = "wasm32")]
 export!(Landscape);
+
+/// Heightfield mode: sample `z = f(x, y)` over [-2, 2]^2 and emit
+/// wireframe edges between grid neighbours.
+fn heightfield_segments(expr: &Expr, camera: &Camera, n: usize) -> Vec<[braille::Point; 2]> {
+    let n = n.clamp(4, 200);
+    let mut mesh = vec![vec![(0.0f32, 0.0f32, 0.0f32); n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            let x = (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
+            let y = (j as f64 / (n - 1) as f64) * 4.0 - 2.0;
+            let z = expr.eval(x, y, 0.0);
+            // Keep poles/asymptotes from swallowing the view.
+            let z = if z.is_finite() { z.clamp(-10.0, 10.0) } else { 0.0 };
+            let (px, py) = camera.project(x as f32, y as f32, z as f32);
+            mesh[i][j] = (px, py, z as f32);
+        }
+    }
+    let mut segments = Vec::with_capacity(n * (n - 1) * 2);
+    for i in 0..n {
+        for j in 0..n {
+            if i + 1 < n {
+                segments.push([mesh[i][j], mesh[i + 1][j]]);
+            }
+            if j + 1 < n {
+                segments.push([mesh[i][j], mesh[i][j + 1]]);
+            }
+        }
+    }
+    segments
+}
+
+/// Implicit-surface mode: sample `f(x, y, z)` on an `n`³ grid over
+/// [-2, 2]³ and emit a point (as a zero-length segment) wherever the
+/// sign changes along a grid edge — linearly interpolated. The points
+/// keep their world `z` so viewers can color by height (a torus comes
+/// out with a nice vertical gradient).
+fn iso_points(expr: &Expr, camera: &Camera, n: usize) -> Vec<[braille::Point; 2]> {
+    let n = n.clamp(4, 64);
+    let coord = |i: usize| (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
+    let idx = |i: usize, j: usize, k: usize| (k * n + j) * n + i;
+
+    let mut v = vec![f64::NAN; n * n * n];
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                v[idx(i, j, k)] = expr.eval(coord(i), coord(j), coord(k));
+            }
+        }
+    }
+
+    /// Fraction along an edge where the linearized field crosses zero.
+    fn crossing(a: f64, b: f64) -> Option<f64> {
+        if !a.is_finite() || !b.is_finite() {
+            return None;
+        }
+        if a == 0.0 {
+            return Some(0.0);
+        }
+        if a.signum() != b.signum() {
+            Some(a / (a - b)).filter(|t| (0.0..=1.0).contains(t))
+        } else {
+            None
+        }
+    }
+
+    let mut pts: Vec<(f64, f64, f64)> = Vec::new();
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let f = v[idx(i, j, k)];
+                if i + 1 < n {
+                    if let Some(t) = crossing(f, v[idx(i + 1, j, k)]) {
+                        pts.push((coord(i) + t * (coord(i + 1) - coord(i)), coord(j), coord(k)));
+                    }
+                }
+                if j + 1 < n {
+                    if let Some(t) = crossing(f, v[idx(i, j + 1, k)]) {
+                        pts.push((coord(i), coord(j) + t * (coord(j + 1) - coord(j)), coord(k)));
+                    }
+                }
+                if k + 1 < n {
+                    if let Some(t) = crossing(f, v[idx(i, j, k + 1)]) {
+                        pts.push((coord(i), coord(j), coord(k) + t * (coord(k + 1) - coord(k))));
+                    }
+                }
+            }
+        }
+    }
+
+    pts.into_iter()
+        .map(|(x, y, z)| {
+            let (px, py) = camera.project(x as f32, y as f32, z as f32);
+            let p = (px, py, z as f32);
+            [p, p]
+        })
+        .collect()
+}
 
 /// Camera pose; the same yaw/pitch/perspective pipeline as the original
 /// textplots sketch in agent-rt/src/tools/landscape.rs.
@@ -153,7 +250,12 @@ fn parse_args(arguments_json: &str) -> Result<Args, String> {
     })
 }
 
-/// Render and return a `braille-v1` document:
+/// Render and return a `braille-v1` document. Two modes:
+/// - heightfield (`z = f(x, y)`, no `z` in the expression): a wireframe
+///   mesh over [-2, 2]²;
+/// - implicit surface (`f(x, y, z) = 0`, the expression uses `z`): the
+///   zero-crossings over [-2, 2]³ as points, colored by world z — e.g.
+///   a torus `(sqrt(x^2+y^2)-1.2)^2 + z^2 - 0.5^2`.
 ///
 /// ```json
 /// {"render": "braille-v1", "title": "f(x,y) expr", "width": 120,
@@ -166,40 +268,20 @@ fn parse_args(arguments_json: &str) -> Result<Args, String> {
 /// KEEP IN SYNC with the parser in crates/tui/src/tool_panel.rs.
 pub fn run(arguments_json: &str) -> Result<String, String> {
     let args = parse_args(arguments_json)?;
-    let n = args.grid;
 
-    // Sample the expression over [-2, 2]^2 and project each vertex.
-    let mut mesh = vec![vec![(0.0f32, 0.0f32, 0.0f32); n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            let x = (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
-            let y = (j as f64 / (n - 1) as f64) * 4.0 - 2.0;
-            let z = args.expr.eval(x, y);
-            // Keep poles/asymptotes from swallowing the view.
-            let z = if z.is_finite() { z.clamp(-10.0, 10.0) } else { 0.0 };
-            let (px, py) = args.camera.project(x as f32, y as f32, z as f32);
-            mesh[i][j] = (px, py, z as f32);
-        }
-    }
-
-    // Wireframe edges: horizontal and vertical neighbors.
-    let mut segments = Vec::with_capacity(n * (n - 1) * 2);
-    for i in 0..n {
-        for j in 0..n {
-            if i + 1 < n {
-                segments.push([mesh[i][j], mesh[i + 1][j]]);
-            }
-            if j + 1 < n {
-                segments.push([mesh[i][j], mesh[i][j + 1]]);
-            }
-        }
-    }
+    let segments = if args.expr.uses_z() {
+        // Implicit-surface mode: draw the zero-crossings of f(x,y,z)
+        // over [-2, 2]^3 as projected points (zero-length segments).
+        iso_points(&args.expr, &args.camera, args.grid)
+    } else {
+        heightfield_segments(&args.expr, &args.camera, args.grid)
+    };
 
     let raster = braille::rasterize(&segments, args.width, args.height);
-    let (z_min, z_max) = mesh
-        .iter()
-        .flatten()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| (lo.min(p.2), hi.max(p.2)));
+    let (z_min, z_max) = segments.iter().flatten().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(lo, hi), p| (lo.min(p.2), hi.max(p.2)),
+    );
     let doc = serde_json::json!({
         "render": "braille-v1",
         "title": args.expr_src,
@@ -249,6 +331,39 @@ mod tests {
         assert!(w * d["rows"].as_array().unwrap().len() <= MAX_CELLS);
         let envelope = serde_json::to_string(&serde_json::json!({ "content": out })).unwrap();
         assert!(envelope.len() < 48 * 1024, "{} bytes", envelope.len());
+    }
+
+    #[test]
+    fn implicit_torus_renders_points_colored_by_z() {
+        let d = doc(
+            r#"{"expr": "(sqrt(x^2+y^2)-1.2)^2 + z^2 - 0.5^2", "width": 60, "height": 30, "grid": 30}"#,
+        );
+        assert_eq!(d["render"], "braille-v1");
+        let rows = d["rows"].as_array().unwrap();
+        let drawn: usize = rows
+            .iter()
+            .flat_map(|r| r.as_str().unwrap().chars())
+            .filter(|c| *c != '\u{2800}')
+            .count();
+        assert!(drawn > 60, "a torus should give plenty of surface dots, got {drawn}");
+        // Levels color by world z: both low and high rings present.
+        let levels: String = d["levels"].as_array().unwrap().iter().flat_map(|l| l.as_str().unwrap().chars()).collect();
+        assert!(levels.contains('0') || levels.contains('1'), "low ring colored: {levels}");
+        assert!(levels.contains('8') || levels.contains('9'), "high ring colored: {levels}");
+        let z = d["z_range"].as_array().unwrap();
+        assert!(z[0].as_f64().unwrap() < z[1].as_f64().unwrap());
+    }
+
+    #[test]
+    fn heightfield_mode_unchanged_without_z() {
+        let d = doc(r#"{"expr": "cos(x)*sin(y)", "width": 40, "height": 16, "grid": 12}"#);
+        let rows = d["rows"].as_array().unwrap();
+        let drawn: usize = rows
+            .iter()
+            .flat_map(|r| r.as_str().unwrap().chars())
+            .filter(|c| *c != '\u{2800}')
+            .count();
+        assert!(drawn > 20, "egg-crate wireframe renders, got {drawn}");
     }
 
     #[test]
