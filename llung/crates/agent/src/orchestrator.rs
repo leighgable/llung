@@ -11,9 +11,10 @@ use libp2p::gossipsub::IdentTopic;
 use llung_core::{
     network::{
         NetworkCommand, NetworkEvent,
-        message::{ChatMessage, MessageKind},
+        message::{Attachment, AttachmentKind, ChatMessage, MessageKind},
     },
     storage::db::Database,
+    utils::generate_cid_from_bytes,
 };
 use rand::Rng;
 use tokio::sync::mpsc;
@@ -22,6 +23,23 @@ use tokio::sync::mpsc;
 /// Local-only: the complete reply still travels as one gossipsub
 /// message; remote peers see the block.
 pub enum AgentStream {
+    /// The model started working on reply `message_id`: no output yet.
+    /// Lets the UI show a spinner during the thinking phase instead of
+    /// silence before the first delta.
+    Working {
+        topic: String,
+        message_id: String,
+        being_id: String,
+        sender_name: String,
+    },
+    /// Append reasoning scratchpad text to the in-progress reply. The
+    /// UI counts it as activity (spinner, then an elided trace) — it is
+    /// never the answer itself.
+    Thought {
+        topic: String,
+        message_id: String,
+        delta: String,
+    },
     /// Append text to the in-progress reply `message_id`.
     Delta {
         topic: String,
@@ -45,7 +63,13 @@ pub struct AgentLoopContext {
     pub compressor: HistoryCompressor,
     pub db: Database,
     pub cmd_tx: mpsc::Sender<NetworkCommand>,
+    /// The ACTIVE topic: the one the current (or last) turn is on —
+    /// replies, streams, and the background compactor use it. Starts as
+    /// the spawn topic; switches per inbound message among `topics`.
     pub topic: String,
+    /// Every topic this agent answers on: the spawn topic plus any it
+    /// was invited to later (`AgentCommand::JoinTopic`).
+    pub topics: Vec<String>,
     pub self_being_id: String,
     pub self_name: String,
     // aukora kernel for agent instance
@@ -60,6 +84,11 @@ pub struct AgentLoopContext {
     /// Channel to the UI's permission prompt: the harness asks the
     /// operator before running prompt-required effect tiers.
     pub perm_tx: mpsc::Sender<PermissionRequest>,
+    /// The agent's workspace root, resolved ONCE at construction
+    /// (LLUNG_WORKSPACE or the process cwd). Tools like show_image and
+    /// the sandbox binders agree on it without re-reading the
+    /// environment — and tests don't need to mutate env vars.
+    pub workspace: std::path::PathBuf,
     /// Background compactor cache: (chain tip message id, flattened
     /// compressed view). When a turn's chain tip matches, the view is
     /// reused instead of rebuilding the summary tree synchronously.
@@ -74,6 +103,10 @@ pub enum AgentCommand {
     Revoke { effect: String },
     /// List this agent's standing grants.
     ListGrants { respond: tokio::sync::oneshot::Sender<Vec<String>> },
+    /// Answer on `topic` too (`/invite <agent> #topic`). The UI also
+    /// subscribes the agent's NETWORK to the topic; this tells the
+    /// agent LOOP to stop filtering it out.
+    JoinTopic { topic: String },
 }
 
 /// How often the background compactor recompresses the agent's home
@@ -84,6 +117,23 @@ const COMPACT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300
 /// Upper bound on `zoom` re-asks per turn — the model must not be able
 /// to ping-pong context expansions forever.
 const MAX_ZOOM_ROUNDS: u32 = 3;
+/// Argument-error feedback rounds for ordinary tool calls: the model
+/// gets this many chances to correct a rejected tool call's JSON
+/// before the failure is published as the turn's result.
+const MAX_TOOL_ROUNDS: u32 = 3;
+/// Backend attempts per ask. Thinking-model endpoints intermittently
+/// return empty or truncated replies (finish_reason=length, dropped
+/// streams); a retry is nearly always enough, and publishing a
+/// one-sentence non-answer as the turn's result (or an error panel for
+/// a transient blip) is worse than a few extra seconds.
+const MAX_ASK_ATTEMPTS: u32 = 3;
+/// Tool executions per turn: after each tool result the model is
+/// re-asked, so it can work iteratively (grep → read → edit → run in
+/// the REPL, correcting as it goes) before producing its final answer.
+const MAX_TOOL_STEPS: u32 = 8;
+/// Cap on a tool result fed back into the prompt (chars), so a chatty
+/// REPL or a huge grep can't blow the turn's context.
+const TOOL_FEEDBACK_CHARS: usize = 4_000;
 
 impl AgentLoopContext {
     /// Build a context for a freshly-provisioned local agent. Creates the
@@ -125,15 +175,21 @@ impl AgentLoopContext {
             }),
         );
         kernel.pinned_keys.insert(supervisor.public_pin());
+        let workspace = std::env::var("LLUNG_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| std::env::current_dir())
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
         Self {
             config,
             backend,
             compressor,
             db,
             cmd_tx,
+            topics: vec![topic.clone()],
             topic,
             self_being_id,
             self_name,
+            workspace,
             kernel,
             supervisor,
             wasm_tx: agent_rt::spawn_wasm_worker(),
@@ -149,6 +205,10 @@ pub async fn run_agent_loop(
     mut event_rx: mpsc::Receiver<NetworkEvent>,
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
 ) {
+    // Resolve the sandbox runtime now, in the background, so the first
+    // tool call doesn't pay for it (seconds on a cold Nix host).
+    tokio::task::spawn_blocking(crate::sandbox::warm_up);
+
     // Background compactor: recompress the home branch periodically so
     // turns find a warm cache instead of rebuilding the tree inline.
     let mut compaction = tokio::time::interval(COMPACT_INTERVAL);
@@ -201,6 +261,12 @@ async fn handle_agent_command(ctx: &mut AgentLoopContext, cmd: AgentCommand) {
                 .collect();
             let _ = respond.send(effects);
         }
+        AgentCommand::JoinTopic { topic } => {
+            if !ctx.topics.contains(&topic) {
+                tracing::info!(agent = %ctx.self_name, %topic, "joined topic");
+                ctx.topics.push(topic);
+            }
+        }
     }
 }
 
@@ -215,7 +281,7 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
         return;
     };
 
-    if topic != ctx.topic || sender.to_base58() == ctx.self_being_id {
+    if !ctx.topics.contains(&topic) || sender.to_base58() == ctx.self_being_id {
         return;
     }
 
@@ -223,7 +289,7 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
         text,
         kind,
         structured,
-    } = decode_incoming(&data, &ctx.topic)
+    } = decode_incoming(&data, &topic)
     else {
         return;
     };
@@ -237,8 +303,10 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
         }
     }
 
-    // Only conversational content earns a turn; tool traffic, notes,
-    // system announcements, and media captions stay silent.
+    // Conversational content earns a turn — media included, so an
+    // addressed image (@agent what is this plot?) reaches a multimodal
+    // backend. Tool traffic, notes, and system announcements stay
+    // silent; the @mention gate below keeps media from chattering.
     if !kind_responds(&kind) {
         return;
     }
@@ -249,8 +317,14 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
         return;
     }
 
+    // Turns run one at a time per agent, so the active topic can simply
+    // follow the turn: replies, streams and tool traffic land on the
+    // topic the trigger came from (and the compactor follows along).
+    ctx.topic = topic;
+
     let trigger_id = id_of(&structured);
-    if let Err(e) = generate_reply(&mut *ctx, &text, trigger_id.as_deref()).await {
+    let trigger = structured.clone();
+    if let Err(e) = generate_reply(&mut *ctx, &text, trigger_id.as_deref(), trigger.as_ref()).await {
         tracing::error!("Agent turn failed: {e}");
         // Never go silent: a broken model backend (connection
         // refused, timeout, ...) must show up in the chat as an
@@ -271,7 +345,8 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
 }
 
 /// Periodic self-compaction (OptChat's background compactor): compress
-/// the agent's home branch and warm the view cache. Errors never
+/// the active topic's branch (the one the agent last spoke on) and warm
+/// the view cache. Errors never
 /// propagate — a failed compaction just means the next turn compresses
 /// synchronously, as before.
 async fn background_compact(ctx: &mut AgentLoopContext) {
@@ -300,7 +375,14 @@ async fn compress_chain(
             return view.clone();
         }
     }
+    let spinner = CompressorSpinner::new(ctx);
+    if let Some(spinner) = &spinner {
+        spinner.show().await;
+    }
     let tree = ctx.compressor.compress(messages).await;
+    if let Some(spinner) = spinner {
+        spinner.done().await;
+    }
     // The OptChat view: the coarsest cut of the tree that fits the byte
     // budget, newest-first. (The old code compared the ROOT summary's
     // size against the budget — roots are always ≤ NODE bytes, so the
@@ -310,6 +392,64 @@ async fn compress_chain(
         .flatten_budgeted(&tree, ctx.compressor.context_budget);
     ctx.view_cache = Some((tip_id.to_string(), view.clone()));
     view
+}
+
+/// A transient `working` line attributed to the history compressor
+/// (e.g. "HistoryCompressor (SmolVLM) is working…"), shown while it
+/// builds the summary tree. Compression can call a model for minutes on
+/// a slow local backend; without its own line that time would show up
+/// as the AGENT working. Only model-backed compressors get one — the
+/// rule-based fallback is instant. Holds owned clones (no `&ctx`
+/// across awaits: the turn future must stay Send).
+struct CompressorSpinner {
+    stream_tx: mpsc::Sender<AgentStream>,
+    topic: String,
+    message_id: String,
+    sender_name: String,
+}
+
+impl CompressorSpinner {
+    /// Sync on purpose: clone what the line needs out of `ctx` before
+    /// any await, then [`Self::show`] it.
+    fn new(ctx: &AgentLoopContext) -> Option<Self> {
+        if !ctx.compressor.is_model_backed() {
+            return None;
+        }
+        Some(Self {
+            stream_tx: ctx.stream_tx.clone(),
+            topic: ctx.topic.clone(),
+            message_id: format!("{}-compress-{:016x}", ctx.self_being_id, {
+                let mut rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
+                rng.next_u64()
+            }),
+            sender_name: ctx.compressor.display_name(),
+        })
+    }
+
+    /// Put the spinner line on screen.
+    async fn show(&self) {
+        let _ = self
+            .stream_tx
+            .send(AgentStream::Working {
+                topic: self.topic.clone(),
+                message_id: self.message_id.clone(),
+                // Not the agent's being: no avatar, not the agent's line.
+                being_id: String::new(),
+                sender_name: self.sender_name.clone(),
+            })
+            .await;
+    }
+
+    /// Compression finished: remove the line.
+    async fn done(self) {
+        let _ = self
+            .stream_tx
+            .send(AgentStream::Retract {
+                topic: self.topic,
+                message_id: self.message_id,
+            })
+            .await;
+    }
 }
 
 /// One inbound gossip payload, decoded.
@@ -352,9 +492,14 @@ fn decode_incoming(data: &[u8], topic: &str) -> Incoming {
     }
 }
 
-/// Which message kinds the agent will respond to.
+/// Which message kinds the agent will respond to. Media qualifies:
+/// with the @mention gate, an addressed image is exactly the
+/// multimodal-input case (see `ChatMessage::attachment`).
 fn kind_responds(kind: &MessageKind) -> bool {
-    matches!(kind, MessageKind::Human | MessageKind::Agent)
+    matches!(
+        kind,
+        MessageKind::Human | MessageKind::Agent | MessageKind::Media(_)
+    )
 }
 
 /// Small models shouldn't answer every message in the topic — only
@@ -414,6 +559,24 @@ async fn execute_secured_tool(
         }
     }
 
+    // Tier::Host effects (show_image) execute HERE, not in the wasm
+    // worker or the pure host dispatcher: publishing needs the agent's
+    // own context (network stack, media cache). The receipt still
+    // commits to the produced output through the same kernel gate.
+    if effect.tier == crate::effects::Tier::Host {
+        let output = match effect.name {
+            "show_image" => show_image(ctx, &arguments).await?,
+            other => {
+                return Err(format!("host:{other} has no orchestrator executor").into());
+            }
+        };
+        let grant = create_self_grant(&manifest, &ctx.supervisor);
+        crate::aukora::security::commit_host_effect(&mut ctx.kernel, manifest, grant, &output)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        crate::aukora::persist::save_kernel_state(&ctx.db, &ctx.self_being_id, &ctx.kernel)?;
+        return Ok(output);
+    }
+
     // Self-grant, signed by the supervisor key pinned in the kernel.
     let grant = create_self_grant(&manifest, &ctx.supervisor);
 
@@ -434,6 +597,16 @@ async fn execute_secured_tool(
     // publishes it); the receipt's output commitment stays in the kernel
     // for audit.
     Ok(output)
+}
+
+/// Cap a tool result that is fed back into the prompt.
+fn truncate_for_feedback(output: &str) -> String {
+    let total = output.chars().count();
+    if total <= TOOL_FEEDBACK_CHARS {
+        return output.to_string();
+    }
+    let kept: String = output.chars().take(TOOL_FEEDBACK_CHARS).collect();
+    format!("{kept}\n… [{} chars truncated]", total - TOOL_FEEDBACK_CHARS)
 }
 
 /// One-line description of a tool output for `ToolResponse.result_summary`.
@@ -462,6 +635,108 @@ async fn publish_agent_text_on(
     publish(ctx, MessageKind::Agent, parent_id, text, id)
         .await
         .map(|_| ())
+}
+
+/// Publish a media message (image attachment + caption) on behalf of
+/// the agent — the chat side of the `show_image` tool. Attachments
+/// travel as `MessageKind::Media`; the TUI renders them like user
+/// attachments and relay fetch works for peers either way.
+async fn publish_agent_media_on(
+    ctx: &mut AgentLoopContext,
+    parent_id: Option<String>,
+    attachment: Attachment,
+    caption: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    publish(ctx, MessageKind::Media(attachment), parent_id, caption, None)
+        .await
+        .map(|_| ())
+}
+
+#[derive(serde::Deserialize)]
+struct ShowImageArgs {
+    path: String,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// Resolve a tool-supplied path against the workspace, refusing
+/// escapes: `..` segments and absolute paths outside the workspace
+/// both canonicalize past the workspace root and are rejected.
+fn resolve_in_workspace(workspace: &std::path::Path, arg: &str) -> Result<std::path::PathBuf, String> {
+    let joined = if std::path::Path::new(arg).is_absolute() {
+        std::path::PathBuf::from(arg)
+    } else {
+        workspace.join(arg)
+    };
+    let canon = joined
+        .canonicalize()
+        .map_err(|e| format!("'{arg}' does not resolve: {e}"))?;
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    if !canon.starts_with(&root) {
+        return Err(format!("'{arg}' escapes the workspace"));
+    }
+    Ok(canon)
+}
+
+/// `show_image` (plan Phase 2): publish a workspace image — a
+/// matplotlib PNG the torch REPL saved — to the chat as a media
+/// message from the agent's own being. Runs in the orchestrator
+/// (needs `AgentLoopContext`); returns the confirmation string the
+/// aukora receipt commits to. Mirrors the user-side `send_attachment`
+/// in tui/app.rs: media cache -> relay publish -> media message.
+async fn show_image(
+    ctx: &mut AgentLoopContext,
+    arguments: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let args: ShowImageArgs = serde_json::from_slice(arguments)
+        .map_err(|e| format!("show_image: arguments must be JSON with 'path': {e}"))?;
+    let path = resolve_in_workspace(&ctx.workspace, &args.path)
+        .map_err(|e| format!("show_image: {e}"))?;
+    let meta = std::fs::metadata(&path)
+        .map_err(|e| format!("show_image: cannot stat '{}': {e}", args.path))?;
+    if !meta.is_file() {
+        return Err(format!("show_image: '{}' is not a file", args.path).into());
+    }
+    if meta.len() as usize > llung_core::media::image::MAX_IMAGE_BYTES {
+        return Err(format!(
+            "show_image: '{}' is {} bytes; the cap is {} — save a smaller figure",
+            args.path,
+            meta.len(),
+            llung_core::media::image::MAX_IMAGE_BYTES
+        )
+        .into());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("show_image: cannot read '{}': {e}", args.path))?;
+    let cid = generate_cid_from_bytes(&bytes)
+        .map_err(|e| format!("show_image: content id failed: {e}"))?;
+    ctx.db.save_avatar_cache(&cid, &bytes)?;
+    // from_path opens the image for width/height — non-image files are
+    // rejected here.
+    let attachment = Attachment::from_path(path.to_str().unwrap_or("unknown"), cid.clone())
+        .map_err(|e| format!("show_image: '{}' is not a usable image: {e}", args.path))?;
+    if attachment.kind != AttachmentKind::Image {
+        return Err(format!("show_image: '{}' is not an image", args.path).into());
+    }
+    ctx.cmd_tx
+        .send(NetworkCommand::ProvideMediaCid { cid: cid.clone() })
+        .await?;
+    // Images ≤ MAX_IMAGE_BYTES also go into the relay caches, so peers
+    // behind NATs and the operator's other devices can fetch them.
+    ctx.cmd_tx
+        .send(NetworkCommand::PublishImage {
+            cid: cid.clone(),
+            mime_type: attachment.mime_type.clone(),
+            data: bytes.clone(),
+        })
+        .await?;
+    let filename = attachment.filename.clone();
+    let size_kb = attachment.size_bytes / 1024;
+    let caption = args.caption.unwrap_or_default();
+    publish_agent_media_on(ctx, None, attachment, caption).await?;
+    Ok(format!("published image {filename} ({size_kb} KB) as cid {cid}"))
 }
 
 /// Publish a message of any `kind` (optionally replying to `parent_id`)
@@ -508,8 +783,13 @@ fn id_of(structured: &Option<ChatMessage>) -> Option<String> {
 /// protocol goes in the *last* turn, not the system message: small
 /// models weight recent context far more, and some VLM chat templates
 /// mangle or drop system prompts entirely.
-fn turn_prompt(ctx: &AgentLoopContext, context: &str, trigger_text: &str) -> Vec<ChatMessage> {
-    turn_prompt_inner(ctx, context, trigger_text, None)
+fn turn_prompt(
+    ctx: &AgentLoopContext,
+    context: &str,
+    trigger_text: &str,
+    trigger_attachment: Option<&llung_core::network::message::Attachment>,
+) -> Vec<ChatMessage> {
+    turn_prompt_inner(ctx, context, trigger_text, None, trigger_attachment)
 }
 
 /// Like [`turn_prompt`], with tool-error feedback appended as the last
@@ -519,8 +799,9 @@ fn turn_prompt_feedback(
     context: &str,
     trigger_text: &str,
     feedback: &str,
+    trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
-    turn_prompt_inner(ctx, context, trigger_text, Some(feedback))
+    turn_prompt_inner(ctx, context, trigger_text, Some(feedback), trigger_attachment)
 }
 
 fn turn_prompt_inner(
@@ -528,7 +809,19 @@ fn turn_prompt_inner(
     context: &str,
     trigger_text: &str,
     feedback: Option<&str>,
+    trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
+    // The triggering message carries the tool protocol AND the
+    // optional image: a multimodal backend (SenseNova + mmproj) sees
+    // the attachment here; a text-only one just reads the caption.
+    let mut trigger_msg = ChatMessage::user(format!(
+        "New message: {}\n\n{}",
+        trigger_text,
+        crate::tools::tool_instructions(),
+    ));
+    if let Some(att) = trigger_attachment {
+        trigger_msg = trigger_msg.with_attachment(att.clone());
+    }
     let mut v = vec![
         ChatMessage::system(format!(
             "You are {}, a helpful agent in a peer-to-peer chat. \
@@ -538,11 +831,7 @@ fn turn_prompt_inner(
             ctx.self_name
         )),
         ChatMessage::user(context.to_string()),
-        ChatMessage::user(format!(
-            "New message: {}\n\n{}",
-            trigger_text,
-            crate::tools::tool_instructions(),
-        )),
+        trigger_msg,
     ];
     if let Some(f) = feedback {
         v.push(ChatMessage::user(f.to_string()));
@@ -563,22 +852,53 @@ async fn ask_streamed(
     prompt: &[ChatMessage],
     reply_id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let (delta_tx, mut delta_rx) = mpsc::channel::<String>(256);
-    let forward_deltas = async {
-        while let Some(delta) = delta_rx.recv().await {
-            let _ = stream_tx
-                .send(AgentStream::Delta {
-                    topic: topic.to_string(),
-                    message_id: reply_id.to_string(),
-                    being_id: being_id.to_string(),
-                    sender_name: sender_name.to_string(),
-                    delta,
-                })
-                .await;
+    let mut attempt = 0u32;
+    loop {
+        // Activity signal BEFORE the first token: the UI shows a spinner
+        // instead of looking idle while the model thinks (re-sent on
+        // every attempt and re-ask — it also resets the preview line).
+        let _ = stream_tx
+            .send(AgentStream::Working {
+                topic: topic.to_string(),
+                message_id: reply_id.to_string(),
+                being_id: being_id.to_string(),
+                sender_name: sender_name.to_string(),
+            })
+            .await;
+        let (delta_tx, mut delta_rx) = mpsc::channel::<crate::interface::StreamChunk>(256);
+        let forward_deltas = async {
+            while let Some(chunk) = delta_rx.recv().await {
+                let ev = match chunk {
+                    crate::interface::StreamChunk::Text(delta) => AgentStream::Delta {
+                        topic: topic.to_string(),
+                        message_id: reply_id.to_string(),
+                        being_id: being_id.to_string(),
+                        sender_name: sender_name.to_string(),
+                        delta,
+                    },
+                    crate::interface::StreamChunk::Thought(delta) => AgentStream::Thought {
+                        topic: topic.to_string(),
+                        message_id: reply_id.to_string(),
+                        delta,
+                    },
+                };
+                let _ = stream_tx.send(ev).await;
+            }
+        };
+        let (reply, ()) = tokio::join!(backend.chat_stream(prompt, delta_tx), forward_deltas);
+        match reply {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_ASK_ATTEMPTS {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "backend ask failed ({e}); retrying ({attempt}/{MAX_ASK_ATTEMPTS})"
+                );
+            }
         }
-    };
-    let (reply, ()) = tokio::join!(backend.chat_stream(prompt, delta_tx), forward_deltas);
-    reply
+    }
 }
 
 /// Zoom tool arguments: the `[start, end)` history range to expand.
@@ -598,6 +918,11 @@ async fn generate_reply(
     ctx: &mut AgentLoopContext,
     trigger_text: &str,
     trigger_id: Option<&str>,
+    // `trigger`: the structured trigger message, when the peer speaks
+    // the ChatMessage protocol. Its image attachment (if any) rides the
+    // final prompt message into the backend — that is the
+    // multimodal-input path.
+    trigger: Option<&ChatMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // load_dag boxes a non-Send error; re-box it so the future stays Send.
     let dag = ctx
@@ -606,6 +931,17 @@ async fn generate_reply(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             e.to_string().into()
         })?;
+    // The reply streams to the local UI under a precomputed id while the
+    // backend request runs; the final publish (below) reuses the id.
+    // No agent `Working` signal yet: history compression runs first and
+    // shows its OWN spinner line (`CompressorSpinner`) — that time is
+    // the compressor model working, not the agent. `ask_streamed`
+    // raises the agent's spinner right before the agent's model call.
+    let reply_id = format!("{}-stream-{:016x}", ctx.self_being_id, {
+        let mut rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
+        rng.next_u64()
+    });
+
     // The agent sees the context chain of the message it was addressed
     // on: its branch, with parallel agent replies and tool traffic
     // folded in — but explicit `/branch` forks left out. Agents @'d on
@@ -624,14 +960,8 @@ async fn generate_reply(
     let tip_id = messages.last().map(|m| m.id.clone()).unwrap_or_default();
     let mut context = compress_chain(ctx, &tip_id, &messages).await;
 
-    let mut prompt = turn_prompt(ctx, &context, trigger_text);
-
-    // The reply streams to the local UI under a precomputed id while the
-    // backend request runs; the final publish (below) reuses the id.
-    let reply_id = format!("{}-stream-{:016x}", ctx.self_being_id, {
-        let mut rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
-        rng.next_u64()
-    });
+    let trigger_attachment = trigger.and_then(|m| m.image_attachment().cloned());
+    let mut prompt = turn_prompt(ctx, &context, trigger_text, trigger_attachment.as_ref());
     // Field references, not `&ctx`: keeps the awaited futures Send
     // (AgentLoopContext holds a `Database`, which is not Sync).
     let mut reply = ask_streamed(
@@ -697,7 +1027,13 @@ async fn generate_reply(
                          indices shown on the history lines. Reply with exactly \
                          one corrected TOOL line, or just answer normally."
                     );
-                    prompt = turn_prompt_feedback(ctx, &context, trigger_text, &feedback);
+                    prompt = turn_prompt_feedback(
+                        ctx,
+                        &context,
+                        trigger_text,
+                        &feedback,
+                        trigger_attachment.as_ref(),
+                    );
                     reply = ask_streamed(
                         &*ctx.backend,
                         &ctx.stream_tx,
@@ -730,13 +1066,20 @@ async fn generate_reply(
         // Rebuild the tree for this turn and expand the range. The
         // zoomed view may exceed the byte budget — an explicit expansion
         // the model asked for, so it stands.
+        let spinner = CompressorSpinner::new(ctx);
+        if let Some(spinner) = &spinner {
+            spinner.show().await;
+        }
         let mut tree = ctx.compressor.compress(&messages).await;
+        if let Some(spinner) = spinner {
+            spinner.done().await;
+        }
         zoom_range(&mut tree, &messages, start, end);
         // Same budgeted cut; the zoomed range stands even past budget.
         context = ctx
             .compressor
             .flatten_budgeted(&tree, ctx.compressor.context_budget);
-        prompt = turn_prompt(ctx, &context, trigger_text);
+        prompt = turn_prompt(ctx, &context, trigger_text, trigger_attachment.as_ref());
         reply = ask_streamed(
             &*ctx.backend,
             &ctx.stream_tx,
@@ -749,8 +1092,14 @@ async fn generate_reply(
         .await?;
     }
 
-    // The model may have asked for a tool instead of plain prose.
-    if let Some(call) = crate::tools::parse_tool_call(&reply) {
+    // The model may work iteratively with tools: each tool result is
+    // fed back and it may call the next tool (REPL until it works,
+    // grep → edit → bash, ...) or answer. Bad arguments are fed back
+    // too, so the model can correct its JSON — same contract as the
+    // zoom loop: bounded rounds, every call/response pair published.
+    let mut steps = 0u32;
+    let mut step_log: Vec<String> = Vec::new();
+    'tool: while let Some(call) = crate::tools::parse_tool_call(&reply) {
         // The streamed preview was raw tool-call text: withdraw it.
         let _ = ctx
             .stream_tx
@@ -760,14 +1109,93 @@ async fn generate_reply(
             })
             .await;
         tracing::info!(agent = %ctx.self_name, tool = %call.name, "model requested tool");
+        let mut call = call;
+        let mut attempts = 0u32;
+        // Host-side data files: wasm has no I/O, so a `path` argument
+        // is read HERE and injected as `csv` before the sandboxed call.
+        let (content, error) = loop {
+            // Confined: the host reads this file outside any sandbox,
+            // so the agent may only name workspace / LLUNG_RO_BINDS paths.
+            let workspace = ctx.workspace.clone();
+            let resolved = crate::tools::resolve_data_file(call.clone(), Some(&workspace)).await;
+            let result: Result<String, (String, String)> = match resolved {
+                Ok(resolved) => {
+                    match execute_secured_tool(
+                        &mut *ctx,
+                        resolved.name.clone(),
+                        resolved.arguments.into_bytes(),
+                    )
+                    .await
+                    {
+                        Ok(output) => Ok(output),
+                        Err(e) => Err((resolved.name.clone(), e.to_string())),
+                    }
+                }
+                Err(e) => Err((call.name.clone(), format!("data file resolution failed: {e}"))),
+            };
+            match result {
+                Ok(output) => break (output, false),
+                Err((name, e)) => {
+                    attempts += 1;
+                    if attempts > MAX_TOOL_ROUNDS {
+                        // Never go silent: rounds exhausted, the error
+                        // panel shows it where it happened.
+                        tracing::error!(tool = %name, "tool failed: {e}");
+                        break (format!("tool '{name}' failed: {e}"), true);
+                    }
+                    tracing::warn!(tool = %name, "tool failed, feeding error back: {e}");
+                    let feedback = format!(
+                        "Your last reply was a tool call to '{name}', but it \
+                         failed: {e}. Correct the arguments and reply with \
+                         exactly one corrected TOOL line, or just answer \
+                         normally."
+                    );
+                    prompt = turn_prompt_feedback(
+                        ctx,
+                        &context,
+                        trigger_text,
+                        &feedback,
+                        trigger_attachment.as_ref(),
+                    );
+                    reply = ask_streamed(
+                        &*ctx.backend,
+                        &ctx.stream_tx,
+                        &ctx.topic,
+                        &ctx.self_being_id,
+                        &ctx.self_name,
+                        &prompt,
+                        &reply_id,
+                    )
+                    .await?;
+                    match crate::tools::parse_tool_call(&reply) {
+                        // Corrected call: hide the preview and run it.
+                        Some(c) => {
+                            let _ = ctx
+                                .stream_tx
+                                .send(AgentStream::Retract {
+                                    topic: ctx.topic.clone(),
+                                    message_id: reply_id.clone(),
+                                })
+                                .await;
+                            call = c;
+                        }
+                        // The model moved on (prose or no tool): let the
+                        // outer loop re-judge the new reply.
+                        None => continue 'tool,
+                    }
+                }
+            }
+        };
         // Announce the call first: viewers show a pending tool panel, then
         // swap in the response (whose parent_id points back here). The
         // call itself hangs off the triggering message, so the tool
         // panel lands on the same branch.
+        let tool_name = call.name.clone();
+        let summary = summarize_output(&content);
         let call_id = publish(
             ctx,
             MessageKind::ToolCall {
-                tool_name: call.name.clone(),
+                tool_name: tool_name.clone(),
                 arguments: call.arguments.clone(),
             },
             trigger_id.map(str::to_string),
@@ -775,40 +1203,68 @@ async fn generate_reply(
             None,
         )
         .await?;
-        // Host-side data files: wasm has no I/O, so a `path` argument
-        // is read HERE and injected as `csv` before the sandboxed call.
-        let resolved = crate::tools::resolve_data_file(call.clone()).await;
-        let (content, error) = match resolved {
-            Ok(call) => {
-                match execute_secured_tool(
-                    &mut *ctx,
-                    call.name.clone(),
-                    call.arguments.into_bytes(),
-                )
-                .await
-                {
-                    Ok(output) => (output, false),
-                    // Never go silent: if the tool fails (missing wasm,
-                    // bad args), the error panel shows it where it happened.
-                    Err(e) => {
-                        tracing::error!(tool = %call.name, "tool failed: {e}");
-                        (format!("tool '{}' failed: {e}", call.name), true)
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("data file resolution failed: {e}");
-                (format!("plot_device failed: {e}"), true)
-            }
-        };
         let response = MessageKind::ToolResponse {
-            tool_name: call.name,
-            result_summary: summarize_output(&content),
+            tool_name: tool_name.clone(),
+            result_summary: summary.clone(),
             error,
         };
-        return publish(ctx, response, Some(call_id), content, None)
-            .await
-            .map(|_| ());
+        publish(ctx, response, Some(call_id), content.clone(), None).await?;
+        step_log.push(format!(
+            "{tool_name}: {summary}{}",
+            if error { " (FAILED)" } else { "" }
+        ));
+        steps += 1;
+        if steps >= MAX_TOOL_STEPS {
+            // The results are all published; hand the turn back with
+            // a pointer instead of looping forever.
+            return publish_agent_text_on(
+                ctx,
+                trigger_id.map(str::to_string),
+                format!(
+                    "⚠ I hit my per-turn tool budget ({MAX_TOOL_STEPS} calls). \
+                     The results above are in the chat — ask me to continue \
+                     and I'll pick up from them."
+                ),
+                None,
+            )
+            .await;
+        }
+        // Feed the result back as the most-recent (most-weighted)
+        // turn: the model continues with the next tool call or the
+        // final answer. The loop re-judges the reply at 'tool.
+        let mut feedback = String::new();
+        if step_log.len() > 1 {
+            feedback.push_str("Tool calls so far this turn:\n");
+            for line in &step_log[..step_log.len() - 1] {
+                feedback.push_str("- ");
+                feedback.push_str(line);
+                feedback.push('\n');
+            }
+        }
+        feedback.push_str(&format!(
+            "Tool '{tool_name}' {}returned:\n```\n{}\n```\n\
+             Continue working toward the request: reply with exactly one \
+             TOOL line to run another tool, or answer normally.",
+            if error { "FAILED and " } else { "" },
+            truncate_for_feedback(&content),
+        ));
+        prompt = turn_prompt_feedback(
+            ctx,
+            &context,
+            trigger_text,
+            &feedback,
+            trigger_attachment.as_ref(),
+        );
+        reply = ask_streamed(
+            &*ctx.backend,
+            &ctx.stream_tx,
+            &ctx.topic,
+            &ctx.self_being_id,
+            &ctx.self_name,
+            &prompt,
+            &reply_id,
+        )
+        .await?;
     }
 
     // Prompt-parroting (common with tiny models): publishing the echo
@@ -1047,6 +1503,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_answers_only_on_joined_topics() {
+        // Spawned on "t"; `/invite` to another topic sends JoinTopic.
+        // Before it, that topic's traffic is ignored; after it, a turn
+        // there runs ON that topic (replies/streams follow the trigger).
+        let mut ctx = ctx_with(crate::history::HistoryCompressor::new(
+            Box::new(crate::history::HeadlineSummarizer::new()),
+            128_000,
+        ));
+        let name = ctx.config.name.clone();
+        let event = |topic: &str| {
+            let msg = ChatMessage {
+                id: format!("m-{topic}"),
+                topic: topic.into(),
+                sender_id: "p".into(),
+                sender_name: "alice".into(),
+                parent_id: None,
+                kind: MessageKind::Human,
+                content: format!("@{name} hi"),
+                attachment: None,
+                timestamp: 0,
+            };
+            NetworkEvent::MessageReceived {
+                topic: topic.into(),
+                sender: libp2p::PeerId::random(),
+                data: serde_json::to_vec(&msg).unwrap(),
+            }
+        };
+
+        assert_eq!(ctx.topics, vec!["t".to_string()]);
+        handle_event(&mut ctx, event("other")).await;
+        assert_eq!(ctx.topic, "t", "not invited yet: ignored");
+
+        handle_agent_command(&mut ctx, AgentCommand::JoinTopic { topic: "other".into() }).await;
+        handle_agent_command(&mut ctx, AgentCommand::JoinTopic { topic: "other".into() }).await;
+        assert_eq!(ctx.topics, vec!["t".to_string(), "other".to_string()], "idempotent");
+
+        // The turn itself fails (no model server on port 1) — what
+        // matters is that it ran, on the joined topic.
+        handle_event(&mut ctx, event("other")).await;
+        assert_eq!(ctx.topic, "other");
+    }
+
+    #[tokio::test]
     async fn context_without_compressor_model_adopts_its_own() {
         // A rule-based compressor gets upgraded to the agent's backend.
         let ctx = ctx_with(crate::history::HistoryCompressor::new(
@@ -1080,6 +1579,7 @@ mod tests {
             parent_id: None,
             kind: llung_core::network::message::MessageKind::Human,
             content: long.clone(),
+            attachment: None,
             timestamp: 0,
         }];
         let tip = msgs[0].id.clone();
@@ -1159,7 +1659,8 @@ mod tests {
                 csv.display()
             ),
         };
-        let resolved = crate::tools::resolve_data_file(call).await.unwrap();
+        // `None`: unconfined (the local user's /plot path).
+        let resolved = crate::tools::resolve_data_file(call, None).await.unwrap();
         // The path stays (panels show it); the csv content is injected.
         assert!(resolved.arguments.contains("\"path\""));
         assert!(resolved.arguments.contains("a,b\\n1,2"), "{}", resolved.arguments);
@@ -1169,22 +1670,50 @@ mod tests {
             name: "landscape".into(),
             arguments: format!("{{\"path\":\"{}\"}}", csv.display()),
         };
-        assert_eq!(crate::tools::resolve_data_file(other).await.unwrap().arguments, format!("{{\"path\":\"{}\"}}", csv.display()));
+        assert_eq!(crate::tools::resolve_data_file(other, None).await.unwrap().arguments, format!("{{\"path\":\"{}\"}}", csv.display()));
         let has_csv = crate::tools::ToolCall {
             name: "plot_device".into(),
             arguments: "{\"csv\":\"x\",\"path\":\"/nope\"}".into(),
         };
-        assert!(crate::tools::resolve_data_file(has_csv).await.unwrap().arguments.contains("/nope"));
+        assert!(crate::tools::resolve_data_file(has_csv, None).await.unwrap().arguments.contains("/nope"));
 
         // A missing file is a clean, model-readable error.
         let missing = crate::tools::ToolCall {
             name: "plot_device".into(),
             arguments: "{\"path\":\"/no/such.csv\"}".into(),
         };
-        let err = crate::tools::resolve_data_file(missing).await.unwrap_err();
+        let err = crate::tools::resolve_data_file(missing, None).await.unwrap_err();
         assert!(err.contains("cannot read"), "{err}");
 
         std::fs::remove_file(&csv).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_plot_device_reads_are_confined_to_the_workspace() {
+        // The host reads plot_device's `path` outside any sandbox: an
+        // AGENT may only name files the sandboxes would show it.
+        let base = std::env::temp_dir().join(format!("llung-confine-{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(ws.join("in.csv"), "a\n1\n").unwrap();
+        std::fs::write(outside.join("secret.csv"), "s\n9\n").unwrap();
+        let call = |path: &std::path::Path| crate::tools::ToolCall {
+            name: "plot_device".into(),
+            arguments: format!("{{\"path\":{:?}}}", path.display().to_string()),
+        };
+
+        let ok = crate::tools::resolve_data_file(call(&ws.join("in.csv")), Some(&ws)).await;
+        assert!(ok.unwrap().arguments.contains("a\\n1"));
+        let err = crate::tools::resolve_data_file(call(&outside.join("secret.csv")), Some(&ws))
+            .await
+            .unwrap_err();
+        assert!(err.contains("outside what this agent may read"), "{err}");
+        // The operator's own /plot is not confined.
+        assert!(crate::tools::resolve_data_file(call(&outside.join("secret.csv")), None).await.is_ok());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[tokio::test]
@@ -1230,7 +1759,7 @@ mod tests {
         ctx.db.save_message(&m1).unwrap();
         ctx.db.save_message(&m2).unwrap();
 
-        generate_reply(&mut ctx, "alice: @tester what did I say?", Some(&m2.id))
+        generate_reply(&mut ctx, "alice: @tester what did I say?", Some(&m2.id), None)
             .await
             .unwrap();
 
@@ -1254,6 +1783,235 @@ mod tests {
         let msg: ChatMessage = serde_json::from_slice(&contents).unwrap();
         assert_eq!(msg.content, "zoomed in and answered");
         assert!(cmd_rx.try_recv().is_err(), "exactly one publish");
+    }
+
+    /// Backend that emits a reasoning chunk then the answer, to exercise
+    /// the Working/Thought/Delta event mapping in `ask_streamed`.
+    struct ThinkingBackend;
+    impl crate::interface::Backend for ThinkingBackend {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = llung_core::network::message::AgentResult<String>> + Send + '_>,
+        > {
+            Box::pin(async { Ok("answer".to_string()) })
+        }
+        fn chat_stream<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            deltas: tokio::sync::mpsc::Sender<crate::interface::StreamChunk>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = llung_core::network::message::AgentResult<String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let _ = deltas
+                    .send(crate::interface::StreamChunk::Thought("let me think…".into()))
+                    .await;
+                let _ = deltas
+                    .send(crate::interface::StreamChunk::Text("answer".into()))
+                    .await;
+                Ok("answer".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streams_working_thought_then_delta_events() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let being = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let mut ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(ThinkingBackend),
+            crate::history::HistoryCompressor::new(
+                Box::new(CountingSummarizer {
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                128_000,
+            )
+            .with_label("SmolVLM"),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            being,
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+
+        generate_reply(&mut ctx, "alice: @tester hi", None, None).await.unwrap();
+
+        let mut events = Vec::new();
+        let mut compress_id = None;
+        while let Ok(ev) = stream_rx.try_recv() {
+            events.push(match ev {
+                AgentStream::Working {
+                    sender_name,
+                    message_id,
+                    ..
+                } => {
+                    if sender_name.starts_with("HistoryCompressor") {
+                        compress_id = Some(message_id);
+                    }
+                    format!("working:{sender_name}")
+                }
+                AgentStream::Thought { .. } => "thought".into(),
+                AgentStream::Delta { sender_name, .. } => format!("delta:{sender_name}"),
+                AgentStream::Retract { message_id, .. } => {
+                    assert_eq!(Some(&message_id), compress_id.as_ref(), "only the compressor line is retracted");
+                    "retract".into()
+                }
+            });
+        }
+        assert_eq!(
+            events,
+            // History compression runs first under its OWN line (the
+            // compressor model is working, not the agent), which is
+            // retracted when done; then the agent's ask raises the
+            // agent's spinner before any output.
+            vec![
+                "working:HistoryCompressor (SmolVLM)",
+                "retract",
+                "working:tester",
+                "thought",
+                "delta:tester",
+            ],
+            "compressor and agent activity attributed separately: {events:?}"
+        );
+    }
+
+    /// Backend that fails like a flaky thinking-model endpoint (empty
+    /// replies) a fixed number of times before succeeding.
+    struct FlakyBackend {
+        failures_left: std::sync::Arc<std::sync::Mutex<u32>>,
+    }
+    impl crate::interface::Backend for FlakyBackend {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = llung_core::network::message::AgentResult<String>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                let mut left = self.failures_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    Err("model backend returned no content".into())
+                } else {
+                    Ok("recovered".to_string())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_backend_replies_are_retried_before_the_turn_fails() {
+        let backend = FlakyBackend {
+            failures_left: std::sync::Arc::new(std::sync::Mutex::new(2)),
+        };
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(16);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let being = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let mut ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(backend),
+            crate::history::HistoryCompressor::new(
+                Box::new(CountingSummarizer {
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                128_000,
+            ),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            being,
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+
+        generate_reply(&mut ctx, "alice: @tester hi", None, None).await.unwrap();
+
+        // Two silent failures, then the third ask succeeds — the turn
+        // publishes the recovered answer, not an error panel.
+        let cmd = cmd_rx.try_recv().expect("a published reply");
+        let NetworkCommand::PublishMessage { contents, .. } = cmd else {
+            panic!("expected a publish command");
+        };
+        let msg: ChatMessage = serde_json::from_slice(&contents).unwrap();
+        assert_eq!(msg.content, "recovered");
+    }
+
+    #[tokio::test]
+    async fn tool_result_is_fed_back_so_the_model_can_continue() {
+        let backend = ScriptBackend::new(vec![
+            // 1. inspect the workspace...
+            r#"TOOL {"name":"glob","arguments":{"pattern":"Cargo.toml"}}"#.to_string(),
+            // 2. ...then answer with what it found.
+            "the manifest is right there".to_string(),
+        ]);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(32);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let being = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let mut ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(backend.clone()),
+            crate::history::HistoryCompressor::new(
+                Box::new(CountingSummarizer {
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                128_000,
+            ),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            being,
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+
+        generate_reply(&mut ctx, "alice: @tester where is the manifest?", None, None)
+            .await
+            .unwrap();
+
+        let prompts = backend.prompts();
+        assert_eq!(prompts.len(), 2, "tool call + continuation");
+        // The second prompt feeds the glob RESULT back (not an error).
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|m| m.content.contains("Tool 'glob'") && m.content.contains("Cargo.toml")),
+            "result feedback must name the tool and show output: {:?}",
+            prompts[1].iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+
+        // Three publishes: ToolCall, ToolResponse, final answer.
+        let mut kinds = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            let NetworkCommand::PublishMessage { contents, .. } = cmd else {
+                continue;
+            };
+            let msg: ChatMessage = serde_json::from_slice(&contents).unwrap();
+            kinds.push(msg.kind);
+        }
+        assert_eq!(kinds.len(), 3, "call, response, answer: {kinds:?}");
+        assert!(matches!(kinds[0], MessageKind::ToolCall { .. }));
+        assert!(matches!(kinds[1], MessageKind::ToolResponse { .. }));
+        assert!(matches!(kinds[2], MessageKind::Agent));
     }
 
     #[tokio::test]
@@ -1298,7 +2056,7 @@ mod tests {
         ctx.db.save_message(&m1).unwrap();
         ctx.db.save_message(&m2).unwrap();
 
-        generate_reply(&mut ctx, "alice: @tester what did I say?", Some(&m2.id))
+        generate_reply(&mut ctx, "alice: @tester what did I say?", Some(&m2.id), None)
             .await
             .unwrap();
 
@@ -1332,6 +2090,7 @@ mod tests {
             sender_name: name.into(),
             parent_id: None,
             kind: MessageKind::Human,
+            attachment: None,
             content: content.into(),
             timestamp: 0,
         }
@@ -1560,7 +2319,10 @@ mod tests {
         assert!(kind_responds(&MessageKind::Agent));
         assert!(!kind_responds(&MessageKind::System));
         assert!(!kind_responds(&MessageKind::Notes));
-        assert!(!kind_responds(&MessageKind::Media(llung_core::network::message::Attachment {
+        // Media DOES respond: the @mention gate above keeps it from
+        // chattering, and an addressed image is the multimodal-input
+        // case (attachment rides the trigger into the backend).
+        assert!(kind_responds(&MessageKind::Media(llung_core::network::message::Attachment {
             cid: "c".into(),
             filename: "img.png".into(),
             mime_type: "image/png".into(),
@@ -1573,6 +2335,293 @@ mod tests {
             tool_name: "landscape".into(),
             arguments: "{}".into(),
         }));
+    }
+
+    /// Multimodal input end-to-end at the prompt level: a Media-kind
+    /// trigger (@mention + image) passes its attachment into the final
+    /// prompt message, where the backend converts it to an image part.
+    #[tokio::test]
+    async fn media_trigger_rides_its_attachment_into_the_prompt() {
+        let backend = ScriptBackend::new(vec!["a plain answer".into()]);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let being = libp2p::PeerId::random().to_string();
+        let mut ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(backend.clone()),
+            crate::history::HistoryCompressor::new(
+                Box::new(crate::history::HeadlineSummarizer::new()),
+                128_000,
+            ),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            being,
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+
+        let att = llung_core::network::message::Attachment {
+            cid: "cid-plot".into(),
+            filename: "loss.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 100,
+            kind: llung_core::network::message::AttachmentKind::Image,
+            width: Some(640),
+            height: Some(480),
+        };
+        // The user's image post: Media kind + top-level field (exactly
+        // what tui::send_attachment gossips).
+        let trigger = ChatMessage::user("@tester what trend is this?")
+            .with_attachment(att.clone());
+        let mut media_trigger = trigger.clone();
+        media_trigger.kind = MessageKind::Media(att.clone());
+
+        generate_reply(&mut ctx, "alice: @tester what trend is this?", None, Some(&media_trigger))
+            .await
+            .unwrap();
+
+        let prompts = backend.prompts();
+        assert_eq!(prompts.len(), 1, "no tool call -> a single ask");
+        let trigger_msg = prompts[0].last().expect("a trigger message");
+        assert_eq!(
+            trigger_msg.image_attachment().map(|a| a.cid.as_str()),
+            Some("cid-plot"),
+            "the attachment rides the prompt's trigger message"
+        );
+    }
+
+    /// A 1x1 red PNG — enough for Attachment::from_path to parse
+    /// width/height and mime-detect as image/png.
+    fn tiny_png_bytes() -> &'static [u8] {
+        &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+            0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn ctx_with_rx() -> (AgentLoopContext, mpsc::Receiver<NetworkCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(crate::interface::OpenAiCompatible::llamacpp(1)),
+            crate::history::HistoryCompressor::new(
+                Box::new(crate::history::HeadlineSummarizer::new()),
+                128_000,
+            ),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            // A REAL peer id: publish() parses self_being_id, and
+            // show_image's whole point is publishing.
+            libp2p::PeerId::random().to_string(),
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+        (ctx, cmd_rx)
+    }
+
+    /// A relative `..`-only path from `from` to `to` (both absolute),
+    /// for escape-rejection tests.
+    fn relative_escape(from: &std::path::Path, to: &std::path::Path) -> std::path::PathBuf {
+        let mut out = std::path::PathBuf::new();
+        for _ in 0..from.components().count().saturating_sub(1) {
+            out.push("..");
+        }
+        for c in to.components().skip(1) {
+            out.push(c.as_os_str());
+        }
+        out
+    }
+
+    /// A fixture dir under target/ (gitignored). Test contexts resolve
+    /// their workspace to the process cwd (the crate dir during cargo
+    /// test), so fixtures live at `target/llung-showimg-*/` and are
+    /// addressed by paths RELATIVE to the workspace — no env mutation,
+    /// safe under parallel tests.
+    fn workspace_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "llung-showimg-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The plan's Phase-2 acceptance: an orchestrator-level show_image
+    /// publishes a Media message AND returns the confirmation string
+    /// (which the aukora receipt commits to).
+    #[tokio::test]
+    async fn show_image_publishes_media_message_and_confirms() {
+        let ws = workspace_fixture("ok");
+        let rel = std::path::Path::new("target").join(ws.file_name().unwrap());
+        let plots = ws.join("experiments/runs/exp07");
+        std::fs::create_dir_all(&plots).unwrap();
+        std::fs::write(plots.join("loss.png"), tiny_png_bytes()).unwrap();
+        let (mut ctx, mut cmd_rx) = ctx_with_rx();
+
+        let root = ctx.kernel.current_history_root;
+        let out = execute_secured_tool(
+            &mut ctx,
+            "show_image".into(),
+            serde_json::json!({
+                "path": rel.join("experiments/runs/exp07/loss.png").to_string_lossy(),
+                "caption": "fitness over generations"
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await
+        .expect("show_image executes");
+        assert!(
+            out.starts_with("published image loss.png"),
+            "confirmation string: {out}"
+        );
+        assert!(out.contains("cid "), "the receipt commits to the cid: {out}");
+        // The kernel gate ran exactly like any other tier.
+        assert_ne!(ctx.kernel.current_history_root, root, "receipt committed");
+
+        // Media cache holds the bytes (relay fetch path reads it).
+        let cid = out.rsplit("cid ").next().unwrap().to_string();
+        assert!(
+            ctx.db.get_avatar_cache(&cid).ok().flatten().is_some(),
+            "image bytes cached under {cid}"
+        );
+
+        // Command sequence: ProvideMediaCid, PublishImage, PublishMessage.
+        let cmd = cmd_rx.try_recv().expect("ProvideMediaCid");
+        let NetworkCommand::ProvideMediaCid { cid: c } = cmd else {
+            panic!("expected ProvideMediaCid, got a different command");
+        };
+        assert_eq!(c, cid);
+        let cmd = cmd_rx.try_recv().expect("PublishImage");
+        let NetworkCommand::PublishImage { cid: c, mime_type, data } = cmd else {
+            panic!("expected PublishImage, got a different command");
+        };
+        assert_eq!(c, cid);
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(data, tiny_png_bytes());
+        let cmd = cmd_rx.try_recv().expect("PublishMessage");
+        let NetworkCommand::PublishMessage { contents, .. } = cmd else {
+            panic!("expected PublishMessage");
+        };
+        let msg: ChatMessage = serde_json::from_slice(&contents).unwrap();
+        let MessageKind::Media(att) = &msg.kind else {
+            panic!("a media message, got {:?}", msg.kind);
+        };
+        assert_eq!(att.filename, "loss.png");
+        assert_eq!(att.cid, cid);
+        assert_eq!(msg.content, "fitness over generations", "caption travels as content");
+        assert_eq!(msg.sender_name, "tester", "published from the agent's own being");
+        assert!(cmd_rx.try_recv().is_err(), "exactly three commands");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Path-escape rejection: absolute paths outside the workspace and
+    /// `..` climbs never resolve, even when the file exists.
+    #[tokio::test]
+    async fn show_image_rejects_paths_outside_the_workspace() {
+        let ws = workspace_fixture("escape");
+        // A real file genuinely OUTSIDE the workspace (target/ fixture
+        // has `..` climbs of its own, so use the OS temp dir).
+        let outside = std::env::temp_dir().join(format!("llung-showimg-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.png"), tiny_png_bytes()).unwrap();
+        let (mut ctx, _cmd_rx) = ctx_with_rx();
+
+        let abs = outside.join("secret.png");
+        let err = execute_secured_tool(
+            &mut ctx,
+            "show_image".into(),
+            serde_json::json!({"path": abs.to_string_lossy()}).to_string().into_bytes(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "absolute escape must be refused: {err}"
+        );
+
+        // A `..` climb that really lands on the outside file.
+        let cwd = std::env::current_dir().unwrap();
+        let climb = relative_escape(&cwd, &abs);
+        assert_eq!(
+            cwd.join(&climb).canonicalize().unwrap(),
+            abs.canonicalize().unwrap(),
+            "test climb really reaches the file"
+        );
+        let err = execute_secured_tool(
+            &mut ctx,
+            "show_image".into(),
+            serde_json::json!({"path": climb.to_string_lossy()}).to_string().into_bytes(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "dot-dot escape must be refused: {err}"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Non-image files and over-cap images are refused before anything
+    /// touches the network.
+    #[tokio::test]
+    async fn show_image_rejects_non_images_and_over_cap_files() {
+        let ws = workspace_fixture("bad");
+        let rel = std::path::Path::new("target").join(ws.file_name().unwrap());
+        std::fs::write(ws.join("notes.txt"), b"not an image").unwrap();
+        std::fs::write(
+            ws.join("big.png"),
+            vec![0u8; llung_core::media::image::MAX_IMAGE_BYTES + 1],
+        )
+        .unwrap();
+        let (mut ctx, mut cmd_rx) = ctx_with_rx();
+
+        let err = execute_secured_tool(
+            &mut ctx,
+            "show_image".into(),
+            serde_json::json!({"path": rel.join("notes.txt").to_string_lossy()})
+                .to_string()
+                .into_bytes(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a usable image")
+                || err.to_string().contains("not an image"),
+            "non-image refused: {err}"
+        );
+
+        let err = execute_secured_tool(
+            &mut ctx,
+            "show_image".into(),
+            serde_json::json!({"path": rel.join("big.png").to_string_lossy()})
+                .to_string()
+                .into_bytes(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cap"), "over-cap refused: {err}");
+        // Nothing was published for either refusal.
+        assert!(cmd_rx.try_recv().is_err(), "no network commands on refusal");
+        std::fs::remove_dir_all(&ws).ok();
     }
 }
 

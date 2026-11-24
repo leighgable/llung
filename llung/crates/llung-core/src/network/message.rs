@@ -123,6 +123,14 @@ pub struct ChatMessage {
     pub parent_id: Option<String>, // <--- creates branches
     pub kind: MessageKind,
     pub content: String,
+    /// Optional multimodal input: ONE image alongside the text.
+    /// Multimodal backends (SenseNova + mmproj) render it as an image
+    /// input; text-only backends degrade to a placeholder and never
+    /// see the key. `skip_serializing_if` keeps the wire format
+    /// unchanged for text-only messages, so old peers stay compatible
+    /// both directions (serde `default` fills `None` on read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
     pub timestamp: u64,
 }
 
@@ -146,6 +154,7 @@ impl ChatMessage {
             parent_id: None,
             kind,
             content: content.into(),
+            attachment: None,
             timestamp: 0,
         }
     }
@@ -170,11 +179,34 @@ impl ChatMessage {
             sender_name,
             parent_id,
             content,
+            attachment: None,
             timestamp,
             kind,
         };
         msg.id = msg.compute_id();
         msg
+    }
+
+    /// Attach an image (multimodal input) and recompute the id, so two
+    /// messages differing only by their attachment never share a DAG
+    /// node.
+    pub fn with_attachment(mut self, attachment: Attachment) -> Self {
+        self.attachment = Some(attachment);
+        self.id = self.compute_id();
+        self
+    }
+
+    /// The image this message carries, if any: the multimodal input
+    /// field first, else the payload of a Media-kind message (the
+    /// chat-rendered form — see tui::send_attachment, which sets both).
+    pub fn image_attachment(&self) -> Option<&Attachment> {
+        if let Some(att) = &self.attachment {
+            return Some(att);
+        }
+        match &self.kind {
+            MessageKind::Media(att) if att.kind == AttachmentKind::Image => Some(att),
+            _ => None,
+        }
     }
 
     pub fn agent_role(&self) -> &'static str {
@@ -197,6 +229,11 @@ impl ChatMessage {
         hasher.update(self.sender_id.as_bytes());
         hasher.update(self.parent_id.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.content.as_bytes());
+        if let Some(att) = &self.attachment {
+            // The cid commits to the bytes; hashing it ties the
+            // attachment into the message id.
+            hasher.update(att.cid.as_bytes());
+        }
         hasher.update(self.timestamp.to_be_bytes());
         hasher
             .finalize()
@@ -211,3 +248,59 @@ pub struct DirectMessage(pub Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectMessageResponse;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png() -> Attachment {
+        Attachment {
+            cid: "cid-abc".into(),
+            filename: "plot.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 100,
+            kind: AttachmentKind::Image,
+            width: Some(640),
+            height: Some(480),
+        }
+    }
+
+    #[test]
+    fn attachment_field_is_optional_on_the_wire() {
+        let msg = ChatMessage::user("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("attachment"),
+            "text-only messages keep the old wire shape: {json}"
+        );
+        // Old peers' payloads (no field at all) deserialize with None.
+        let old = r#"{"id":"","topic":"","sender_id":"","sender_name":"","parent_id":null,"kind":"Human","content":"hi","timestamp":0}"#;
+        let parsed: ChatMessage = serde_json::from_str(old).unwrap();
+        assert!(parsed.attachment.is_none());
+    }
+
+    #[test]
+    fn with_attachment_recomputes_the_id_and_roundtrips() {
+        let base = ChatMessage::user("look");
+        let with = ChatMessage::user("look").with_attachment(png());
+        assert_ne!(base.id, with.id, "the attachment ties into the DAG id");
+        assert_eq!(with.image_attachment().unwrap().cid, "cid-abc");
+        let json = serde_json::to_string(&with).unwrap();
+        let back: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attachment.unwrap().filename, "plot.png");
+    }
+
+    #[test]
+    fn image_attachment_falls_back_to_the_media_kind() {
+        // Reloaded messages: the DB keeps the payload inside the kind
+        // column (see Database::row_to_message), so the top-level field
+        // is None after a reload — the kind fallback must cover it.
+        let msg = ChatMessage::user("caption").with_attachment(png());
+        let mut reloaded = msg.clone();
+        reloaded.attachment = None;
+        reloaded.kind = MessageKind::Media(png());
+        assert_eq!(reloaded.image_attachment().unwrap().cid, "cid-abc");
+        // No attachment anywhere -> None.
+        assert!(ChatMessage::user("plain").image_attachment().is_none());
+    }
+}

@@ -3,7 +3,7 @@ use crate::prefix_text::PrefixText;
 use crate::registration_panel::RegistrationPanel;
 use crate::{chat_panel::ChatPanel, taffy_ui::TaffyUi};
 use agent::config::AgentConfig;
-use agent::history::{HistoryCompressor, ModelSummarizer};
+use agent::history::HistoryCompressor;
 use agent::interface::OpenAiCompatible;
 use agent::{AgentLoopContext, run_agent_loop};
 use core::option::Option::None;
@@ -81,6 +81,12 @@ pub struct PeerInfo {
     pub enc_public_key: Option<[u8; 32]>,
 }
 
+/// Masked buffer for `/key set <provider>` (see `App::key_entry`).
+struct KeyEntryState {
+    provider: String,
+    buffer: String,
+}
+
 pub struct App {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     config: CoreConfig,
@@ -129,6 +135,14 @@ pub struct App {
     pending_perm: Option<agent::permissions::PermissionRequest>,
     /// Prompts waiting behind `pending_perm` (concurrent agents).
     perm_queue: std::collections::VecDeque<agent::permissions::PermissionRequest>,
+    /// Masked key-entry mode (`/key set <provider>`): typed characters
+    /// go into the key buffer instead of the chat input; Enter stores
+    /// into the login keyring (gnome-keyring), Esc cancels.
+    key_entry: Option<KeyEntryState>,
+    /// Set when an external process may have scribbled on the terminal
+    /// (polkit/systemd password prompts for sandboxed tool runs): the
+    /// next frame is preceded by a full clear + repaint.
+    repaint: bool,
     /// Our account's being_id — presence from the SAME being on a
     /// different machine is one of our other devices; dial it so the
     /// history-exchange protocol can sync the account across devices.
@@ -158,6 +172,16 @@ pub struct App {
     /// recomputed when something relevant changes. `draw` has no DB
     /// access, so it is computed here, not in the render path.
     status_line: String,
+    /// Pi-style completion picker: backend/model/thinking pickers for
+    /// `/agent spawn`, fuzzy files for `@…` mentions and `/attach`.
+    /// Purely derived from the input buffer on every keystroke (`draw`
+    /// only reads it); the Taffy popup node above the input grows while
+    /// this is `Some`.
+    completion: Option<crate::completion::Completion>,
+    /// Buffer text as of the last Esc-dismissal: the picker stays hidden
+    /// while the buffer is byte-identical, so a second Esc reaches the
+    /// app's quit handler instead of reopening the picker.
+    completion_dismissed_for: String,
 }
 
 impl App {
@@ -202,6 +226,8 @@ impl App {
             agent_grant_txs: HashMap::new(),
             pending_perm: None,
             perm_queue: std::collections::VecDeque::new(),
+            key_entry: None,
+            repaint: false,
             self_being_id: String::new(),
             dialed_self_addrs: std::collections::HashSet::new(),
             mesh_dialed: std::collections::HashSet::new(),
@@ -212,7 +238,49 @@ impl App {
             stream_tx: None,
             perm_tx: None,
             status_line: String::new(),
+            completion: None,
+            completion_dismissed_for: String::new(),
         }
+    }
+
+    /// Re-derive the completion picker from the input buffer. Selection
+    /// survives a recompute while the same token is still being
+    /// completed (typing a filter fragment must not reset the cursor).
+    fn refresh_completion(&mut self) {
+        let prev = self.completion.take();
+        let mut next = crate::completion::for_input(
+            &self.input.text,
+            self.input.cursor,
+            &self.completion_dismissed_for,
+        );
+        if let (Some(p), Some(n)) = (&prev, &mut next)
+            && p.title == n.title
+            && p.replace_start == n.replace_start
+        {
+            n.selected = p.selected.min(n.items.len().saturating_sub(1));
+        }
+        self.completion = next;
+    }
+
+    /// Substitute the selected item into the input. Directories and
+    /// bare keys (`backend=`) keep the picker open to complete the next
+    /// level; finished values close it until the buffer changes again.
+    fn accept_completion(&mut self, item: &crate::completion::Item) {
+        let Some(comp) = self.completion.take() else {
+            return;
+        };
+        let replace = item.replace.clone();
+        let keep_open = item.keep_open;
+        self.input
+            .text
+            .replace_range(comp.replace_start..comp.replace_end, &replace);
+        self.input.cursor = comp.replace_start + replace.len();
+        self.completion_dismissed_for = if keep_open {
+            String::new()
+        } else {
+            self.input.text.clone()
+        };
+        self.refresh_completion();
     }
 
     /// Recompute the status row: current topic, local agents, and the
@@ -222,7 +290,7 @@ impl App {
     /// calls); the agent's own summaries differ in wording, not in
     /// shape or budget.
     fn update_status_line(&mut self, db: &Database) {
-        const CONTEXT_BUDGET: usize = 64_000;
+        const CONTEXT_BUDGET: usize = agent::history::DEFAULT_CONTEXT_BUDGET;
         let ctx = db.load_dag().ok().and_then(|dag| {
             let topic = self.current_topic.clone();
             let focus = self
@@ -357,7 +425,8 @@ impl App {
                     // layout cache is only dropped while something is
                     // actually spinning, so idle ticks cost nothing.
                     crate::spinner::tick();
-                    if self.chat_panel.has_running_tools() {
+                    if self.chat_panel.has_running_tools() || self.chat_panel.has_spinning_streams()
+                    {
                         self.chat_panel.invalidate();
                     }
                 }
@@ -369,7 +438,37 @@ impl App {
                 }
             }
             self.load_missing_avatars(db);
+            if self.repaint {
+                // External auth prompts (polkit/systemd) write straight
+                // to the terminal; ratatui's diff would keep their
+                // residue. Clear + reset the back buffer: next draw
+                // repaints every cell.
+                self.force_full_repaint();
+                self.repaint = false;
+            }
             self.draw()?;
+        }
+    }
+
+    /// Clear the screen and reset ratatui's back buffer so the next draw
+    /// repaints every cell.
+    ///
+    /// NOT `Terminal::clear()`: that snapshots the cursor with
+    /// `crossterm::cursor::position()`, which needs crossterm's global
+    /// input-reader lock within 2 s — and the `EventStream` thread in
+    /// `events.rs` holds that lock while it blocks waiting for input.
+    /// Unless a key arrives in time, the query fails with "The cursor
+    /// position could not be read within a normal duration" and the
+    /// error used to exit the app. Resizing a Fullscreen viewport to its
+    /// current size clears the screen and resets the back buffer without
+    /// any terminal query. Failure here is cosmetic, so it's only logged.
+    fn force_full_repaint(&mut self) {
+        let result = self
+            .terminal
+            .size()
+            .and_then(|size| self.terminal.resize(size.into()));
+        if let Err(e) = result {
+            tracing::warn!("full repaint failed: {e}");
         }
     }
 
@@ -772,6 +871,12 @@ impl App {
         key: crossterm::event::KeyEvent,
         db: &Database,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Key-entry mode owns the keyboard: typed characters build the
+        // (hidden) key buffer instead of the chat input.
+        if self.key_entry.is_some() {
+            return self.handle_key_entry(key).await;
+        }
+
         // A pending permission prompt owns the keyboard until it is
         // answered: no typing into the chat while an agent waits.
         if self.pending_perm.is_some() {
@@ -799,7 +904,64 @@ impl App {
             }
             return Ok(());
         }
+
+        // The completion picker (pi-style) is open: Up/Down move the
+        // selection, Enter/Tab accept it, Esc dismisses it — every other
+        // key edits the buffer normally and the picker re-derives on the
+        // next keystroke. While it is open it shadows history recall
+        // (Up/Down) and send (Enter).
+        if self.completion.is_some() {
+            let newline = key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(c) = &mut self.completion {
+                        c.move_selection(-1);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(c) = &mut self.completion {
+                        c.move_selection(1);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.completion_dismissed_for = self.input.text.clone();
+                    self.completion = None;
+                    return Ok(());
+                }
+                KeyCode::Enter if !newline => {
+                    let item = self
+                        .completion
+                        .as_ref()
+                        .map(|c| c.items[c.selected].clone());
+                    if let Some(item) = item {
+                        self.accept_completion(&item);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Tab => {
+                    let item = self
+                        .completion
+                        .as_ref()
+                        .map(|c| c.items[c.selected].clone());
+                    if let Some(item) = item {
+                        self.accept_completion(&item);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match key.code {
+            // Ctrl+L: redraw every cell (the classic terminal "repaint").
+            // Recovers the frame after anything wrote to the TTY behind
+            // ratatui's back.
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.repaint = true;
+            }
+
             // Typing inserts at the cursor.
             KeyCode::Char(c) => {
                 self.input.insert(c);
@@ -835,9 +997,15 @@ impl App {
                 }
             }
 
-            // Send message
+            // Send message. Shift+Enter inserts a newline (multi-line
+            // messages: markdown lists, code blocks). Shift+Enter is
+            // only distinguishable on terminals with CSI u reporting
+            // (kitty/ghostty/WezTerm/foot — enabled at startup);
+            // Alt+Enter works as a newline everywhere else.
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
                     self.input.insert('\n');
                 } else {
                     let is_command = self.input.text.trim().starts_with('/');
@@ -874,6 +1042,7 @@ impl App {
                             content: text.clone(),
                             timestamp: timestamp as u64,
                             kind: MessageKind::Human,
+                            attachment: None,
                         };
 
                         if let Err(e) = db.save_message(&msg) {
@@ -915,6 +1084,10 @@ impl App {
 
             _ => {}
         }
+
+        // Derive the picker from the buffer as edited by this keypress
+        // (typing a filter fragment updates the list immediately).
+        self.refresh_completion();
 
         Ok(())
     }
@@ -1015,6 +1188,12 @@ impl App {
 
     /// Answer the on-screen permission prompt (y/Y/n).
     fn answer_permission(&mut self, answer: agent::permissions::PermissionAnswer) {
+        // Anything an approved launch writes straight to the TTY lands
+        // outside ratatui's knowledge. Sandboxes use a user systemd
+        // scope with --no-ask-password, so the old polkit TTY prompt is
+        // gone; this repaint (and the one when the tool result arrives,
+        // and Ctrl+L) is cheap insurance against other residue.
+        self.repaint = true;
         if let Some(req) = self.pending_perm.take() {
             let verb = match answer {
                 agent::permissions::PermissionAnswer::Once => "allowed (once)",
@@ -1029,6 +1208,69 @@ impl App {
         // cheap to redo now only when idle.
         if self.pending_perm.is_none() {
             self.status_line.clear();
+        }
+    }
+
+    /// Key-entry mode (`/key set <provider>`): accumulate typed
+    /// characters into the hidden buffer; Enter stores the key in the
+    /// login keyring, Esc cancels. Nothing is echoed but the `•` mask.
+    async fn handle_key_entry(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(mut entry) = self.key_entry.take() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Enter => {
+                if entry.buffer.is_empty() {
+                    self.system(format!("key entry for '{}' cancelled (empty)", entry.provider));
+                } else {
+                    match llung_core::secrets::store_api_key(&entry.provider, &entry.buffer).await
+                    {
+                        Ok(()) => self.system(format!(
+                            "🔑 stored {provider} API key in the login keyring",
+                            provider = entry.provider
+                        )),
+                        Err(e) => self.system(format!(
+                            "✗ storing {provider} key failed: {e}",
+                            provider = entry.provider
+                        )),
+                    }
+                }
+                // `entry` drops here with the key material.
+            }
+            KeyCode::Esc => {
+                self.system(format!("key entry for '{}' cancelled", entry.provider));
+            }
+            KeyCode::Backspace => {
+                entry.buffer.pop();
+                self.key_entry = Some(entry);
+            }
+            KeyCode::Char(c)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                entry.buffer.push(c);
+                self.key_entry = Some(entry);
+            }
+            _ => {
+                self.key_entry = Some(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// `/key list`: which providers have a stored key (env override not
+    /// visible to the keyring — mentioned for completeness).
+    async fn key_list(&mut self) {
+        for provider in ["kimi"] {
+            match llung_core::secrets::has_api_key(provider).await {
+                true => self.system(format!("{provider}: set")),
+                false => self.system(format!(
+                    "{provider}: not set — `/key set {provider}` or LLUNG_KIMI_API_KEY"
+                )),
+            }
         }
     }
 
@@ -1220,6 +1462,29 @@ impl App {
     /// gossipsub message (same id) replaces the preview when it lands.
     fn handle_agent_stream(&mut self, ev: agent::AgentStream) {
         match ev {
+            agent::AgentStream::Working {
+                topic,
+                message_id,
+                being_id,
+                sender_name,
+            } => {
+                if topic != self.current_topic {
+                    return;
+                }
+                let avatar = self.known_peers.get(&being_id).and_then(|i| i.avatar.clone());
+                self.chat_panel
+                    .push_stream_start(being_id, sender_name, avatar, &message_id);
+            }
+            agent::AgentStream::Thought {
+                topic,
+                message_id,
+                delta,
+            } => {
+                if topic != self.current_topic {
+                    return;
+                }
+                self.chat_panel.push_stream_thought(&message_id, &delta);
+            }
             agent::AgentStream::Delta {
                 topic,
                 message_id,
@@ -1295,6 +1560,10 @@ impl App {
                     .push_tool(msg.sender_id.clone(), msg.sender_name.clone(), avatar, block);
             }
             MessageKind::ToolResponse { ref tool_name, error, .. } => {
+                // A finished tool run is when a child process (sandbox
+                // launcher, an auth agent) may have scribbled on the
+                // TTY: repaint the whole frame once.
+                self.repaint = true;
                 let block = ToolBlock::response(
                     msg.parent_id.clone(),
                     tool_name.clone(),
@@ -1414,6 +1683,7 @@ impl App {
             content: text.clone(),
             timestamp: chrono::Utc::now().timestamp() as u64,
             kind: MessageKind::Human,
+            attachment: None,
         };
 
         if let Err(e) = db.save_message(&msg) {
@@ -1437,12 +1707,24 @@ impl App {
         let input_text = &self.input.text;
         let input_cursor = self.input.cursor;
         let status_line = &self.status_line;
+        let completion = &self.completion;
         let screen = self.screen;
         let sidebar_mode = self.sidebar_mode;
         let peers = &self.known_peers;
         let chats = &self.chats;
         let current_topic = &self.current_topic;
         let theme = &self.theme;
+        // Key-entry mode borrows the input box: the chat buffer stays
+        // untouched, the box shows the mask and the prompt.
+        let key_masked: Option<(String, String)> = self.key_entry.as_ref().map(|k| {
+            (
+                "•".repeat(k.buffer.chars().count()),
+                format!(
+                    "🔑 key for '{}' — typing is hidden · Enter=store · Esc=cancel",
+                    k.provider
+                ),
+            )
+        });
 
         // The editing cursor's cell (set at the end of the draw, once
         // the buffer borrow ends).
@@ -1452,6 +1734,11 @@ impl App {
         // renders placeholders once the image arrives), but this avoids a
         // blank flash. APC sequences don't move the cursor, so ratatui's
         // cursor tracking stays valid.
+        // The picker grows the popup node; Taffy shifts only the chat
+        // rect (the input box keeps its fixed height) and the popup
+        // strip is rendered from its own node rect below.
+        taffy_ui.set_popup_rows(completion.as_ref().map_or(0, |c| c.visible_rows() as u16));
+
         let pending = crate::terminal::kitty::take_pending();
         if !pending.is_empty() {
             use std::io::Write;
@@ -1465,6 +1752,7 @@ impl App {
             taffy_ui.resize(area.width, area.height);
 
             let chat_rect = taffy_ui.node_rect(taffy_ui.chat);
+            let popup_rect = taffy_ui.node_rect(taffy_ui.popup);
             let input_rect = taffy_ui.node_rect(taffy_ui.input);
             let sidebar_rect = taffy_ui.node_rect(taffy_ui.sidebar);
             let buf = frame.buffer_mut();
@@ -1478,16 +1766,29 @@ impl App {
                 }
                 AppScreen::Chat => {
                     chat_panel.render(buf, chat_rect, theme);
+                    if let Some(comp) = completion {
+                        crate::completion::render_picker(buf, popup_rect, comp, theme);
+                    }
                     // Cursor position is applied at the end of the
                     // closure (the buffer borrow must end first).
-                    cursor_pos = Self::render_input_buf(
-                        buf,
-                        input_rect,
-                        input_text,
-                        input_cursor,
-                        status_line,
-                        theme,
-                    );
+                    cursor_pos = match &key_masked {
+                        Some((masked, prompt)) => Self::render_input_buf(
+                            buf,
+                            input_rect,
+                            masked,
+                            masked.len(),
+                            prompt,
+                            theme,
+                        ),
+                        None => Self::render_input_buf(
+                            buf,
+                            input_rect,
+                            input_text,
+                            input_cursor,
+                            status_line,
+                            theme,
+                        ),
+                    };
                     Self::render_sidebar_buf(
                         buf,
                         sidebar_rect,
@@ -2014,20 +2315,66 @@ impl App {
                         if let Some(key) = api_key {
                             backend = backend.with_api_key(key);
                         }
+                        // Multimodal input: resolve attachment cids
+                        // against the media cache so a vision backend
+                        // (SenseNova + mmproj) can SEE images the chat
+                        // carries — the agent's own published plots
+                        // included. A dedicated connection: rusqlite
+                        // `Connection` is Send but not Sync.
+                        {
+                            let media_db = Database::open(
+                                self.config.db_path.to_str().ok_or("non-UTF8 db path")?,
+                            )?;
+                            let media_db = std::sync::Arc::new(std::sync::Mutex::new(media_db));
+                            backend = backend.with_media_lookup(move |cid| {
+                                media_db.lock().ok()?.get_avatar_cache(cid).ok().flatten()
+                            });
+                        }
+                        // llama-server identifies models by their full
+                        // GGUF path — ask which model it serves instead
+                        // of guessing a friendly name. Failure keeps the
+                        // configured fallback; probe() reports the outage
+                        // right below when the server is down.
+                        if agent_config.backend == agent::config::BackendKind::LlamaCpp {
+                            backend.discover_model().await;
+                        }
 
                         // Warn early when the model server isn't there —
                         // otherwise the agent simply never answers and it
                         // looks like a hang.
-                        if let Err(e) = backend.probe().await {
-                            self.chat_panel.push(
-                                "system".into(), "system".into(),
-                                format!(
-                                    "Warning: model backend {backend_kind:?} unreachable ({e}). \
-                                     The agent will fail until it is up — or respawn with backend=..."
-                                ),
-                                None, None,
-                            );
-                        }
+                        let backend_up = match backend.probe().await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                self.chat_panel.push(
+                                    "system".into(), "system".into(),
+                                    format!(
+                                        "Warning: model backend {backend_kind:?} unreachable ({e}). \
+                                         The agent will fail until it is up — or respawn with backend=..."
+                                    ),
+                                    None, None,
+                                );
+                                false
+                            }
+                        };
+
+                        // History compression: on the local llamacpp
+                        // backend SmolVLM does it (same llama-server,
+                        // router mode); elsewhere the agent's own model.
+                        let compressor = if agent::history::uses_smolvlm(&agent_config) {
+                            let mut smol = OpenAiCompatible::smolvlm(9931);
+                            if !smol.discover_smolvlm().await && backend_up {
+                                self.chat_panel.push(
+                                    "system".into(), "system".into(),
+                                    "Warning: llama-server lists no SmolVLM model (router mode, \
+                                     see scripts/serve-sensenova.sh). History compression falls \
+                                     back to truncation.".into(),
+                                    None, None,
+                                );
+                            }
+                            HistoryCompressor::with_model(Box::new(smol)).with_label("SmolVLM")
+                        } else {
+                            HistoryCompressor::with_model(Box::new(backend.clone()))
+                        };
                         let stream_tx = self
                             .stream_tx
                             .clone()
@@ -2039,10 +2386,7 @@ impl App {
                         let ctx = AgentLoopContext::new(
                             agent_config.clone(),
                             Box::new(backend.clone()),
-                            HistoryCompressor::new(
-                                Box::new(ModelSummarizer::new(Box::new(backend))),
-                                64_000,
-                            ),
+                            compressor,
                             Database::open(
                                 self.config.db_path.to_str().ok_or("non-UTF8 db path")?,
                             )?,
@@ -2075,7 +2419,14 @@ impl App {
 
                         self.chat_panel.push(
                             "system".into(), "system".into(),
-                            format!("Agent '{name}' is ready (backend: {backend_kind:?}). Invite it with: /invite {name} #{}", self.current_topic),
+                            // Already in this topic: its network joined
+                            // #current_topic at init and the loop answers
+                            // there — no /invite step needed.
+                            format!(
+                                "Agent '{name}' is ready in #{topic} (backend: {backend_kind:?}) — talk to it with @{name}. \
+                                 To bring it to another topic later: /join #other, then /invite {name}",
+                                topic = self.current_topic,
+                            ),
                             None, None,
                         );
                         self.update_status_line(db);
@@ -2259,6 +2610,29 @@ impl App {
                     }
                 }
             }
+            "/key" => {
+                match parse_key_command(args.trim()) {
+                    Err(usage) => self.system(usage),
+                    Ok(KeyCommand::List) => self.key_list().await,
+                    Ok(KeyCommand::Set { provider }) => {
+                        self.system(format!(
+                            "typing now goes to the '{provider}' key (hidden) — Enter stores, \
+                             Esc cancels"
+                        ));
+                        self.key_entry = Some(KeyEntryState {
+                            provider,
+                            buffer: String::new(),
+                        });
+                    }
+                    Ok(KeyCommand::Delete { provider }) => {
+                        match llung_core::secrets::delete_api_key(&provider).await {
+                            Ok(true) => self.system(format!("deleted {provider} API key")),
+                            Ok(false) => self.system(format!("no stored {provider} key")),
+                            Err(e) => self.system(format!("✗ {e}")),
+                        }
+                    }
+                }
+            }
             "/help" | "/h" | "/?" => {
                 for line in Self::help_text() {
                     self.chat_panel
@@ -2393,7 +2767,7 @@ impl App {
             "  /join #<topic> — switch to a topic (and subscribe)".into(),
             "  /invite <peer> [peer...] [#<topic>] [display name] — invite peers to a topic (default: current chat)".into(),
             "  /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high] — spawn a local agent, then invite it like any peer".into(),
-            "  kimi needs an API key once: `llung-cli key set kimi` (login keyring) or LLUNG_KIMI_API_KEY".into(),
+            "  /key set kimi — store the Kimi API key in your login keyring from here (hidden input); /key list · /key delete".into(),
             "  /branch — where am I in the chat tree?".into(),
             "  /branch <n> — focus the message n-back; your next message forks the chat there".into(),
             "  /branch up|down — walk to the parent / most recent child message".into(),
@@ -2404,11 +2778,13 @@ impl App {
             "  /grant <effect> perpetual [agent] — pre-authorize a tool tier (e.g. bash, repl); agent defaults to all".into(),
             "  /grant revoke <effect> [agent] — remove a standing grant".into(),
             "  /grant pending — show the permission prompt queue".into(),
+            "  /key list — API keys per provider · /key set <provider> — store one (hidden input, login keyring) · /key delete <provider>".into(),
             "  /plot <csv-path> [kind=scatter|histogram|cdf] [x=col] [y=col] [z=col] — run plot_device on a file yourself".into(),
             "  /attach <path> [caption] — send an image".into(),
             "  /peers · /chats · /media — toggle the sidebars".into(),
             "  /theme <name | light/dark | path.json> · /theme reload — theme picker".into(),
             "  /quit — exit".into(),
+            "  Ctrl+L — redraw the screen (if anything scrambled it)".into(),
             "Example — spawn an agent and ask it to plot:".into(),
             "  /agent spawn plotter backend=lemonade".into(),
             "  /invite plotter #introductions".into(),
@@ -2478,6 +2854,7 @@ impl App {
             content: caption.clone().unwrap_or_default(),
             timestamp: timestamp as u64,
             kind: MessageKind::Media(attachment.clone()),
+            attachment: Some(attachment.clone()),
         };
 
         db.save_message(&msg)?;
@@ -2519,6 +2896,13 @@ impl App {
                 let _ = tx.send(NetworkCommand::SubscribeTopic {
                     topic: IdentTopic::new(&topic_id),
                 }).await;
+                // The network now delivers the topic; the agent LOOP
+                // must also stop filtering it out, or it never answers.
+                if let Some(agent_tx) = self.agent_grant_txs.get(q) {
+                    let _ = agent_tx
+                        .send(agent::AgentCommand::JoinTopic { topic: topic_id.clone() })
+                        .await;
+                }
                 continue;
             }
             // REMOTE PEER: resolve via known_peers / DHT
@@ -2586,6 +2970,37 @@ enum GrantCommand {
 
 const GRANT_USAGE: &str = "Usage: /grant list | /grant <effect> perpetual [agent] | /grant revoke <effect> [agent] | /grant pending";
 
+const KEY_USAGE: &str = "\
+Usage: /key list | /key set <provider> | /key delete <provider>
+
+Providers name a model backend's API key (currently: kimi). Keys are
+stored in the login keyring (freedesktop Secret Service — gnome-keyring
+or KWallet), encrypted at rest and unlocked with your login; `/key set`
+reads the key with hidden input, so it never sits in the chat history.
+LLUNG_<PROVIDER>_API_KEY overrides for one shell.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyCommand {
+    List,
+    Set { provider: String },
+    Delete { provider: String },
+}
+
+/// `/key` subcommands; providers mirror `llung_core::secrets`.
+fn parse_key_command(args: &str) -> Result<KeyCommand, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        [] | ["list"] => Ok(KeyCommand::List),
+        ["set", provider] => Ok(KeyCommand::Set {
+            provider: provider.to_string(),
+        }),
+        ["delete", provider] | ["rm", provider] => Ok(KeyCommand::Delete {
+            provider: provider.to_string(),
+        }),
+        _ => Err(KEY_USAGE.into()),
+    }
+}
+
 /// Effects are keyed by the bare tool name used in manifests
 /// (`bash`, `repl`, `gpu:futhark`). `agent` defaults to all local agents.
 fn parse_grant_command(args: &str) -> Result<GrantCommand, String> {
@@ -2646,6 +3061,7 @@ fn tier_label(tier: agent::effects::Tier) -> &'static str {
         Tier::ProcBash => " (sandboxed shell)",
         Tier::Repl => " (interpreter)",
         Tier::Gpu => " (GPU)",
+        Tier::Host => " (host publish)",
     }
 }
 
@@ -2790,6 +3206,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_command_parsing() {
+        assert_eq!(parse_key_command(""), Ok(KeyCommand::List));
+        assert_eq!(parse_key_command("list"), Ok(KeyCommand::List));
+        assert_eq!(
+            parse_key_command("set kimi"),
+            Ok(KeyCommand::Set { provider: "kimi".into() })
+        );
+        assert_eq!(
+            parse_key_command("delete kimi"),
+            Ok(KeyCommand::Delete { provider: "kimi".into() })
+        );
+        assert_eq!(
+            parse_key_command("rm kimi"),
+            Ok(KeyCommand::Delete { provider: "kimi".into() })
+        );
+        assert!(parse_key_command("set").is_err());
+        assert!(parse_key_command("set a b").is_err());
+        assert!(parse_key_command("frobnicate kimi").is_err());
+    }
+
+    #[test]
     fn grant_command_parsing() {
         assert_eq!(parse_grant_command("list"), Ok(GrantCommand::List));
         assert_eq!(parse_grant_command("pending"), Ok(GrantCommand::Pending));
@@ -2914,6 +3351,25 @@ mod tests {
         assert!(buf[(0, 2)].symbol() == "─");
         assert!(buf[(39, 2)].symbol() == "─");
         assert!(buf[(1, 3)].symbol() == "#");
+    }
+
+    #[test]
+    fn completion_popup_renders_title_and_selection() {
+        let theme = crate::theme::Theme::default();
+        let comp = crate::completion::for_input("/agent spawn scout backend=", 27, "")
+            .expect("backend picker");
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 60, 6));
+        crate::completion::render_picker(&mut buf, ratatui::layout::Rect::new(0, 0, 60, 6), &comp, &theme);
+        // Title row carries the context; the first item shows a marker
+        // at the left edge (label text starts two cells in).
+        assert_eq!(buf[(2, 0)].symbol(), "s");
+        assert_eq!(buf[(1, 1)].symbol(), "›");
+        assert_eq!(buf[(3, 1)].symbol(), "l"); // "llamacpp"
+        assert!(comp.visible_rows() <= 1 + crate::completion::MAX_VISIBLE);
+        // Selection movement wraps and stays renderable.
+        let mut comp = comp;
+        comp.move_selection(1);
+        crate::completion::render_picker(&mut buf, ratatui::layout::Rect::new(0, 0, 60, 6), &comp, &theme);
     }
 
     #[test]

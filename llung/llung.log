@@ -1,36 +1,38 @@
-2026-11-18T15:47:15.938809Z  INFO tui::terminal::query: terminal query: 493 bytes in 2.147476ms, fg=Some([200, 211, 245]) bg=Some([34, 36, 54]) palette=true kitty_graphics=true
-2026-11-18T15:47:15.938916Z  INFO tui::terminal: graphics: HalfBlocks (inside Zellij (no Unicode placeholder support))
-2026-11-18T15:47:15.940288Z  INFO tui: opening account at /home/leigh/.local/share/llung/account/node.db
-2026-11-18T15:47:15.945038Z  INFO libp2p_swarm: local_peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX
-2026-11-18T15:47:15.946666Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.192
-2026-11-18T15:47:15.946887Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
-2026-11-18T15:47:15.947057Z  INFO llung_core::network::engine: DHT: now providing media cid bafkreiemihk7tn37ed2rw62rcosrhlxwj7mrtskdz3rljqw3xix3s43bwq
-2026-11-18T15:47:15.947525Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/38723
-2026-11-18T15:47:15.947564Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/tcp/38723
-2026-11-18T15:47:15.947582Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/38723
-2026-11-18T15:47:15.947672Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/57399/quic-v1
-2026-11-18T15:47:15.947693Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/udp/57399/quic-v1
-2026-11-18T15:47:15.947708Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/57399/quic-v1
-2026-11-18T15:47:16.448775Z  WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
-2026-11-18T15:47:35.239374Z  INFO libp2p_swarm: local_peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9
-2026-11-18T15:47:35.241823Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.192
-2026-11-18T15:47:35.242009Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
-2026-11-18T15:47:35.242450Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/37277
-2026-11-18T15:47:35.243075Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/tcp/37277
-2026-11-18T15:47:35.243172Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/37277
-2026-11-18T15:47:35.243339Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/56172/quic-v1
-2026-11-18T15:47:35.243374Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/udp/56172/quic-v1
-2026-11-18T15:47:35.243397Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/56172/quic-v1
-2026-11-18T15:47:35.253450Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/127.0.0.1/tcp/38723, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.255408Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/192.168.1.192/tcp/38723, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.255437Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/127.0.0.1/tcp/38723, send_back_addr: /ip4/127.0.0.1/tcp/56274 }
-2026-11-18T15:47:35.256430Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/172.17.0.1/tcp/38723, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.256950Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/192.168.1.192/tcp/38723, send_back_addr: /ip4/192.168.1.192/tcp/37277 }
-2026-11-18T15:47:35.258383Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/172.17.0.1/tcp/38723, send_back_addr: /ip4/192.168.1.192/tcp/37277 }
-2026-11-18T15:47:35.268254Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/192.168.1.192/udp/57399/quic-v1, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.268743Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/127.0.0.1/udp/57399/quic-v1, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.271429Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/172.17.0.1/udp/57399/quic-v1, role_override: Dialer, port_use: Reuse }
-2026-11-18T15:47:35.282152Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/57399/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/41046/quic-v1 }
-2026-11-18T15:47:35.282629Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/57399/quic-v1, send_back_addr: /ip4/192.168.1.192/udp/56172/quic-v1 }
-2026-11-18T15:47:35.284896Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWKiFLXz53uocN5UBAg1o83MkgjRGasLv8hVvEBMm31xy9 endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/57399/quic-v1, send_back_addr: /ip4/192.168.1.192/udp/56172/quic-v1 }
-2026-11-18T15:47:36.011387Z  INFO agent_rt: Wasm Background Worker Active.
+2026-11-23T19:30:15.250271Z  INFO tui::terminal::query: terminal query: 493 bytes in 1.811316ms, fg=Some([200, 211, 245]) bg=Some([34, 36, 54]) palette=true kitty_graphics=true
+2026-11-23T19:30:15.250369Z  INFO tui::terminal: graphics: HalfBlocks (inside Zellij (no Unicode placeholder support))
+2026-11-23T19:30:15.252922Z  INFO tui: opening account at /home/leigh/.local/share/llung/account/node.db
+2026-11-23T19:30:15.257627Z  INFO libp2p_swarm: local_peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX
+2026-11-23T19:30:15.259016Z  INFO llung_core::network::engine: DHT: now providing media cid bafkreiemihk7tn37ed2rw62rcosrhlxwj7mrtskdz3rljqw3xix3s43bwq
+2026-11-23T19:30:15.259746Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.192
+2026-11-23T19:30:15.259919Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-11-23T19:30:15.260582Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/39773
+2026-11-23T19:30:15.260673Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/tcp/39773
+2026-11-23T19:30:15.260707Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/39773
+2026-11-23T19:30:15.260881Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/40052/quic-v1
+2026-11-23T19:30:15.260931Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/udp/40052/quic-v1
+2026-11-23T19:30:15.260960Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/40052/quic-v1
+2026-11-23T19:30:15.761983Z  WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
+2026-11-23T19:35:15.763010Z  WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
+2026-11-23T19:40:15.763535Z  WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
+2026-11-23T19:40:49.972099Z  INFO libp2p_swarm: local_peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA
+2026-11-23T19:40:49.974852Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=192.168.1.192
+2026-11-23T19:40:49.975020Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=172.17.0.1
+2026-11-23T19:40:49.975645Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/tcp/46761
+2026-11-23T19:40:49.975697Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/tcp/46761
+2026-11-23T19:40:49.975725Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/tcp/46761
+2026-11-23T19:40:49.975833Z  INFO llung_core::network::engine: Node listening on: /ip4/127.0.0.1/udp/57008/quic-v1
+2026-11-23T19:40:49.975889Z  INFO llung_core::network::engine: Node listening on: /ip4/192.168.1.192/udp/57008/quic-v1
+2026-11-23T19:40:49.975913Z  INFO llung_core::network::engine: Node listening on: /ip4/172.17.0.1/udp/57008/quic-v1
+2026-11-23T19:40:49.984117Z  INFO agent_rt: Wasm Background Worker Active.
+2026-11-23T19:40:49.987753Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/127.0.0.1/tcp/39773, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:49.988617Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/172.17.0.1/tcp/39773, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:49.989171Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/192.168.1.192/tcp/39773, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:49.989340Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/127.0.0.1/tcp/39773, send_back_addr: /ip4/127.0.0.1/tcp/42990 }
+2026-11-23T19:40:49.990059Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/172.17.0.1/tcp/39773, send_back_addr: /ip4/192.168.1.192/tcp/60580 }
+2026-11-23T19:40:49.990542Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/192.168.1.192/tcp/39773, send_back_addr: /ip4/192.168.1.192/tcp/35922 }
+2026-11-23T19:40:50.002834Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/192.168.1.192/udp/40052/quic-v1, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:50.005702Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/127.0.0.1/udp/40052/quic-v1, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:50.006537Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWSaV1ioyELG2hhGpMDvUuLFYTJ82KFoEXPYeLZ9MWSPaX endpoint=Dialer { address: /ip4/172.17.0.1/udp/40052/quic-v1, role_override: Dialer, port_use: Reuse }
+2026-11-23T19:40:50.015576Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/40052/quic-v1, send_back_addr: /ip4/192.168.1.192/udp/57008/quic-v1 }
+2026-11-23T19:40:50.019323Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/40052/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/56011/quic-v1 }
+2026-11-23T19:40:50.020509Z  INFO llung_core::network::engine: connection established peer_id=12D3KooWRXh9ryXMpvmxzJVohcojn6fWipvXfkMiWH3UF3HzaVNA endpoint=Listener { local_addr: /ip4/0.0.0.0/udp/40052/quic-v1, send_back_addr: /ip4/192.168.1.192/udp/57008/quic-v1 }

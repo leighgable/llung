@@ -77,7 +77,9 @@ pub fn run(arguments_json: &str) -> Result<String, String> {
 
     let root = args.path.as_deref().unwrap_or(".");
     let root = shellexpand::tilde(root).to_string();
-    let root_path = PathBuf::from(root.as_ref() as &str);
+    // Absolute root: result lines carry absolute paths (see glob.rs).
+    let root_path = std::path::absolute(PathBuf::from(root.as_ref() as &str))
+        .map_err(|e| format!("grep: bad path '{root}': {e}"))?;
     if !root_path.exists() {
         return Err(format!("grep: '{}' does not exist", root_path.display()));
     }

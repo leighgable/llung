@@ -9,11 +9,12 @@
 //   tier        prefix     examples                executor     prompt?
 //   ──────────  ─────────  ──────────────────────  ───────────  ──────
 //   Wasm        (bare)     landscape, plot_device  wasm worker  no
+//   Host        host:      show_image              orchestrator no
 //   FsRead      fs:        glob, grep              host::       no
 //   Edit        edit:      edit                    host::       no
 //   ProcBash    proc:      bash (Phase 3)          bwrap        YES
 //   Repl        repl:      python, chibi, futhark  REPL mgr     YES
-//   Gpu         gpu:       futhark-opencl/cuda     bwrap+GPU    YES, never implicit
+//   Gpu         gpu:       futhark, torch          bwrap+GPU    YES, never implicit
 //
 // Bare (prefix-less) names resolve through the registry: known host-tool
 // names map to their tier, everything else stays Wasm (preserving the
@@ -41,6 +42,13 @@ pub enum Tier {
     /// GPU-backed execution (futhark opencl/cuda). Always prompts;
     /// never covered by an implicit standing grant.
     Gpu,
+    /// Side-effecting host tools that need the AGENT's context (network
+    /// stack, media cache) — e.g. `show_image` publishes a media
+    /// message from the agent's own being. The orchestrator executes
+    /// them (secure_execute_agent_tool has no such context) and commits
+    /// the receipt through the same kernel gate. Publishing to a topic
+    /// the agent already posts to is not privileged: no prompt.
+    Host,
 }
 
 impl Tier {
@@ -53,6 +61,7 @@ impl Tier {
             Tier::ProcBash => "proc",
             Tier::Repl => "repl",
             Tier::Gpu => "gpu",
+            Tier::Host => "host",
         }
     }
 
@@ -83,6 +92,7 @@ pub struct Effect<'a> {
 /// Bare-name registry: host tools and the sandboxed tools. `bash` runs
 /// through bubblewrap (Phase 3) — never in-process like the host tools.
 const BARE_TIERS: &[(&str, Tier)] = &[
+    ("show_image", Tier::Host),
     ("glob", Tier::FsRead),
     ("grep", Tier::FsRead),
     ("edit", Tier::Edit),
@@ -104,6 +114,7 @@ pub fn classify(target_effect: &str) -> Effect<'_> {
             "proc" => Tier::ProcBash,
             "repl" => Tier::Repl,
             "gpu" => Tier::Gpu,
+            "host" => Tier::Host,
             // Unknown prefix: do not silently run it as something else.
             // Classify as Wasm under the full original string so the
             // worker reports the missing component with its real name.
@@ -152,7 +163,13 @@ mod tests {
         assert_eq!(classify("repl:python").tier, Tier::Repl);
         assert_eq!(classify("repl:futhark").name, "futhark");
         assert_eq!(classify("gpu:futhark-opencl").tier, Tier::Gpu);
+        assert_eq!(classify("gpu:torch").tier, Tier::Gpu);
+        assert_eq!(classify("gpu:torch").name, "torch");
         assert_eq!(classify("edit:file").tier, Tier::Edit);
+        // host: tools are context-dependent orchestrator effects.
+        assert_eq!(classify("host:show_image").tier, Tier::Host);
+        assert_eq!(classify("host:show_image").name, "show_image");
+        assert_eq!(classify("show_image").tier, Tier::Host);
         // Explicit wasm prefix round-trips.
         assert_eq!(classify("wasm:landscape").tier, Tier::Wasm);
         assert_eq!(classify("wasm:landscape").name, "landscape");
@@ -172,6 +189,7 @@ mod tests {
         assert!(!Tier::Wasm.requires_prompt());
         assert!(!Tier::FsRead.requires_prompt());
         assert!(!Tier::Edit.requires_prompt());
+        assert!(!Tier::Host.requires_prompt(), "publishing to the agent's own topic is not privileged");
         assert!(Tier::ProcBash.requires_prompt());
         assert!(Tier::Repl.requires_prompt());
         assert!(Tier::Gpu.requires_prompt());

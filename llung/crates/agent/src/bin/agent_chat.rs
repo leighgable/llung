@@ -1,7 +1,8 @@
 // crates/agent/src/bin/agent_chat.rs
 //
-// Minimal REPL for chatting with the local agent backend (SmolVLM Q4 on
-// llama-server). Every turn — human input and model reply — is persisted
+// Minimal REPL for chatting with the local agent backend (SenseNova
+// U1.5 8B on the sensenova-loop llama-server fork). Every turn — human
+// input and model reply — is persisted
 // to the llung SQLite DB as ChatMessages on the "agent-chat" topic, so
 // the conversation survives restarts and is visible to the rest of the
 // system (DAG history, TUI, orchestrator).
@@ -10,12 +11,13 @@
 //   cargo run -p agent --bin agent_chat [db_path]
 //
 // Env overrides:
-//   LLAMA_BASE_URL  (default http://localhost:9931/v1)
-//   LLM_MODEL       (default SmolVLM)
+//   LLAMA_BASE_URL   (default http://localhost:9931/v1)
+//   LLM_MODEL        (overrides auto-discovery from /v1/models; the
+//                     fallback is LLUNG_LLAMA_MODEL / "sensenova-9b")
 
 use std::io::{self, Write};
 
-use agent::interface::{Backend, OpenAiCompatible};
+use agent::interface::{Backend, OpenAiCompatible, first_model_at};
 use llung_core::{
     identity::being::BeingKind,
     network::message::{ChatMessage, MessageKind},
@@ -24,22 +26,6 @@ use llung_core::{
 use tokio::io::AsyncBufReadExt;
 
 const TOPIC: &str = "agent-chat";
-
-/// Query an OpenAI-compatible `/v1/models` and return the first model id.
-async fn first_model_at(base_url: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ModelList {
-        data: Vec<ModelEntry>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        id: String,
-    }
-
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let list: ModelList = reqwest::get(url).await.ok()?.json().await.ok()?;
-    list.data.into_iter().next().map(|m| m.id)
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,7 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /v1/models rather than guessing a friendly name.
     let model = match std::env::var("LLM_MODEL") {
         Ok(m) => m,
-        Err(_) => first_model_at(&base_url).await.unwrap_or_else(|| "SmolVLM".into()),
+        Err(_) => first_model_at(&base_url)
+            .await
+            .unwrap_or_else(OpenAiCompatible::llama_fallback_model),
     };
 
     let (db, machine) = Database::new(&db_path)?;

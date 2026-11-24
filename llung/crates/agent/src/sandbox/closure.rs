@@ -28,6 +28,14 @@ const RUNTIME_DEPS: &[&str] = &[
     "true", "echo", "grep", "sed", "awk", "find", "sort", "uniq", "tr", "pwd", "xargs", "dirname",
 ];
 
+/// Optional companions, bound BEST-EFFORT into every sandbox: present
+/// on the host PATH -> their closure is ro-bound like the runtime
+/// deps; absent -> silently skipped. Unlike [`RUNTIME_DEPS`], a missing
+/// one must never flip the whole runtime into Fallback. `uv` lets the
+/// agent maintain the python env itself (`uv lock` after a pyproject
+/// edit); `git` can back experiments up to a repo someday.
+pub const OPTIONAL_RUNTIME_DEPS: &[&str] = &["uv", "git"];
+
 fn closure_cache() -> &'static Mutex<HashMap<PathBuf, Vec<PathBuf>>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -123,6 +131,24 @@ mod tests {
         // host the same assertion holds for the Fallback decision — the
         // test only requires resolution, not store membership.
         assert!(sh.is_absolute());
+    }
+
+    #[test]
+    fn optional_runtime_deps_are_strictly_optional() {
+        // Disjoint from the mandatory set: a missing RUNTIME_DEPS entry
+        // degrades the whole sandbox to Fallback, which must never
+        // happen over a nice-to-have.
+        for name in OPTIONAL_RUNTIME_DEPS {
+            assert!(
+                !RUNTIME_DEPS.contains(name),
+                "{name} must stay optional"
+            );
+        }
+        // In the nix devShell both are present; the smoke test in
+        // bwrap.rs verifies they run sandboxed.
+        if which("uv").is_none() || which("git").is_none() {
+            eprintln!("uv/git not on PATH; presence half of the assertion skipped");
+        }
     }
 
     #[test]

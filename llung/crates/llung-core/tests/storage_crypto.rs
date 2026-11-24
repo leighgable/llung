@@ -59,6 +59,7 @@ fn message_kind_roundtrips_through_storage() {
             arguments: r#"{"city":"Oslo"}"#.to_string(),
         },
         content: "what's the weather?".to_string(),
+        attachment: None,
         timestamp: 42,
     };
     msg.id = msg.compute_id();
@@ -80,6 +81,7 @@ fn message_kind_roundtrips_through_storage() {
     let human = ChatMessage {
         id: "m2".to_string(),
         kind: MessageKind::Human,
+        attachment: None,
         ..msg.clone()
     };
     db.save_message(&human).unwrap();

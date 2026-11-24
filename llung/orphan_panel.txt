@@ -1,0 +1,20 @@
+The panel state machine has an orphan-panel bug: push_tool_response only replaces a pending
+ panel when it can find one — if the ToolResponse gossip message arrives before its ToolCall
+ (gossipsub doesn't guarantee cross-publish ordering), the response is pushed as a finished
+ panel, and when the ToolCall arrives afterwards, push_tool unconditionally stacks a new
+ pending panel that no response will ever match. Instant tools like grep make this easy to
+ spot: a permanent running… panel. Duplicated delivery would do the same. Let me make panel
+ insertion an idempotent upsert keyed by call_id, where a finished panel is never replaced
+ by a pending one:
+
+Now update push_tool_response to use the same upsert (so an out-of-order response that
+ arrives first gets updated in place when... wait — response first: upsert pushes response
+ panel (call_id present, Success). Call arrives later: push_tool → upsert → finds finished
+ panel, incoming pending → keep_finished → return. Panel stays Success.
+
+ Also push_tool_response currently matches only PENDING panels via parent_id and falls back
+ to push. Rewrite to delegate to upsert_tool with the response block (block.call_id ==
+ parent_id). If call_id is None → upsert pushes new panel (same as old fallback).
+
+
+ read ~/Code/llung/llung/crates/tui/src/chat_panel.rs:248-297

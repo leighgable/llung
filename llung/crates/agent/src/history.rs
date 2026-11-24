@@ -24,10 +24,15 @@ use std::pin::Pin;
 
 use llung_core::network::message::{ChatMessage, MessageKind};
 
+use crate::config::{AgentConfig, BackendKind};
 use crate::interface::Backend;
 
 /// Target size of one summary line (OptChat NODE).
 pub const NODE_BYTES: usize = 512;
+
+/// Default ceiling (BYTES) for the history view fed to the agent's
+/// model (OptChat VIEW).
+pub const DEFAULT_CONTEXT_BUDGET: usize = 32_000;
 
 /// OptChat message kinds, mapped onto our MessageKind: `user: text`.
 fn kind_tag(kind: &MessageKind) -> &'static str {
@@ -84,6 +89,9 @@ pub struct HistoryCompressor {
     backend: Box<dyn Summarizer>,
     /// Max BYTES to feed into the expensive model (OptChat VIEW).
     pub context_budget: usize,
+    /// Which model compresses (e.g. "SmolVLM"), for UI attribution;
+    /// see [`Self::display_name`].
+    label: Option<String>,
 }
 
 impl HistoryCompressor {
@@ -91,7 +99,37 @@ impl HistoryCompressor {
         Self {
             backend,
             context_budget,
+            label: None,
         }
+    }
+
+    /// Name the model doing the compression (e.g. "SmolVLM") so the UI
+    /// can attribute compression work to it, not to the agent.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Who is working while this compressor runs, for UI spinners:
+    /// `HistoryCompressor (SmolVLM)`, or bare `HistoryCompressor`.
+    pub fn display_name(&self) -> String {
+        match &self.label {
+            Some(label) => format!("HistoryCompressor ({label})"),
+            None => "HistoryCompressor".into(),
+        }
+    }
+
+    /// Model-backed compressor with the [`DEFAULT_CONTEXT_BUDGET`]
+    /// ceiling. Pick the model with [`uses_smolvlm`]: SmolVLM
+    /// (`OpenAiCompatible::smolvlm`) on the local llamacpp backend, the
+    /// agent's own backend otherwise. If the model is unreachable,
+    /// `ModelSummarizer` falls back to rule-based truncation —
+    /// compression never breaks a turn.
+    pub fn with_model(model: Box<dyn Backend>) -> Self {
+        Self::new(
+            Box::new(ModelSummarizer::new(model)),
+            DEFAULT_CONTEXT_BUDGET,
+        )
     }
 
     /// Whether a model does the compressing (see [`Summarizer::is_model_backed`]).
@@ -383,6 +421,13 @@ impl HistoryCompressor {
     }
 }
 
+/// True when an agent's history compression should run on SmolVLM
+/// (llama-server router mode) instead of its own model: the local
+/// llamacpp backend without a `model_url` override.
+pub fn uses_smolvlm(config: &AgentConfig) -> bool {
+    config.backend == BackendKind::LlamaCpp && config.model_url.is_none()
+}
+
 /// Zoom every node fully inside `[start, end)` — the agent-side of
 /// OptChat's `zoom(id, n)` tool, range-addressed instead of id+n.
 pub fn zoom_range(node: &mut SummaryNode, messages: &[ChatMessage], start: usize, end: usize) {
@@ -443,8 +488,9 @@ pub trait Summarizer: Send + Sync {
     }
 }
 
-/// Model-backed Summarizer: asks the agent's chat backend (e.g. SmolVLM
-/// on llama-server) to compress history with a dedicated system prompt.
+/// Model-backed Summarizer: asks the agent's chat backend (e.g.
+/// SenseNova on llama-server) to compress history with a dedicated
+/// system prompt.
 /// Suspicious output (empty, rambling, prompt-echo) and backend errors
 /// fall back to rule-based truncation via `head`.
 pub struct ModelSummarizer {
@@ -621,6 +667,7 @@ mod tests {
             parent_id: None,
             kind,
             content: content.into(),
+            attachment: None,
             timestamp: 0,
         }
     }

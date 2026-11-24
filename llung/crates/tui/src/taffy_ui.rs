@@ -25,7 +25,14 @@ pub struct TaffyUi {
     root: NodeId,
     pub sidebar: NodeId,
     pub chat: NodeId,
+    /// Completion-picker strip between the chat and the input. Zero
+    /// height when no picker is active; `set_popup_rows` grows it and
+    /// the chat yields the space (the input box itself never moves).
+    pub popup: NodeId,
     pub input: NodeId,
+    /// Last height handed to `set_popup_rows`, so unchanged frames skip
+    /// the style update entirely (zero steady-state cost).
+    popup_rows: u16,
 }
 
 impl TaffyUi {
@@ -59,6 +66,18 @@ impl TaffyUi {
             })
             .unwrap();
 
+        // Completion picker: collapsed by default, grown by
+        // `set_popup_rows` while a picker is active.
+        let popup = taffy
+            .new_leaf(TaffyStyle {
+                size: Size {
+                    width: Dimension::percent(1.0),
+                    height: Dimension::length(0.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+
         // Input: top border, two text rows, bottom border, status row.
         let input = taffy
             .new_leaf(TaffyStyle {
@@ -83,7 +102,7 @@ impl TaffyUi {
                     flex_grow: 1.0,
                     ..Default::default()
                 },
-                &[chat, input],
+                &[chat, popup, input],
             )
             .unwrap();
 
@@ -108,8 +127,28 @@ impl TaffyUi {
             root,
             sidebar,
             chat,
+            popup,
             input,
+            popup_rows: 0,
         }
+    }
+
+    /// Grow/shrink the completion-picker strip. Called every frame;
+    /// an unchanged height skips the style update, so the steady state
+    /// costs nothing.
+    pub fn set_popup_rows(&mut self, rows: u16) {
+        if rows == self.popup_rows {
+            return;
+        }
+        self.popup_rows = rows;
+        let style = taffy::Style {
+            size: Size {
+                width: Dimension::percent(1.0),
+                height: Dimension::length(rows as f32),
+            },
+            ..Default::default()
+        };
+        let _ = self.taffy.set_style(self.popup, style);
     }
 
     /// Recompute layout when the terminal resizes.

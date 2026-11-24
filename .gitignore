@@ -3,3 +3,9 @@ key.txt
 archive/
 .direnv/
 target/
+experiments/runs/*
+!experiments/runs/.gitkeep
+llung.log
+data/
+__pycache__/
+.venv/

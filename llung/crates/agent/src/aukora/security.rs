@@ -7,11 +7,31 @@ use tokio::sync::mpsc;
 /// Returns the signed receipt *and* the tool's raw output — the caller
 /// decides what to publish (chat wants the output, audit wants the
 /// receipt).
-/// Where wasm tools live. `LLUNG_TOOLS_DIR` overrides the default
-/// `runtime-tools/` directory (resolved against the process cwd).
+/// Where wasm tools live: see [`crate::paths::tools_dir`] (env
+/// override, next to the executable, then the source tree — never
+/// dependent on the launch directory).
 fn tool_wasm_path(effect: &str) -> std::path::PathBuf {
-    let dir = std::env::var("LLUNG_TOOLS_DIR").unwrap_or_else(|_| "runtime-tools".into());
-    std::path::PathBuf::from(dir).join(format!("{effect}.wasm"))
+    crate::paths::tool_wasm_path(effect)
+}
+
+/// Tier::Host effects (e.g. `host:show_image`) execute in the
+/// ORCHESTRATOR, not here — they need `AgentLoopContext` (the agent's
+/// network stack, media cache). After the orchestrator performed the
+/// effect and holds the tool's output string, this runs the SAME kernel
+/// gate as every other tier and commits the receipt to that output, so
+/// the audit trail is identical to wasm/host/bwrap executors.
+pub fn commit_host_effect(
+    state: &mut KernelState,
+    manifest: Manifest,
+    grant: Grant,
+    output: &str,
+) -> Result<Receipt, String> {
+    let mut receipt = state
+        .consume_manifest_use_core(manifest.clone(), grant)
+        .map_err(|e| format!("Aukora Guard Denied Execution: {}", e))?;
+    receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
+    state.advance_history_root(&receipt);
+    Ok(receipt)
 }
 
 pub async fn secure_execute_agent_tool(
@@ -71,6 +91,17 @@ pub async fn secure_execute_agent_tool(
             receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
             state.advance_history_root(&receipt);
             return Ok((receipt, output));
+        }
+        crate::effects::Tier::Host => {
+            // Host effects need AgentLoopContext (network stack, db) —
+            // the orchestrator executes them and funnels the result
+            // through `commit_host_effect`. Reaching this arm means a
+            // routing bug, not a missing grant.
+            return Err(format!(
+                "effect '{}' (tier 'host') executes in the orchestrator — \
+                 route it through commit_host_effect",
+                manifest.target_effect
+            ));
         }
         crate::effects::Tier::Gpu => {
             // GPU-backed execution (futhark opencl). Phase 5 adds the
@@ -227,6 +258,35 @@ mod tests {
             .expect("fs:-prefixed glob runs on the host executor");
         assert!(output.contains("x.txt"), "got: {output}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Host effects execute in the orchestrator; the kernel gate must
+    /// still commit a receipt to the produced output — same audit
+    /// trail as every other tier — and anti-replay must apply.
+    #[tokio::test]
+    async fn host_effect_commits_receipt_to_the_output() {
+        let (mut kernel, supervisor) = kernel_with_supervisor();
+        let (manifest, grant) =
+            signed_manifest("host:show_image", "{\"path\":\"loss.png\"}", 11, &supervisor);
+        let receipt = commit_host_effect(&mut kernel, manifest.clone(), grant, "published image loss.png")
+            .expect("host gate commits");
+        assert_eq!(receipt.status, ReceiptStatus::Executed);
+        assert_eq!(
+            receipt.output_commitment,
+            compute_sha256_bytes(b"published image loss.png"),
+            "receipt commits to the orchestrator-produced output"
+        );
+        assert_ne!(kernel.current_history_root, [0u8; 32]);
+
+        // Anti-replay applies exactly like the in-process executors.
+        let hash = compute_sha256(&manifest);
+        let grant2 = crate::aukora::kernel::Grant {
+            manifest_hash: hash,
+            authorized_by: supervisor.public_pin(),
+            signature: supervisor.sign(&hash),
+        };
+        let err = commit_host_effect(&mut kernel, manifest, grant2, "again").unwrap_err();
+        assert!(err.contains("Replay"), "got: {err}");
     }
 
     #[tokio::test]

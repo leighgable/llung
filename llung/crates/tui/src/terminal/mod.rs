@@ -40,6 +40,51 @@ pub mod graphics;
 pub mod kitty;
 pub mod query;
 
+use std::sync::OnceLock;
+
+/// Whether the Kitty keyboard protocol flags were pushed at startup;
+/// cleanup pops them only when they were.
+static KEYBOARD_ENHANCED: OnceLock<bool> = OnceLock::new();
+
+/// Terminals that speak the Kitty keyboard protocol (progressive
+/// enhancement / CSI u), which is what lets the app SEE modified keys
+/// like Shift+Enter as distinct key events — without it, Shift+Enter
+/// arrives byte-identical to Enter and both submit the chat message.
+fn keyboard_enhancement_supported(env: &graphics::Env) -> bool {
+    matches!(
+        env.term_program.as_deref(),
+        Some("kitty" | "ghostty" | "WezTerm" | "foot")
+    ) || env.kitty_window_id.is_some()
+        || env.term.as_deref().is_some_and(|t| t.contains("kitty"))
+}
+
+/// Ask the terminal to report keys with their modifiers (CSI u), so
+/// Shift+Enter is distinguishable from Enter. No-op on terminals that
+/// don't support the protocol. Call after entering the alternate
+/// screen; [`cleanup_sequence`] pops the flags. Returns whether the
+/// push happened.
+pub fn push_keyboard_enhancement() -> bool {
+    let supported = keyboard_enhancement_supported(&graphics::Env::from_process());
+    // Even on failure (terminal ignored the sequence) the answer for
+    // cleanup purposes is "don't pop what wasn't accepted" — but the
+    // sequence is also how we find out, so only pop on supported
+    // terminals regardless of the write result.
+    let _ = KEYBOARD_ENHANCED.set(supported);
+    if !supported {
+        return false;
+    }
+    use crossterm::event::KeyboardEnhancementFlags as Flags;
+    use crossterm::event::PushKeyboardEnhancementFlags;
+    let flags = Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    match crossterm::execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("keyboard enhancement flags rejected: {e}");
+            false
+        }
+    }
+}
+
 /// Probe the terminal once at startup and record the results for the
 /// theme (`system` colors) and image rendering. Call before the TUI
 /// starts reading input; briefly enters raw mode itself. Without a
@@ -59,11 +104,45 @@ pub fn init() {
     crate::theme::system::set_terminal_colors(report.colors);
 }
 
-/// Escape sequences to write before leaving the alternate screen: frees
-/// uploaded images so they don't linger in terminal memory.
+/// Escape sequences to write before leaving the alternate screen: pops
+/// the keyboard enhancement flags and frees uploaded images so they
+/// don't linger in terminal memory.
 pub fn cleanup_sequence() -> Vec<u8> {
+    let mut out = Vec::new();
+    if KEYBOARD_ENHANCED.get().copied().unwrap_or(false) {
+        out.extend_from_slice(b"\x1b[<1u"); // PopKeyboardEnhancementFlags
+    }
     match graphics::graphics() {
-        graphics::Graphics::Kitty => kitty::cleanup_sequence(),
-        graphics::Graphics::HalfBlocks => Vec::new(),
+        graphics::Graphics::Kitty => out.extend_from_slice(&kitty::cleanup_sequence()),
+        graphics::Graphics::HalfBlocks => {}
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_enhancement_support_detection() {
+        let env = |tp: &str, term: &str| graphics::Env {
+            term_program: Some(tp.into()),
+            term: Some(term.into()),
+            ..Default::default()
+        };
+        assert!(keyboard_enhancement_supported(&env("ghostty", "xterm-ghostty")));
+        assert!(keyboard_enhancement_supported(&env("kitty", "xterm-kitty")));
+        assert!(keyboard_enhancement_supported(&env("WezTerm", "xterm-256color")));
+        assert!(keyboard_enhancement_supported(&env("", "xterm-kitty")));
+        let kitty_win = graphics::Env {
+            term_program: None,
+            term: Some("xterm-256color".into()),
+            kitty_window_id: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(keyboard_enhancement_supported(&kitty_win));
+        // Plain xterm/alacritty etc. send Shift+Enter identical to Enter.
+        assert!(!keyboard_enhancement_supported(&env("Alacritty", "xterm-256color")));
+        assert!(!keyboard_enhancement_supported(&env("", "xterm-256color")));
     }
 }

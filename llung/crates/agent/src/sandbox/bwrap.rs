@@ -8,6 +8,11 @@
 //
 // GPU profile (SANDBOXES.md): /run/opengl-driver ro, /etc/OpenCL (or
 // OCL_ICD_VENDORS), GPU char devices via --dev-bind, /dev/shm tmpfs.
+//
+// baseline() additionally binds OPTIONAL_RUNTIME_DEPS (uv, git)
+// best-effort: present on the host PATH -> ro-bound with their
+// closure; absent -> skipped. They must never trigger the degraded
+// Fallback profile the way a missing RUNTIME_DEPS entry would.
 
 use crate::sandbox::closure;
 use std::path::{Path, PathBuf};
@@ -134,11 +139,25 @@ impl Sandbox {
                 sb.env.push(("PATH".into(), "/usr/bin:/bin".into()));
             }
         }
+        // Nice-to-have companions (uv, git — see closure.rs): bound
+        // when present on the host PATH, skipped silently when not;
+        // never a reason to degrade the runtime.
+        for dep in closure::OPTIONAL_RUNTIME_DEPS {
+            sb.bind_binary_optional(dep);
+        }
         sb
     }
 
     pub fn bind_ro(&mut self, src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> &mut Self {
         self.mounts.push(Mount { src: src.into(), dest: dest.into(), kind: MountKind::Ro });
+        self
+    }
+
+    /// Read-write bind (e.g. `experiments/` inside the otherwise ro
+    /// workspace mount — a later bind of a subpath shadows the earlier
+    /// ro parent, same as the tmpfs-over-bind note in `argv()`).
+    pub fn bind_rw(&mut self, src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> &mut Self {
+        self.mounts.push(Mount { src: src.into(), dest: dest.into(), kind: MountKind::Rw });
         self
     }
 
@@ -184,6 +203,33 @@ impl Sandbox {
             self.add_path_dir(dir);
         }
         Ok(())
+    }
+
+    /// Best-effort variant of [`bind_binary`]: a missing binary (or a
+    /// non-store one on a degraded host) is SKIPPED silently, so these
+    /// are strictly nice-to-haves — see `closure::OPTIONAL_RUNTIME_DEPS`.
+    pub fn bind_binary_optional(&mut self, name: &str) {
+        let Some(path) = closure::which(name) else {
+            return;
+        };
+        // Symlinked profile entries (/run/current-system/sw/bin/git,
+        // ~/.nix-profile/bin/...) are not store paths themselves —
+        // canonicalize to the real target before asking for its
+        // closure. The resolved parent's bin dir goes on the PATH.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let Ok(paths) = closure::store_closure(&path) else {
+            return;
+        };
+        for p in paths {
+            self.mounts.push(Mount {
+                src: p.clone(),
+                dest: p,
+                kind: MountKind::Ro,
+            });
+        }
+        if let Some(dir) = path.parent() {
+            self.add_path_dir(dir);
+        }
     }
 
     /// Append a directory to the sandbox PATH env (deduped). Assumes
@@ -245,6 +291,22 @@ impl Sandbox {
                 "/run/opengl-driver/etc/OpenCL/vendors".into(),
             ));
         }
+        // ROCm/HIP userspace (ROCr + libdrm amdgpu) enumerates devices
+        // through sysfs: the kfd topology, PCI device attributes, and
+        // the /sys/class/dri symlink mapping the render node to its PCI
+        // address (amdgpu_get_auth walks it). Without these, GPU
+        // discovery silently yields zero devices. Read-only: sysfs is
+        // kernel-generated and the driver never writes it.
+        for sys in ["/sys/devices", "/sys/bus/pci", "/sys/class", "/sys/dev"] {
+            let path = PathBuf::from(sys);
+            if path.exists() {
+                self.mounts.push(Mount {
+                    src: path.clone(),
+                    dest: path,
+                    kind: MountKind::Ro,
+                });
+            }
+        }
         self
     }
 
@@ -259,10 +321,39 @@ impl Sandbox {
             "--die-with-parent".into(),
             "--new-session".into(),
         ];
-        for m in &self.mounts {
-            v.push(m.kind.flag().into());
-            v.push(m.src.to_string_lossy().into_owned());
-            v.push(m.dest.to_string_lossy().into_owned());
+        // Filesystem layering: bwrap applies mounts in argv order and a
+        // later mount covers whatever was at its destination. Emit binds
+        // and tmpfs mounts parent-before-child (stable sort by
+        // destination depth) so every one stays visible: the /tmp tmpfs
+        // must precede a workspace or LLUNG_RO_BINDS dir under /tmp
+        // (it used to come last and hide them), and an rw subdir bind
+        // still follows its ro parent.
+        enum Layer<'a> {
+            Bind(&'a Mount),
+            Tmpfs(&'a PathBuf),
+        }
+        let mut layers: Vec<Layer> = self
+            .tmpfs
+            .iter()
+            .map(Layer::Tmpfs)
+            .chain(self.mounts.iter().map(Layer::Bind))
+            .collect();
+        layers.sort_by_key(|layer| match layer {
+            Layer::Bind(m) => m.dest.components().count(),
+            Layer::Tmpfs(t) => t.components().count(),
+        });
+        for layer in layers {
+            match layer {
+                Layer::Bind(m) => {
+                    v.push(m.kind.flag().into());
+                    v.push(m.src.to_string_lossy().into_owned());
+                    v.push(m.dest.to_string_lossy().into_owned());
+                }
+                Layer::Tmpfs(t) => {
+                    v.push("--tmpfs".into());
+                    v.push(t.to_string_lossy().into_owned());
+                }
+            }
         }
         if self.create_dev {
             v.push("--dev".into());
@@ -284,10 +375,6 @@ impl Sandbox {
             v.push("--proc".into());
             v.push("/proc".into());
         }
-        for t in &self.tmpfs {
-            v.push("--tmpfs".into());
-            v.push(t.to_string_lossy().into_owned());
-        }
         for (k, val) in &self.env {
             v.push("--setenv".into());
             v.push(k.clone());
@@ -303,20 +390,48 @@ impl Sandbox {
         v
     }
 
-    /// Whether this run will be wrapped in a systemd scope
-    /// (`/run/systemd/system` exists = systemd is PID 1 here).
+    /// Whether this run will be wrapped in a systemd scope:
+    /// `/run/systemd/system` exists (systemd is PID 1) and the caller
+    /// has a user manager to talk to (`$XDG_RUNTIME_DIR/bus`).
     fn use_systemd_scope(&self) -> bool {
-        self.memory_max.is_some() && Path::new("/run/systemd/system").exists()
+        self.memory_max.is_some()
+            && Path::new("/run/systemd/system").exists()
+            && std::env::var_os("XDG_RUNTIME_DIR")
+                .is_some_and(|dir| Path::new(&dir).join("bus").exists())
+    }
+
+    /// The resource-limit wrapper: a transient scope on the USER
+    /// manager. Never the system manager — that needs polkit, whose
+    /// TTY agent writes a password prompt straight onto the controlling
+    /// terminal (wrecking the TUI) and reads the password from the same
+    /// TTY the UI reads keystrokes from. `--no-ask-password` makes any
+    /// authorization need a fast failure instead of a prompt.
+    fn scope_argv(&self, argv: &[String]) -> Vec<String> {
+        let mut scope_argv: Vec<String> = vec![
+            "systemd-run".into(),
+            "--user".into(),
+            "--scope".into(),
+            "--no-ask-password".into(),
+            "--quiet".into(),
+            "--collect".into(),
+        ];
+        if let Some(mem) = &self.memory_max {
+            scope_argv.push("-p".into());
+            scope_argv.push(format!("MemoryMax={mem}"));
+        }
+        scope_argv.extend(argv.iter().cloned());
+        scope_argv
     }
 
     /// Run the sandbox with a hard wall-clock timeout and the output
     /// caps. Timeout → kill → `timed_out = true`.
     ///
     /// Resource limits: when systemd is PID 1 we first try a transient
-    /// `systemd-run --scope` (clean MemoryMax accounting). That needs
-    /// polkit authorization, which headless/unprivileged sessions may
-    /// not grant — a denied scope transparently falls back to running
-    /// bwrap directly with an RLIMIT_AS pre-exec cap.
+    /// `systemd-run --user --scope` (clean MemoryMax accounting via the
+    /// user manager's delegated memory controller; no polkit). If the
+    /// scope can't be created (no user manager, no systemd-run), we
+    /// transparently fall back to running bwrap directly with an
+    /// RLIMIT_AS pre-exec cap.
     pub async fn run(&self, timeout: Duration) -> Result<SandboxOutput, String> {
         let mut argv = self.argv();
         // Resolve bwrap to an absolute path: systemd-run (the resource-
@@ -328,22 +443,14 @@ impl Sandbox {
             }
         }
         if self.use_systemd_scope() {
-            let mut scope_argv: Vec<String> = vec![
-                "systemd-run".into(),
-                "--scope".into(),
-                "--quiet".into(),
-                "--collect".into(),
-            ];
-            if let Some(mem) = &self.memory_max {
-                scope_argv.push("-p".into());
-                scope_argv.push(format!("MemoryMax={mem}"));
-            }
-            scope_argv.extend(argv.iter().cloned());
+            let scope_argv = self.scope_argv(&argv);
             let attempt =
                 Self::spawn_and_wait(scope_argv, None, timeout, self.degraded.clone()).await;
             match &attempt {
-                // Denied by polkit → fall through to the rlimit path.
+                // No scope (denied / no manager) or no systemd-run at
+                // all: the command never ran → the rlimit path.
                 Ok(out) if scope_denied(out) => {}
+                Err(_) => {}
                 _ => return attempt,
             }
         }
@@ -354,11 +461,17 @@ impl Sandbox {
         Self::spawn_and_wait(argv, limit, timeout, self.degraded.clone()).await
     }
 
-    /// systemd-run --scope failure signature when polkit denies the
-    /// transient unit (unprivileged/headless sessions).
+    /// systemd-run's own failure to create the scope (authorization
+    /// denied, user manager unreachable). Matched at the START of
+    /// stderr only: in that case systemd-run printed its error and the
+    /// command never ran. A command that ran and merely printed
+    /// "Access denied" must NOT match — the fallback would run it twice.
     fn scope_denied(stderr: &[u8]) -> bool {
         let s = String::from_utf8_lossy(stderr);
-        s.contains("Failed to start transient scope") || s.contains("Access denied")
+        let s = s.trim_start();
+        s.starts_with("Failed to start transient scope")
+            || s.starts_with("Failed to connect to")
+            || s.starts_with("Failed to create bus connection")
     }
 
     async fn spawn_and_wait(
@@ -510,6 +623,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scope_uses_user_manager_and_never_prompts() {
+        // The system manager needs polkit, whose TTY agent scribbles a
+        // password prompt over the TUI: the scope must be a USER scope
+        // and must never ask for a password.
+        let mut sb = Sandbox::new("sh", vec!["-c".into(), "true".into()]);
+        sb.memory_max("512M");
+        let argv = sb.scope_argv(&["/bin/bwrap".into(), "--".into(), "sh".into()]);
+        assert_eq!(
+            &argv[..6],
+            ["systemd-run", "--user", "--scope", "--no-ask-password", "--quiet", "--collect"]
+        );
+        assert!(argv.windows(2).any(|w| w == ["-p", "MemoryMax=512M"]));
+        assert_eq!(&argv[argv.len() - 3..], ["/bin/bwrap", "--", "sh"]);
+    }
+
+    #[test]
+    fn scope_denied_matches_only_systemd_run_failures() {
+        // systemd-run's own errors (the command never ran) fall back...
+        assert!(Sandbox::scope_denied(
+            b"Failed to start transient scope unit: Access denied as the requested \
+              operation requires interactive authentication.\n"
+        ));
+        assert!(Sandbox::scope_denied(
+            b"Failed to connect to user scope bus via local transport: No such file or directory\n"
+        ));
+        // ...but a command that RAN and printed an error must not, or
+        // the fallback would run it a second time.
+        assert!(!Sandbox::scope_denied(b"cat: /root/x: Access denied\n"));
+        assert!(!Sandbox::scope_denied(
+            b"some output\nFailed to start transient scope unit: quoted\n"
+        ));
+    }
+
+    #[test]
     fn argv_is_deterministic_and_golden() {
         let mut sb = Sandbox::new("sh", vec!["-c".into(), "echo hi".into()]);
         sb.create_dev = true;
@@ -532,19 +679,34 @@ mod tests {
             argv,
             vec![
                 "bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-                "--ro-bind", "/nix/store/abc-sh", "/nix/store/abc-sh",
+                // Parent-before-child layering (depth 1 before depth 3).
+                "--tmpfs", "/tmp",
                 "--ro-bind", "/ws", "/ws",
+                "--ro-bind", "/nix/store/abc-sh", "/nix/store/abc-sh",
                 "--dev", "/dev",
                 "--tmpfs", "/dev/shm",
                 "--proc", "/proc",
-                "--tmpfs", "/tmp",
                 "--setenv", "PATH", "/nix/store/abc-sh/bin",
                 "--chdir", "/ws",
                 "--", "sh", "-c", "echo hi",
             ]
         );
-        // Same builder, same argv (mounts keep insertion order).
+        // Same builder, same argv (stable order within a depth).
         assert_eq!(argv, sb.argv());
+    }
+
+    #[test]
+    fn tmpfs_never_hides_a_bind_beneath_it() {
+        // A workspace or LLUNG_RO_BINDS dir under /tmp must be mounted
+        // AFTER the /tmp tmpfs, and an rw subdir after its ro parent.
+        let mut sb = Sandbox::new("sh", vec![]);
+        sb.tmpfs.push("/tmp".into());
+        sb.workspace("/tmp/ws", false);
+        sb.bind_rw("/tmp/ws/experiments", "/tmp/ws/experiments");
+        let argv = sb.argv();
+        let at = |needle: &str| argv.iter().position(|a| a == needle).unwrap();
+        assert!(at("/tmp") < at("/tmp/ws"), "{argv:?}");
+        assert!(at("/tmp/ws") < at("/tmp/ws/experiments"), "{argv:?}");
     }
 
     #[test]
@@ -583,6 +745,13 @@ mod tests {
         if !Path::new("/etc/OpenCL").exists() {
             assert!(argv.windows(2).any(|w| w == ["--setenv", "OCL_ICD_VENDORS"]));
         }
+        // ROCm device discovery needs the sysfs view (kfd topology,
+        // PCI attributes, the dri class symlink). Read-only binds.
+        for sys in ["/sys/devices", "/sys/class"] {
+            if Path::new(sys).exists() {
+                assert!(argv.contains(&sys.to_string()), "sysfs bind missing: {sys}");
+            }
+        }
     }
 
     #[test]
@@ -615,6 +784,95 @@ mod tests {
         assert!(glob_match("card0", "card0"));
         assert!(!glob_match("card0", "card1"));
         assert!(!glob_match("kfd*", "dri"));
+    }
+
+    /// A rw subdir bind shadows the ro workspace mount: writes land in
+    /// the subdir, the rest of the workspace stays read-only.
+    #[tokio::test]
+    async fn smoke_rw_subdir_writable_inside_ro_workspace() {
+        if std::env::var("LLUNG_SANDBOX").as_deref() == Ok("off") {
+            eprintln!("LLUNG_SANDBOX=off; skipping");
+            return;
+        }
+        if closure::which("bwrap").is_none() {
+            eprintln!("bubblewrap not on PATH; skipping");
+            return;
+        }
+        // NOT under /tmp: baseline mounts a fresh tmpfs over /tmp,
+        // which would shadow these binds (see the argv() note).
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "llung-bwrap-rwsub-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let sub = dir.join("experiments");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut sb = Sandbox::baseline(
+            "sh",
+            vec!["-c".into(), "touch experiments/marker && echo sub-ok".into()],
+        );
+        sb.workspace(&dir, false);
+        sb.bind_rw(&sub, &sub);
+        let out = sb.run(Duration::from_secs(10)).await.expect("sandbox run");
+        assert_eq!(out.exit_code, Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(sub.join("marker").exists(), "rw bind must write through to the host");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `bind_binary_optional` is strictly best-effort: a missing name
+    /// adds no mounts and reports no error (unlike `bind_binary`).
+    #[test]
+    fn bind_binary_optional_is_silent_about_missing_names() {
+        let mut sb = Sandbox::new("sh", vec![]);
+        sb.env.push(("PATH".into(), "/nonexistent".into()));
+        let before = sb.mounts.len();
+        sb.bind_binary_optional("definitely-not-a-real-binary-xyz");
+        assert_eq!(sb.mounts.len(), before, "nothing bound, nothing broken");
+    }
+
+    /// Optional companions (uv, git) actually run inside the sandbox —
+    /// that is the agent's dependency-management and backup path.
+    #[tokio::test]
+    async fn smoke_uv_and_git_run_in_the_sandbox() {
+        if std::env::var("LLUNG_SANDBOX").as_deref() == Ok("off") {
+            eprintln!("LLUNG_SANDBOX=off; skipping");
+            return;
+        }
+        if closure::which("bwrap").is_none()
+            || closure::which("uv").is_none()
+            || closure::which("git").is_none()
+        {
+            eprintln!("bwrap/uv/git not on PATH; skipping");
+            return;
+        }
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("llung-bwrap-tools-{}-{}", std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sb = Sandbox::baseline(
+            "sh",
+            vec!["-c".into(), "uv --version && git --version && echo tools-ok".into()],
+        );
+        sb.workspace(&dir, false);
+        let out = sb.run(Duration::from_secs(30)).await.expect("sandbox run");
+        assert_eq!(out.exit_code, Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("tools-ok"),
+            "uv+git must resolve on the sandbox PATH: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end smoke test: real bwrap running a real command. Skips

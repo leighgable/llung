@@ -22,7 +22,7 @@ pub struct PermissionRequest {
     /// Who is asking (agent display name + being id).
     pub agent_name: String,
     pub agent_id: String,
-    /// The manifest's target_effect (e.g. "proc:bash", "gpu:futhark").
+    /// The manifest's target_effect (e.g. "proc:bash", "gpu:torch").
     pub effect: String,
     pub tier: Tier,
     /// Short human-readable summary of the arguments (see
@@ -95,6 +95,13 @@ pub fn summarize_arguments(effect: &crate::effects::Effect<'_>, arguments: &[u8]
                 .map(|b| format!("(backend={b})"))
                 .unwrap_or_default()
         ),
+        // Host effects don't prompt today, but keep the summary useful
+        // for receipts/logs: name the file being published.
+        Tier::Host => json
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| format!("{} {p}", effect.name))
+            .unwrap_or_else(|| truncate(&args, 120)),
         _ => truncate(&args, 120),
     }
 }

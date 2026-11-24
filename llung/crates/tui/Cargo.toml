@@ -24,6 +24,7 @@ rand = "0.10.3"
 rand_core = "0.10.1"
 shellexpand = "3.1.2"
 base64 = "0.22"
+dirs.workspace = true
 
 [dev-dependencies]
 # End-to-end tests render real tool output (host build of the wasm tool's logic).

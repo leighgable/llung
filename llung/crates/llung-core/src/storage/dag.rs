@@ -415,6 +415,7 @@ mod tests {
             sender_name: "peer".to_string(),
             parent_id: parent.map(|p| p.to_string()),
             kind: MessageKind::Human,
+            attachment: None,
             content: content.to_string(),
             timestamp: 0,
         }

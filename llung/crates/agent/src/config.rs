@@ -3,7 +3,9 @@
 /// OpenAI-compatible endpoint, API key from `llung_core::secrets`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
-    /// llama.cpp's llama-server hosting SmolVLM Q4 on port 9931.
+    /// llama.cpp's llama-server on the pinned sensenova-loop fork,
+    /// serving SenseNova U1.5 8B (vision-capable via --mmproj) on port
+    /// 9931. Model id is auto-discovered from `/v1/models` at spawn.
     LlamaCpp,
     /// Lemonade server (OpenAI-compatible) on port 13305.
     Lemonade,
@@ -93,7 +95,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "SmolVLM".into(),
+            model: crate::interface::LLAMA_FALLBACK_MODEL.into(),
             name: "llung-agent".into(),
             // No explicit override: `backend` picks the endpoint
             // (llama.cpp llama-server :9931 by default).

@@ -6,10 +6,23 @@ readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
 dependencies = [
+    "hypothesis>=6.143",
+    "matplotlib>=3.10",
+    "numpy>=2.5.5",
+    "pytest>=9.0",
+    "pyyaml>=6.0.4",
+    "tbparse>=0.0.9",
+    "tensorboard>=2.21.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
 ]
 
+[tool.pytest.ini_options]
+# The trainer's test-suite lives with the harness it tests.
+testpaths = ["experiments/core/tests"]
+
 [project.optional-dependencies]
-test = ["mypy", "nox", "pytest", "ruff"]
+test = ["mypy", "nox", "ruff"]
 
 # select = [
 #  "AIR",   ## Airflow

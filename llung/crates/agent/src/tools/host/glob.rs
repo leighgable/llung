@@ -28,7 +28,12 @@ pub fn run(arguments_json: &str) -> Result<String, String> {
     }
     let root = args.path.as_deref().unwrap_or(".");
     let root = shellexpand::tilde(root).to_string();
-    let root_path = PathBuf::from(root.as_ref() as &str);
+    // Absolute root, so every result is an absolute path the model can
+    // hand straight to another tool. (Relative results were relative to
+    // `path`, and the model re-used them against the workspace instead
+    // — "data/flights.csv" under ~/Code became a miss under the repo.)
+    let root_path = std::path::absolute(PathBuf::from(root.as_ref() as &str))
+        .map_err(|e| format!("glob: bad path '{root}': {e}"))?;
     if !root_path.is_dir() {
         return Err(format!("glob: '{}' is not a directory", root_path.display()));
     }
@@ -60,7 +65,7 @@ pub fn run(arguments_json: &str) -> Result<String, String> {
                 truncated = true;
                 break;
             }
-            out.push_str(&rel.to_string_lossy());
+            out.push_str(&entry.path().to_string_lossy());
             out.push('\n');
         }
     }
@@ -123,6 +128,12 @@ mod tests {
 
         let out = glob_in(&dir.0, "**/*.rs").unwrap();
         assert!(out.contains("src/main.rs"), "got: {out}");
+        // Absolute paths: usable verbatim by the next tool call,
+        // whatever `path` the search was rooted at.
+        for line in out.lines() {
+            assert!(std::path::Path::new(line).is_absolute(), "relative result: {line}");
+            assert!(std::path::Path::new(line).is_file(), "not a real file: {line}");
+        }
         assert!(out.contains("src/lib/util.rs"), "got: {out}");
         assert!(!out.contains("util.py"), "got: {out}");
         assert!(!out.contains("README.md"), "got: {out}");

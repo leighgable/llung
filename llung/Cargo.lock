@@ -57,6 +57,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "agent-rt",
+ "base64",
  "bincode",
  "ed25519-dalek",
  "globset",
@@ -6380,6 +6381,7 @@ dependencies = [
  "base64",
  "chrono",
  "crossterm",
+ "dirs 5.0.1",
  "futures",
  "image",
  "landscape-tool",

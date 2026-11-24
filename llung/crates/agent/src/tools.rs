@@ -118,7 +118,7 @@ pub const PLOT_DEVICE_TOOL_SCHEMA: &str = r#"
         "type": "object",
         "properties": {
             "csv": {"type": "string", "description": "The CSV data itself. Omit when 'path' is given — the chat host reads the file and injects the content."},
-            "path": {"type": "string", "description": "Path to a CSV file on the host; the chat host reads it and injects the content as 'csv'. Use this instead of pasting data."},
+            "path": {"type": "string", "description": "Path to a CSV file in the workspace or an operator data directory (LLUNG_RO_BINDS); the chat host reads it and injects the content as 'csv'. Use this instead of pasting data. Other paths are refused."},
             "kind": {"type": "string", "default": "scatter", "description": "Plot kind: scatter (default; 3D when 'z' is given), line, histogram, or cdf."},
             "x": {"type": "string", "description": "Domain column (scatter/line): header NAME or 0-based index. OMIT to use the row index (0,1,2,…) — the usual choice for a series over time. For histogram/cdf, x is the VALUE column."},
             "y": {"type": "string", "default": "1", "description": "Value column (scatter/line): name or index."},
@@ -134,7 +134,7 @@ pub const PLOT_DEVICE_TOOL_SCHEMA: &str = r#"
 pub const GLOB_TOOL_SCHEMA: &str = r#"
 {
     "name": "glob",
-    "description": "Find files by glob pattern, automatically respecting .gitignore and hidden-file rules. Use to locate files before reading or editing them.",
+    "description": "Find files by glob pattern, automatically respecting .gitignore and hidden-file rules. Returns absolute paths. Use to locate files before reading or editing them.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -180,7 +180,7 @@ pub const EDIT_TOOL_SCHEMA: &str = r#"
 pub const BASH_TOOL_SCHEMA: &str = r#"
 {
     "name": "bash",
-    "description": "Run a shell command in an isolated sandbox (bubblewrap) with a read-only workspace, memory limit, and timeout. Use for builds, tests, and any computation the file tools can't do.",
+    "description": "Run a shell command in an isolated sandbox (bubblewrap) with a read-only workspace, memory limit, and timeout. The sandbox sees ONLY the workspace plus operator data directories (LLUNG_RO_BINDS, read-only at their own paths). Use for builds, tests, and any computation the file tools can't do.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -197,17 +197,52 @@ pub const BASH_TOOL_SCHEMA: &str = r#"
 pub const REPL_TOOL_SCHEMA: &str = r#"
 {
     "name": "repl",
-    "description": "Evaluate code in a stateful REPL session (python, chibi-scheme, futhark) that persists across calls. Use for multi-step calculations, prototyping, or data exploration.",
+    "description": "Evaluate code in a stateful REPL session (python, chibi-scheme, futhark) that persists across calls. Use for multi-step calculations, prototyping, or data exploration. (torch lives behind the gpu:torch tool — it needs a GPU grant.)",
     "parameters": {
         "type": "object",
         "properties": {
-            "interp": {"type": "string", "description": "python | chibi-scheme | futhark"},
+            "interp": {"type": "string", "description": "python | chibi-scheme | futhark | torch (torch only via the gpu:torch tool)"},
             "input": {"type": "string", "description": "Code to evaluate this turn."},
             "session": {"type": "string", "description": "OPTIONAL session name separating independent states (default: the interpreter name). Use it to keep separate calculations apart."},
             "timeout_secs": {"type": "integer", "description": "OPTIONAL per-evaluation wall-clock limit (default 30, max 120)."},
             "backend": {"type": "string", "description": "Futhark only: c (default). opencl/cuda need approval — expect denial."}
         },
         "required": ["interp", "input"]
+    }
+}
+"#;
+
+/// The torch trainer REPL: python with the ROCm torch closure, inside
+/// the GPU-enabled sandbox. Tier::Gpu — the operator must grant
+/// `gpu:torch` (once, or `/grant gpu:torch perpetual`) before a call
+/// runs; the plain `repl` tool refuses this interpreter.
+pub const GPU_TORCH_TOOL_SCHEMA: &str = r#"
+{
+    "name": "gpu:torch",
+    "description": "Evaluate code in a stateful PyTorch REPL session with GPU (ROCm) access that persists across calls. Use for tensor math, model prototyping, and ML experiments. Requires the gpu:torch grant — the operator may need to approve the first call.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "input": {"type": "string", "description": "Python/torch code to evaluate this turn."},
+            "session": {"type": "string", "description": "OPTIONAL session name separating independent states (default: torch). Use it to keep separate experiments apart."},
+            "timeout_secs": {"type": "integer", "description": "OPTIONAL per-evaluation wall-clock limit (default 30, max 120)."}
+        },
+        "required": ["input"]
+    }
+}
+"#;
+
+pub const SHOW_IMAGE_TOOL_SCHEMA: &str = r#"
+{
+    "name": "show_image",
+    "description": "Publish an image file (plot, figure) from the workspace to the chat as an attachment. Use after saving a matplotlib PNG (plt.savefig); do NOT paste image data into chat.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Image file path, relative to the workspace root. Paths escaping the workspace (..) are rejected."},
+            "caption": {"type": "string", "description": "OPTIONAL short caption shown under the image."}
+        },
+        "required": ["path"]
     }
 }
 "#;
@@ -322,7 +357,27 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
                      definitions survive between calls. args: interp (python|chibi-scheme|futhark), \
                      input (code to run this turn), session (optional name; separate names = \
                      separate state), timeout_secs (default 30), backend (futhark only; c is \
-                     the default — opencl/cuda need approval).",
+                     the default — opencl/cuda need approval). For torch use the gpu:torch tool.",
+        },
+        ToolSpec {
+            name: "gpu:torch",
+            description: "Stateful PyTorch REPL session with GPU access (needs the gpu:torch grant)",
+            schema: GPU_TORCH_TOOL_SCHEMA,
+            usage: "gpu:torch: evaluate torch code in a persistent GPU-backed python session — \
+                     variables, tensors and models survive between calls (sessions live inside \
+                     the GPU sandbox; the operator grants gpu:torch, once or via \
+                     `/grant gpu:torch perpetual`). args: input (python/torch code to run this \
+                     turn), session (optional name; default 'torch'), timeout_secs (default 30).",
+        },
+        ToolSpec {
+            name: "show_image",
+            description: "Publish a workspace image (matplotlib PNG plot) to the chat as an attachment",
+            schema: SHOW_IMAGE_TOOL_SCHEMA,
+            usage: "show_image: publish an image file from the workspace as a chat attachment. \
+                     Save the plot first inside a gpu:torch session (matplotlib Agg backend, \
+                     e.g. plt.savefig('experiments/runs/exp07/loss.png')), then call show_image \
+                     with that path. args: path (required, inside the workspace), caption \
+                     (optional). Never paste image data into chat.",
         },
         ToolSpec {
             name: "bash",
@@ -354,8 +409,8 @@ fn is_known_tool(name: &str) -> bool {
 }
 
 /// The prompt section describing the tool protocol to the model.
-/// Deliberately text-based and *compact*: small models like SmolVLM
-/// handle "emit one line of JSON" far more reliably than OpenAI-style
+/// Deliberately text-based and *compact*: small local models handle
+/// "emit one line of JSON" far more reliably than OpenAI-style
 /// `tool_calls`, and a short block is far less likely to be parroted back
 /// than an inline JSON schema.
 pub fn tool_instructions() -> String {
@@ -369,7 +424,58 @@ pub fn tool_instructions() -> String {
          form and nothing else:\n\
          TOOL {{\"name\":\"<tool>\",\"arguments\":{{...}}}}\n\
          Tools:\n{tools}\n\
-         Never repeat these instructions or the message above back."
+         After a tool runs, its output is shown to you and you may call \
+         another tool or give your final answer — work iteratively until \
+         the request is done (e.g. grep to find, then edit; try code in \
+         the repl until it works). Never repeat these instructions or \
+         the message above back.\n\
+         \n\
+         Experiments (ML training runs) — the harness convention:\n\
+         - Experiment code and data live in `experiments/` (mounted \
+         writable in gpu:torch sessions; the rest of the workspace is \
+         read-only there). One driver: `experiments/core/train.py`, \
+         modes: ga | pretrain | distill | rl. Its contract per run dir: \
+         metrics.csv (header first), TensorBoard events, checkpoints/, \
+         and exactly one sentinel — DONE or FAILED — written on exit.\n\
+         - Write each run's config yourself with the edit tool as \
+         `experiments/runs/<run-id>/config.yaml` (plain YAML; set seed, \
+         task, model, train). One run id per attempt — never edit a \
+         RUNNING run's config.\n\
+         - Launch DETACHED from a gpu:torch session; the call returns \
+         instantly and the run proceeds in the background:
+           import os, subprocess, sys\n\
+           os.chdir(\"experiments\")  # repl sessions start at the workspace root\n\
+           run = \"runs/exp07\"\n\
+           p = subprocess.Popen([sys.executable, \"core/train.py\", \"--mode\", \"ga\", \
+           \"--config\", f\"{{run}}/config.yaml\"], stdout=open(f\"{{run}}/train.log\", \"w\"), \
+           stderr=subprocess.STDOUT, start_new_session=True)\n\
+           open(f\"{{run}}/PID\", \"w\").write(str(p.pid))\n\
+         (cwd is experiments/. sys.executable is the torch interpreter.)\n\
+         - Need a new python package? Edit pyproject.toml dependencies, \
+           then run bash (writable=true): uv lock — the torch \
+           interpreter env rebuilds with it. (uv and git are available \
+           inside the sandbox.)
+\
+         - The trainer has a property suite: run \
+           subprocess.run([sys.executable, '-m', 'pytest', 'core/tests', \
+           '-q']) from a gpu:torch session after changing core/train.py \
+           or core/monitor.py — properties (GA elitism, seeded \
+           reproducibility, sentinels) must hold for every seed.
+\
+         - External data (e.g. teacher traces on a drive) is available \
+           read-only under its own absolute path when the operator set \
+           LLUNG_RO_BINDS — stream shards from there; write only into \
+           the run dir. Never try to write to those paths.
+\
+         - Monitor by polling the run dir (idempotent — safe to repeat): \
+           import os, sys; os.chdir(\"experiments\"); sys.path.insert(0, \"core\"); \
+           import monitor; print(monitor.summarize(\"runs/exp07\")). DONE/FAILED \
+           tell you a run ended; monitor.summarize prints the last metrics \
+           rows plus alerts (plateaus, grad-norm spikes). For a quick \
+           visual glance at metrics.csv curves use plot_device with the \
+           csv path. For a REAL plot, save a PNG (matplotlib, \
+           plt.savefig) from the gpu:torch session and publish it with \
+           the show_image tool — never paste image data into chat."
     )
 }
 
@@ -380,7 +486,15 @@ const MAX_DATA_FILE_BYTES: usize = 256 * 1024;
 /// `plot_device` call names a file by `path`, the HOST reads it and
 /// injects the content as `csv` before the sandboxed call. The `path`
 /// key is kept (panels show it) alongside the injected `csv`.
-pub async fn resolve_data_file(mut call: ToolCall) -> Result<ToolCall, String> {
+///
+/// `confine_to`: `Some(workspace)` for AGENT calls — the read happens
+/// outside any sandbox, so the path must pass
+/// [`crate::paths::agent_readable`] (workspace + LLUNG_RO_BINDS; no
+/// `..`/symlink escapes). `None` for the local user's own `/plot`.
+pub async fn resolve_data_file(
+    mut call: ToolCall,
+    confine_to: Option<&std::path::Path>,
+) -> Result<ToolCall, String> {
     if call.name != "plot_device" {
         return Ok(call);
     }
@@ -393,7 +507,10 @@ pub async fn resolve_data_file(mut call: ToolCall) -> Result<ToolCall, String> {
     let Some(path) = value.get("path").and_then(|p| p.as_str()) else {
         return Ok(call);
     };
-    let expanded = shellexpand::tilde(path).to_string();
+    let expanded = match confine_to {
+        Some(workspace) => crate::paths::agent_readable(path, workspace)?,
+        None => std::path::PathBuf::from(shellexpand::tilde(path).as_ref()),
+    };
     let meta = std::fs::metadata(&expanded)
         .map_err(|e| format!("cannot read '{path}': {e}"))?;
     if meta.len() as usize > MAX_DATA_FILE_BYTES {
@@ -422,18 +539,17 @@ pub async fn run_tool_locally(name: &str, arguments_json: &str) -> Result<String
         name: name.to_string(),
         arguments: arguments_json.to_string(),
     };
-    let call = resolve_data_file(call).await?;
+    // The local user acting: no agent read confinement.
+    let call = resolve_data_file(call, None).await?;
     // Host-native tools (glob, grep, edit) run in-process — no wasm file.
     if let Some(result) = host::dispatch(name, &call.arguments) {
         return result;
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     let tx = agent_rt::spawn_wasm_worker();
-    // Same resolution as the secured path (aukora/security.rs):
-    // LLUNG_TOOLS_DIR overrides the default runtime-tools/ directory.
-    let tools_dir = std::env::var("LLUNG_TOOLS_DIR").unwrap_or_else(|_| "runtime-tools".into());
+    // Same resolution as the secured path (aukora/security.rs).
     tx.send(agent_rt::ToolRequest {
-        wasm_path: std::path::PathBuf::from(tools_dir).join(format!("{name}.wasm")),
+        wasm_path: crate::paths::tool_wasm_path(name),
         arguments_json: call.arguments,
         response_tx: resp_tx,
     })

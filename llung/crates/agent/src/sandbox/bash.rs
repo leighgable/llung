@@ -52,6 +52,13 @@ fn parse_args(arguments_json: &str) -> Result<BashArgs, String> {
 }
 
 pub async fn run(arguments_json: &str) -> Result<String, String> {
+    run_with_binds(arguments_json, &crate::paths::ro_binds()).await
+}
+
+/// [`run`] with the read-only data binds passed in (tests inject them
+/// instead of mutating the process-global LLUNG_RO_BINDS, which every
+/// concurrently spawning sandbox test would also see).
+async fn run_with_binds(arguments_json: &str, ro_binds: &[PathBuf]) -> Result<String, String> {
     let args = parse_args(arguments_json)?;
     let timeout_secs = args
         .timeout_secs
@@ -70,6 +77,12 @@ pub async fn run(arguments_json: &str) -> Result<String, String> {
 
     let mut sb = Sandbox::baseline("sh", vec!["-c".into(), args.cmd.clone()]);
     sb.workspace(&workspace, writable);
+    // Operator data roots (LLUNG_RO_BINDS, e.g. ~/Code/data): visible
+    // read-only at their own paths — same set the repl sessions and
+    // plot_device's host-side reader accept.
+    for dir in ro_binds {
+        sb.bind_ro(dir, dir);
+    }
     sb.memory_max(format!("{memory_mb}M"));
     let out = sb.run(Duration::from_secs(timeout_secs)).await?;
 
@@ -182,6 +195,30 @@ mod tests {
     async fn bash(cmd: &str) -> Result<String, String> {
         let args = serde_json::json!({"cmd": cmd, "timeout_secs": 10}).to_string();
         run(&args).await
+    }
+
+    /// LLUNG_RO_BINDS directories (operator data outside the
+    /// workspace, e.g. ~/Code/data) are visible read-only at their own
+    /// path. Binds injected directly: no env mutation, no cross-test
+    /// interference. The dir lives under /tmp ON PURPOSE — the sandbox's
+    /// /tmp tmpfs must not hide it (mount layering in `argv`).
+    #[tokio::test]
+    async fn ro_binds_are_readable_but_not_writable() {
+        if skip_without_bwrap() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("llung-bash-robind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("flights.csv"), "month,passengers\n1949-01,112\n").unwrap();
+        let binds = vec![dir.clone()];
+        let args = |cmd: String| serde_json::json!({"cmd": cmd, "timeout_secs": 10}).to_string();
+        let read = run_with_binds(&args(format!("head -2 {}/flights.csv", dir.display())), &binds).await;
+        let write = run_with_binds(&args(format!("echo x > {}/new.txt", dir.display())), &binds).await;
+        std::fs::remove_dir_all(&dir).ok();
+
+        let read = read.expect("bound data is readable");
+        assert!(read.contains("1949-01,112"), "got: {read}");
+        assert!(write.is_err(), "bound data must be read-only: {write:?}");
     }
 
     #[tokio::test]

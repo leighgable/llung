@@ -15,6 +15,7 @@ use tracing_subscriber;
 mod app;
 mod avatar;
 mod chat_panel;
+mod completion;
 mod events;
 mod input;
 mod md;
@@ -118,12 +119,44 @@ fn initial_theme(cli_theme: Option<String>) -> Result<ThemeStartup, String> {
     Ok(ThemeStartup { theme, selection, settings, notices })
 }
 
+/// Where the log goes — a per-user location, never the launch
+/// directory (which may be any project, or read-only like `/`):
+///
+/// * `LLUNG_LOG_FILE` overrides.
+/// * Linux/BSD: `$XDG_STATE_HOME/llung/llung.log` (~/.local/state/…).
+/// * macOS: `~/Library/Logs/llung/llung.log`.
+/// * Elsewhere: the local data dir, else the temp dir.
+fn log_file_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("LLUNG_LOG_FILE").filter(|p| !p.is_empty()) {
+        return std::path::PathBuf::from(p);
+    }
+    let dir = if cfg!(target_os = "macos") {
+        dirs::home_dir().map(|h| h.join("Library/Logs"))
+    } else {
+        dirs::state_dir().or_else(dirs::data_local_dir)
+    }
+    .unwrap_or_else(std::env::temp_dir);
+    dir.join("llung").join("llung.log")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::fs::File::create("llung.log").unwrap())
-        .with_ansi(false)
-        .try_init();
+    // Logging is best-effort: an unwritable log location must never
+    // stop the app from starting (it used to `unwrap()` a file in the
+    // launch directory).
+    let log_path = log_file_path();
+    if let Some(dir) = log_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(file) = std::fs::File::create(&log_path) {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(file)
+            .with_ansi(false)
+            .try_init();
+    }
+    // Where the agents' wasm tools resolve (env, next to the exe, or the
+    // source tree): the first thing to check when a tool won't load.
+    tracing::info!(tools_dir = %agent::paths::tools_dir().display(), "wasm tools");
 
     let cli = match parse_args() {
         Ok(cli) => cli,
@@ -158,6 +191,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Enter the TUI; everything from here is styled ──
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // CSI u key reporting where supported: makes Shift+Enter distinct
+    // from Enter (multi-line messages); cleanup_sequence pops it.
+    terminal::push_keyboard_enhancement();
     let result = run_tui(db_path, theme).await;
 
     // ── Cleanup (also after errors) ──

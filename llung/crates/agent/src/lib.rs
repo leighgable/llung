@@ -4,6 +4,7 @@ pub mod effects;
 pub mod history;
 pub mod interface;
 pub mod orchestrator;
+pub mod paths;
 pub mod permissions;
 pub mod sandbox;
 pub mod tools;

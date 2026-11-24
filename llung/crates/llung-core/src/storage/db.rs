@@ -630,6 +630,10 @@ impl Database {
                 sender_id: row.get(3)?,
                 sender_name: row.get(4)?,
                 content: row.get(5)?,
+                // The attachment is not its own column: Media-kind
+                // payloads round-trip via `kind`, and `image_attachment`
+                // falls back to them after a reload.
+                attachment: None,
                 timestamp: row.get::<_, i64>(6)? as u64,
                 kind: row.get(7)?,
             })
@@ -655,6 +659,10 @@ impl Database {
                 sender_id: row.get(3)?,
                 sender_name: row.get(4)?,
                 content: row.get(5)?,
+                // The attachment is not its own column: Media-kind
+                // payloads round-trip via `kind`, and `image_attachment`
+                // falls back to them after a reload.
+                attachment: None,
                 timestamp: row.get::<_, i64>(6)? as u64,
                 kind: row.get(7)?,
             })
@@ -678,6 +686,8 @@ impl Database {
             sender_name: row.get(3)?,
             parent_id: row.get(4)?,
             content: row.get(5)?,
+            // See load_all_messages: attachments reload via the kind column.
+            attachment: None,
             timestamp: row.get::<_, i64>(6)? as u64,
             kind: row.get(7)?,
         })

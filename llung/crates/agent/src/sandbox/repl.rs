@@ -3,7 +3,9 @@
 // Stateful REPL tool (SANDBOXES.md): long-running interpreters spawned
 // INSIDE the Phase 3 bubblewrap sandbox, with stdin/stdout piped across
 // turns. One session per (agent, session-name) keeps its variables and
-// definitions between tool calls.
+// definitions between tool calls. Interpreters: python, chibi-scheme,
+// futhark, and torch (the fat ROCm torch closure, GPU sandbox, only via
+// the gpu:torch effect).
 //
 // Turn delimiters: interactive interpreters don't exit after a command,
 // so the harness must know when output finished. After every input we
@@ -64,6 +66,25 @@ pub enum Interp {
     Python,
     Chibi,
     Futhark,
+    /// The torch trainer interpreter: python with the fat ROCm torch
+    /// closure bound. Always spawned in the GPU-enabled sandbox and
+    /// reachable only through the `gpu:torch` effect.
+    Torch,
+}
+
+/// Pre-resolve every interpreter's toolchain closure (the same
+/// `which` + `store_closure` lookups `ReplSession::spawn` does) so the
+/// first session start skips them. Starts no process: this is lookup
+/// only, so it needs no grant — not even for the `gpu:torch` closure.
+/// Missing interpreters and non-Nix hosts are skipped silently.
+pub(crate) fn warm_closures() {
+    for interp in [Interp::Python, Interp::Chibi, Interp::Futhark, Interp::Torch] {
+        for dep in interp.deps() {
+            if let Some(path) = closure::which(dep) {
+                let _ = closure::store_closure(&path);
+            }
+        }
+    }
 }
 
 impl Interp {
@@ -72,8 +93,9 @@ impl Interp {
             "python" | "python3" => Ok(Interp::Python),
             "chibi" | "chibi-scheme" => Ok(Interp::Chibi),
             "futhark" => Ok(Interp::Futhark),
+            "torch" | "pytorch" | "python-torch" => Ok(Interp::Torch),
             other => Err(format!(
-                "repl: unknown interpreter '{other}' (python | chibi-scheme | futhark)"
+                "repl: unknown interpreter '{other}' (python | chibi-scheme | futhark | torch)"
             )),
         }
     }
@@ -83,16 +105,23 @@ impl Interp {
             Interp::Python => "python",
             Interp::Chibi => "chibi",
             Interp::Futhark => "futhark",
+            Interp::Torch => "torch",
         }
     }
 
     /// Host binaries whose store closure the sandbox needs. Futhark's
-    /// c backend shells out to `cc` at run time.
+    /// c backend shells out to `cc` at run time; Triton compiles its
+    /// runtime shims with `gcc` AT KERNEL-LAUNCH TIME (not a build dep
+    /// of the python env, so it must be bound explicitly); torch
+    /// resolves to the dedicated `torch-python` wrapper (flake:
+    /// torch-interp) so the lean `python3` keeps meaning the plain
+    /// python closure.
     fn deps(&self) -> &'static [&'static str] {
         match self {
             Interp::Python => &["python3"],
             Interp::Chibi => &["chibi-scheme"],
             Interp::Futhark => &["futhark", "cc"],
+            Interp::Torch => &["torch-python", "gcc"],
         }
     }
 
@@ -108,6 +137,7 @@ impl Interp {
                     deps: self.deps(),
                     gpu,
                     extra_ro_binds: empty.clone(),
+                    rw_subdirs: Vec::new(),
                 }
             };
         match self {
@@ -140,8 +170,32 @@ impl Interp {
                     backend != Backend::C,
                 ))
             }
+            Interp::Torch => {
+                // Same sentinel protocol as python — it IS python,
+                // just the fat torch closure with the GPU sandbox
+                // always on. Reached via the gpu:torch effect; the
+                // plain repl tool refuses this interpreter. The
+                // trainer writes experiment runs under experiments/,
+                // mounted read-write over the ro workspace.
+                let _ = backend;
+                let mut cfg = base(
+                    SentinelStyle::Print,
+                    PromptStyle::None,
+                    "torch-python",
+                    vec!["-i".into(), "-q".into(), "-B".into()],
+                    true,
+                );
+                cfg.rw_subdirs = vec!["experiments".into()];
+                Ok(cfg)
+            }
         }
     }
+}
+
+/// LLUNG_RO_BINDS (see [`crate::paths::ro_binds`]): each existing
+/// entry bound read-only under its own path.
+fn extra_ro_binds_from_env() -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    crate::paths::ro_binds().into_iter().map(|p| (p.clone(), p)).collect()
 }
 
 /// How the sentinel expression is injected after each input.
@@ -229,6 +283,10 @@ pub struct SessionConfig {
     /// Extra read-only binds, e.g. a test script living outside the
     /// workspace. Real interpreter configs leave this empty.
     pub extra_ro_binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Workspace subdirectories mounted READ-WRITE over the ro
+    /// workspace mount (the torch trainer's `experiments/`). Created
+    /// if missing at spawn time.
+    pub rw_subdirs: Vec<std::path::PathBuf>,
 }
 
 impl SessionConfig {
@@ -240,7 +298,7 @@ impl SessionConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ReplArgs {
-    /// python | chibi-scheme | futhark
+    /// python | chibi-scheme | futhark | torch (torch only via gpu:torch)
     pub interp: String,
     /// Code to evaluate this turn.
     pub input: String,
@@ -364,12 +422,38 @@ impl ReplSession {
             .or_else(|_| std::env::current_dir())
             .map_err(|e| format!("repl: cannot resolve workspace: {e}"))?;
         sb.workspace(&workspace, false);
+        // Bind-mount rw_subdirs AFTER the ro workspace mount: bwrap
+        // applies mounts in order, so the later rw bind of the subdir
+        // shadows the ro parent (same shadowing rule as tmpfs /tmp).
+        for sub in &config.rw_subdirs {
+            let path = workspace.join(sub);
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                return Err(format!(
+                    "repl: cannot create rw mount '{}' in the workspace: {e}",
+                    path.display()
+                ));
+            }
+            sb.bind_rw(&path, &path);
+        }
+        // Operator-level extra read-only binds (LLUNG_RO_BINDS): data
+        // that is too big for the workspace — e.g. TBs of precomputed
+        // teacher traces on an external drive. Same absolute path
+        // inside the sandbox, read at native bind-mount speed, never
+        // writable. Nonexistent entries are skipped.
+        for (src, dest) in extra_ro_binds_from_env() {
+            sb.bind_ro(src, dest);
+        }
         if config.gpu {
             sb.enable_gpu();
             // GPU drivers live outside the store closure; propagate the
-            // host's library path (set by the devShell shellHook).
+            // host's library path and ROCm overrides (set by the
+            // devShell shellHook — e.g. HSA_OVERRIDE_GFX_VERSION for
+            // the gfx1150 iGPU).
             if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
                 sb.setenv("LD_LIBRARY_PATH", ld);
+            }
+            if let Ok(hsa) = std::env::var("HSA_OVERRIDE_GFX_VERSION") {
+                sb.setenv("HSA_OVERRIDE_GFX_VERSION", hsa);
             }
         }
         let mut child = sb.spawn_piped().await?;
@@ -636,15 +720,23 @@ fn config_default_session(config: &SessionConfig) -> String {
         "python3" => "python".into(),
         "chibi-scheme" => "chibi".into(),
         "futhark" => "futhark".into(),
+        "torch-python" => "torch".into(),
         other => other.into(),
     }
 }
 
 /// Tier::Repl executor: the `repl` tool (python, chibi-scheme, futhark
-/// c backend). Non-c futhark backends are refused here — they require
-/// the `gpu:futhark` effect.
+/// c backend). Non-c futhark backends and the torch interpreter are
+/// refused here — they require the `gpu:futhark` / `gpu:torch` effects.
 pub async fn run(agent: &str, arguments_json: &str) -> Result<String, String> {
     let (interp, backend, args) = parse_args(arguments_json)?;
+    if interp == Interp::Torch {
+        return Err(
+            "repl: interp 'torch' runs in the GPU sandbox and requires the gpu:torch effect — \
+             call TOOL {\"name\":\"gpu:torch\",\"arguments\":{...}} instead"
+                .into(),
+        );
+    }
     if backend != Backend::C {
         return Err(format!(
             "repl: futhark backend '{}' requires the gpu:futhark grant — Phase 5 wires the prompt",
@@ -663,9 +755,10 @@ pub async fn run(agent: &str, arguments_json: &str) -> Result<String, String> {
         .await
 }
 
-/// Tier::Gpu executor (currently only `gpu:futhark`): futhark repl with
-/// the opencl backend inside the GPU-enabled sandbox. Phase 5 adds the
-/// human grant prompt on top of the kernel check.
+/// Tier::Gpu executor (`gpu:futhark`, `gpu:torch`): futhark repl with
+/// the opencl backend, or the torch trainer interpreter — both inside
+/// the GPU-enabled sandbox. The human grant prompt sits in the
+/// orchestrator (Phase 5), on top of the kernel check.
 pub async fn run_gpu(agent: &str, effect_name: &str, arguments_json: &str) -> Result<String, String> {
     match effect_name {
         "futhark" => {
@@ -681,8 +774,20 @@ pub async fn run_gpu(agent: &str, effect_name: &str, arguments_json: &str) -> Re
                 .evaluate(agent, &config, &args)
                 .await
         }
+        "torch" => {
+            let (interp, _backend, args) = parse_args(arguments_json)?;
+            if interp != Interp::Torch {
+                return Err("gpu:torch expects args for interp='torch'".into());
+            }
+            let config = SessionConfig::for_interp(Interp::Torch, Backend::C)?;
+            manager()
+                .lock()
+                .await
+                .evaluate(agent, &config, &args)
+                .await
+        }
         other => Err(format!(
-            "gpu:{other} has no executor (only gpu:futhark, opencl backend)"
+            "gpu:{other} has no executor (gpu:futhark opencl, gpu:torch)"
         )),
     }
 }
@@ -737,6 +842,7 @@ done
             deps: &[],
             gpu: false,
             extra_ro_binds: vec![(script.to_path_buf(), in_sandbox)],
+            rw_subdirs: Vec::new(),
         }
     }
 
@@ -934,8 +1040,8 @@ done
         manager().lock().await.kill_session("test-futhark:futhark").await;
     }
 
-    #[test]
-    fn arg_parsing_and_unknown_names() {
+    #[tokio::test]
+    async fn arg_parsing_and_unknown_names() {
         let (interp, backend, args) = parse_args(
             &serde_json::json!({"interp": "futhark", "input": "1", "backend": "opencl"}).to_string(),
         )
@@ -949,6 +1055,191 @@ done
             .contains("input"));
         assert!(Interp::parse("cobol").unwrap_err().contains("unknown interpreter"));
         assert!(Backend::parse("metal").unwrap_err().contains("unknown backend"));
+        // Torch parses under all its aliases and never routes through
+        // the plain repl executor.
+        assert_eq!(Interp::parse("torch").unwrap(), Interp::Torch);
+        assert_eq!(Interp::parse("pytorch").unwrap(), Interp::Torch);
+        assert_eq!(Interp::parse("python-torch").unwrap(), Interp::Torch);
+        assert_eq!(Interp::Torch.default_session(), "torch");
+        assert!(run("tester", &serde_json::json!({"interp": "torch", "input": "1"}).to_string())
+            .await
+            .unwrap_err()
+            .contains("gpu:torch"));
+    }
+
+    /// Phase 0 acceptance (RESEARCH-HARNESS-PLAN.md 0.1): a torch REPL
+    /// session survives across calls and a matmul runs on the iGPU
+    /// (HIP/`cuda`) inside the GPU-enabled bwrap sandbox.
+    #[tokio::test]
+    async fn torch_repl_runs_on_the_gpu_when_available() {
+        if skip_without_bwrap() || closure::which("torch-python").is_none() {
+            eprintln!("torch-python not on PATH; skipping");
+            return;
+        }
+        let config = SessionConfig::for_interp(Interp::Torch, Backend::C).unwrap();
+        let mut args = ReplArgs {
+            interp: "torch".into(),
+            input: "import torch; assert torch.cuda.is_available(), 'no GPU visible inside the sandbox'; dev = 'cuda'; x = torch.zeros(8, 8, device=dev); print('dev', dev, torch.__version__, torch.cuda.get_device_name(0))".into(),
+            session: Some("acc".into()),
+            timeout_secs: Some(90),
+            backend: None,
+        };
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-torch", &config, &args)
+            .await
+            .expect("import torch on GPU");
+        assert!(out.contains("dev cuda"), "the iGPU must be visible inside the sandbox: {out:?}");
+        // State persists: x is still there; matmul on the iGPU.
+        args.input = "y = x @ torch.ones(8, 8, device=dev); print('matmul_sum', y.sum().item())".into();
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-torch", &config, &args)
+            .await
+            .expect("matmul");
+        assert!(out.contains("matmul_sum 0.0"), "8x0 @ 8x1 must sum to 0: {out:?}");
+        manager().lock().await.kill_session("test-torch:acc").await;
+    }
+
+    #[test]
+    fn torch_config_uses_gpu_and_mounts_experiments_rw() {
+        let cfg = SessionConfig::for_interp(Interp::Torch, Backend::C).unwrap();
+        assert!(cfg.gpu, "torch sessions always spawn in the GPU sandbox");
+        assert_eq!(cfg.program, "torch-python");
+        assert_eq!(cfg.sentinel, SentinelStyle::Print, "it IS python");
+        assert_eq!(cfg.rw_subdirs, vec![Path::new("experiments")]);
+        assert!(
+            cfg.deps.contains(&"gcc"),
+            "triton compiles runtime shims at kernel-launch time"
+        );
+    }
+
+    /// Triton acceptance: custom kernels compile AND run on the iGPU
+    /// inside the torch sandbox. Triton compiles through a C toolchain
+    /// at RUNTIME — the sandbox must let that happen (writable /tmp
+    /// for the cache, compiler on PATH via the closure).
+    #[tokio::test]
+    async fn triton_kernel_compiles_inside_the_torch_sandbox() {
+        if skip_without_bwrap() || closure::which("torch-python").is_none() {
+            eprintln!("torch-python not on PATH; skipping");
+            return;
+        }
+        let config = SessionConfig::for_interp(Interp::Torch, Backend::C).unwrap();
+        let args = ReplArgs {
+            interp: "torch".into(),
+            // Write the kernel to a REAL file (triton inspects source),
+        // then run it as a subprocess and report back.
+            input: r#"
+import os, subprocess, sys
+os.makedirs("experiments/triton-smoke", exist_ok=True)
+src = '''
+import torch, triton, triton.language as tl
+@triton.jit
+def add_k(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask), mask=mask)
+if __name__ == "__main__":
+    n = 1024
+    x = torch.randn(n, device="cuda"); y = torch.randn(n, device="cuda"); out = torch.empty_like(x)
+    add_k[(1,)](x, y, out, n, BLOCK=1024)
+    torch.cuda.synchronize()
+    print("triton_ok", torch.allclose(out, x + y))
+'''
+open("experiments/triton-smoke/k.py", "w").write(src)
+r = subprocess.run([sys.executable, "experiments/triton-smoke/k.py"], capture_output=True, text=True, timeout=180)
+print(r.stdout.strip() or r.stderr[-500:])
+"#
+            .into(),
+            session: Some("triton".into()),
+            timeout_secs: Some(240),
+            backend: None,
+        };
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-torch", &config, &args)
+            .await
+            .expect("triton smoke");
+        assert!(
+            out.contains("triton_ok True"),
+            "custom triton kernels must compile and run in the sandbox: {out:?}"
+        );
+        manager().lock().await.kill_session("test-torch:triton").await;
+        // Workspace fixture cleanup (host side; the sandbox bind is rw).
+        let _ = std::fs::remove_dir_all("experiments/triton-smoke");
+    }
+
+    #[test]
+    fn parse_ro_binds_filters_and_splits() {
+        let dir = std::env::temp_dir().join(format!("llung-robinds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+
+        use crate::paths::parse_ro_binds;
+        assert!(parse_ro_binds(None).is_empty());
+        assert!(parse_ro_binds(Some("")).is_empty());
+        // Colon-split, empties dropped, nonexistent paths skipped (the
+        // session binds each under the SAME absolute path, so configs
+        // can reference them verbatim).
+        let parsed = parse_ro_binds(Some(&format!(":/nonexistent-xyz:{dir_s}::")));
+        assert_eq!(parsed, vec![dir.clone()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LLUNG_RO_BINDS data is actually readable inside a session — the
+    /// streaming-traces path. SAFETY: scoped env override; the worst a
+    /// concurrent session spawn picks up is one extra ro temp-dir bind.
+    #[tokio::test]
+    async fn ro_bind_env_path_is_readable_inside_a_session() {
+        if skip_without_bwrap() || closure::which("python3").is_none() {
+            eprintln!("python3/bwrap not available; skipping");
+            return;
+        }
+        // NOT under /tmp: the sandbox mounts a fresh tmpfs over /tmp,
+        // which would shadow the bind (same rule as argv()'s note).
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "llung-robind-live-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("trace shard 0001.bin"), b"trace-bytes").unwrap();
+
+        unsafe { std::env::set_var("LLUNG_RO_BINDS", &dir) };
+        let (interp, backend, mut args) = parse_args(
+            &serde_json::json!({"interp": "python", "input": "pass", "timeout_secs": 15})
+                .to_string(),
+        )
+        .unwrap();
+        // The path inside the sandbox is the SAME absolute path.
+        args.input = format!(
+            "print(open({:?}).read())",
+            dir.join("trace shard 0001.bin").to_string_lossy()
+        );
+        let config = SessionConfig::for_interp(interp, backend).unwrap();
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-robind", &config, &args)
+            .await
+            .expect("read through the env bind");
+        unsafe { std::env::remove_var("LLUNG_RO_BINDS") };
+        assert!(
+            out.contains("trace-bytes"),
+            "external data must be streamable in the sandbox: {out:?}"
+        );
+        manager().lock().await.kill_session("test-robind:python").await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

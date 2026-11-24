@@ -39,7 +39,18 @@ pub struct ChatLine {
     /// Set while this line is a streaming preview: the id the final
     /// gossipsub message will carry, so it can replace this line.
     pub stream_id: Option<String>,
+    /// Reasoning scratchpad chars accumulated on this stream (Kimi-style
+    /// `reasoning_content`). Shown as activity and elided to a one-line
+    /// trace, never as the answer.
+    pub thought_chars: usize,
+    /// True until the first answer-text delta arrives: the line renders
+    /// as an animated `working`/`thinking` spinner.
+    pub stream_working: bool,
 }
+
+/// Reasoning longer than this is collapsed to a `(thought N chars)`
+/// trace instead of staying on screen (pi-style elision).
+const THOUGHT_ELIDE_CHARS: usize = 160;
 
 #[derive(Default)]
 struct VisualLine {
@@ -134,12 +145,17 @@ impl ChatPanel {
             attachment,
             tool: None,
             stream_id: None,
+            thought_chars: 0,
+            stream_working: false,
         });
         self.cache.clear();
         self.cached_width = 0;
     }
 
-    /// Show a tool call as a pending panel.
+    /// Show a tool call as a pending panel. Idempotent per `call_id`:
+    /// gossipsub does not order an agent's ToolCall/ToolResponse pair, so
+    /// the response can arrive first — and a delivered call must never
+    /// stack a second `running…` panel (or resurrect a finished one).
     pub fn push_tool(
         &mut self,
         sender_id: String,
@@ -147,6 +163,36 @@ impl ChatPanel {
         avatar: Option<AvatarThumbnail>,
         block: ToolBlock,
     ) {
+        self.upsert_tool(sender_id, sender, avatar, block);
+    }
+
+    /// Insert a tool panel, or update the existing panel with the same
+    /// `call_id`. A finished panel (success/error) is never replaced by
+    /// a pending one; anything else updates in place so the spinner
+    /// gives way to the result exactly once.
+    fn upsert_tool(
+        &mut self,
+        sender_id: String,
+        sender: String,
+        avatar: Option<AvatarThumbnail>,
+        block: ToolBlock,
+    ) {
+        if let Some(cid) = block.call_id.as_deref() {
+            if let Some(line) = self.messages.iter_mut().find(|m| {
+                m.tool.as_ref().and_then(|t| t.call_id.as_deref()) == Some(cid)
+            }) {
+                let keep_finished = line
+                    .tool
+                    .as_ref()
+                    .is_some_and(|t| t.state != ToolState::Pending)
+                    && block.state == ToolState::Pending;
+                if !keep_finished {
+                    line.tool = Some(block);
+                    self.invalidate();
+                }
+                return;
+            }
+        }
         let is_me = sender.trim() == self.my_name.trim();
         self.messages.push(ChatLine {
             sender_id,
@@ -157,8 +203,64 @@ impl ChatPanel {
             attachment: None,
             tool: Some(block),
             stream_id: None,
+            thought_chars: 0,
+            stream_working: false,
         });
         self.invalidate();
+    }
+
+    /// The model started a turn, an attempt, or a re-ask for `stream_id`:
+    /// show the `working` spinner until the first answer-text delta
+    /// arrives. Sent before EVERY backend call (so the spinner covers
+    /// between-tool-steps thinking); when the line already exists — a
+    /// retry after a truncated attempt — it resets to the spinner state.
+    pub fn push_stream_start(
+        &mut self,
+        sender_id: String,
+        sender: String,
+        avatar: Option<AvatarThumbnail>,
+        stream_id: &str,
+    ) {
+        if let Some(line) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.stream_id.as_deref() == Some(stream_id))
+        {
+            line.content = PrefixText::new(String::new());
+            line.thought_chars = 0;
+            line.stream_working = true;
+            self.invalidate();
+            return;
+        }
+        let is_me = sender.trim() == self.my_name.trim();
+        self.messages.push(ChatLine {
+            sender_id,
+            sender,
+            content: PrefixText::new(String::new()),
+            is_me,
+            avatar,
+            attachment: None,
+            tool: None,
+            stream_id: Some(stream_id.to_string()),
+            thought_chars: 0,
+            stream_working: true,
+        });
+        self.invalidate();
+    }
+
+    /// Reasoning scratchpad text for `stream_id`: counted as activity
+    /// (the spinner becomes `thinking (N chars)`), elided once long.
+    pub fn push_stream_thought(&mut self, stream_id: &str, delta: &str) {
+        if let Some(line) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.stream_id.as_deref() == Some(stream_id))
+        {
+            line.thought_chars += delta.chars().count();
+            self.invalidate();
+        }
     }
 
     /// Append a streaming delta to the in-progress reply `stream_id`,
@@ -179,6 +281,7 @@ impl ChatPanel {
             .rev()
             .find(|m| m.stream_id.as_deref() == Some(stream_id))
         {
+            line.stream_working = false;
             line.content.append(delta);
         } else {
             let is_me = sender.trim() == self.my_name.trim();
@@ -191,23 +294,45 @@ impl ChatPanel {
                 attachment: None,
                 tool: None,
                 stream_id: Some(stream_id.to_string()),
+                thought_chars: 0,
+                stream_working: false,
             });
         }
         self.invalidate();
     }
 
-    /// Remove a streaming preview line (the reply became a tool call, or
-    /// the final message with the same id is about to render). Returns
-    /// true when a line was removed.
+    /// Resolve a streaming preview: the reply became a tool call, or the
+    /// final message with the same id is about to render. Long reasoning
+    /// is kept as an elided `(thought N chars)` trace instead of
+    /// vanishing. Returns true when a stream line was consumed.
     pub fn remove_stream_line(&mut self, stream_id: &str) -> bool {
-        let before = self.messages.len();
-        self.messages
-            .retain(|m| m.stream_id.as_deref() != Some(stream_id));
-        let removed = self.messages.len() != before;
-        if removed {
-            self.invalidate();
+        let Some(pos) = self
+            .messages
+            .iter()
+            .rposition(|m| m.stream_id.as_deref() == Some(stream_id))
+        else {
+            return false;
+        };
+        let line = &mut self.messages[pos];
+        if line.thought_chars >= THOUGHT_ELIDE_CHARS {
+            // Detach the elided trace: it stays as a normal muted line.
+            line.content = PrefixText::new(format!("(thought {} chars)", line.thought_chars));
+            line.stream_id = None;
+            line.stream_working = false;
+            line.tool = None;
+        } else {
+            self.messages.remove(pos);
         }
-        removed
+        self.invalidate();
+        true
+    }
+
+    /// True while any stream line is still in its spinner phase — the
+    /// signal for the tick loop to keep invalidating so it animates.
+    pub fn has_spinning_streams(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|m| m.stream_id.is_some() && m.stream_working)
     }
 
     /// A tool response: replaces the pending panel of the call it answers
@@ -317,6 +442,44 @@ impl ChatPanel {
                 });
             }
             last_was_me = msg.is_me;
+
+            // ── STREAMING PREVIEW: pi-style `working` spinner until the
+            // first answer-text delta; long reasoning stays elided ──
+            if msg.stream_id.is_some() {
+                let avatar_pad = msg.avatar.as_ref().map(|a| a.width() + 1).unwrap_or(0);
+                let left_margin = 2 + avatar_pad;
+                if msg.content.as_str().is_empty() {
+                    let label = if msg.thought_chars > 0 {
+                        format!(
+                            "{} thinking… ({} chars)",
+                            crate::spinner::frame(),
+                            msg.thought_chars
+                        )
+                    } else {
+                        format!("{} {} is working…", crate::spinner::frame(), msg.sender)
+                    };
+                    self.cache.push(VisualLine {
+                        text: label,
+                        x_offset: left_margin,
+                        role: Role::Muted,
+                        msg_index: i,
+                        ..Default::default()
+                    });
+                    continue;
+                }
+                // Answer text is arriving: long reasoning shows as an
+                // elided trace above the stream, pi-style.
+                if msg.thought_chars >= THOUGHT_ELIDE_CHARS {
+                    self.cache.push(VisualLine {
+                        text: format!("(thought {} chars)", msg.thought_chars),
+                        x_offset: left_margin,
+                        role: Role::Muted,
+                        msg_index: i,
+                        ..Default::default()
+                    });
+                }
+                // Fall through to the normal markdown/plain rendering.
+            }
 
             // ── TOOL PANELS: pi-style tinted block, near full width ──
             if let Some(ref tool) = msg.tool {
@@ -860,6 +1023,141 @@ mod tests {
         assert!(panel.cache.iter().any(|l| l.segments.iter().any(|(_, r)| *r == Role::MdListBullet)));
         // Word-aware wrap: no mid-word "## " mangling, header on own line.
         assert!(panel.cache.iter().any(|l| l.role == Role::PeerName && l.text == "plotter"));
+    }
+
+    #[test]
+    fn my_multiline_markdown_renders_as_styled_bubble() {
+        let mut panel = ChatPanel::new("me".into());
+        // What a typed multi-line markdown message looks like after the
+        // Enter-handling keeps newlines: a list plus strong text.
+        panel.push(
+            "me".into(),
+            "me".into(),
+            "Shopping list:\n- eggs\n- **coffee**\n".into(),
+            None,
+            None,
+        );
+        panel.invalidate();
+        let theme = crate::theme::Theme::default();
+        panel.rewrap(80, &theme);
+
+        // Block lines carry their text in styled segments (text stays
+        // empty); newlines split blocks without losing content.
+        let seg_text = |l: &VisualLine| -> String {
+            l.segments.iter().map(|(t, _)| t.as_str()).collect()
+        };
+        assert!(panel.cache.iter().any(|l| l
+            .segments
+            .iter()
+            .any(|(t, r)| t.contains("Shopping list:") && *r == Role::MyMessage)));
+        // Both list items survive as styled list lines, strong included.
+        let bullets: Vec<_> = panel
+            .cache
+            .iter()
+            .filter(|l| l.segments.iter().any(|(_, r)| *r == Role::MdListBullet))
+            .collect();
+        assert_eq!(bullets.len(), 2, "two list items expected");
+        assert!(bullets.iter().any(|l| seg_text(l).contains("eggs")));
+        assert!(bullets.iter().any(|l| l.segments.iter().any(|(t, r)| *r == Role::MdStrong && t == "coffee")));
+        // My bubble: right-aligned (x_offset past the middle on 80 cols).
+        assert!(bullets.iter().all(|l| l.x_offset > 40), "right-aligned expected");
+    }
+
+    #[test]
+    fn compressor_spinner_is_attributed_to_the_compressor() {
+        // The agent loop streams history compression under its own
+        // line (empty being id, compressor display name), retracted
+        // before the agent's own `working` line appears.
+        let mut panel = ChatPanel::new("me".into());
+        let theme = crate::theme::Theme::default();
+        panel.push_stream_start(String::new(), "HistoryCompressor (SmolVLM)".into(), None, "c1");
+        panel.rewrap(80, &theme);
+        let texts: Vec<&String> = panel.cache.iter().map(|l| &l.text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("HistoryCompressor (SmolVLM) is working")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("sensei")), "{texts:?}");
+
+        assert!(panel.remove_stream_line("c1"));
+        panel.push_stream_start("p".into(), "sensei".into(), None, "s1");
+        panel.rewrap(80, &theme);
+        let texts: Vec<&String> = panel.cache.iter().map(|l| &l.text).collect();
+        assert!(texts.iter().any(|t| t.contains("sensei is working")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("HistoryCompressor")), "{texts:?}");
+    }
+
+    #[test]
+    fn stream_shows_spinner_then_elides_thoughts() {
+        let mut panel = ChatPanel::new("me".into());
+        let theme = crate::theme::Theme::default();
+
+        // Turn start: no output yet -> `working` spinner line.
+        panel.push_stream_start("p".into(), "kimi".into(), None, "s1");
+        panel.rewrap(80, &theme);
+        assert!(
+            panel.cache.iter().any(|l| l.text.contains("working")),
+            "spinner line: {:?}",
+            panel.cache.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        // Reasoning arrives: spinner becomes `thinking (N chars)`.
+        panel.push_stream_thought("s1", &"x".repeat(500));
+        panel.rewrap(80, &theme);
+        assert!(
+            panel.cache.iter().any(|l| l.text.contains("thinking") && l.text.contains("500")),
+            "thinking line: {:?}",
+            panel.cache.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        // Answer text streams: elided thought trace above it, spinner gone.
+        panel.push_stream_delta("p".into(), "kimi".into(), None, "s1", "the answer");
+        panel.rewrap(80, &theme);
+        assert!(
+            panel.cache.iter().any(|l| l.text.contains("(thought 500 chars)")),
+            "elided trace: {:?}",
+            panel.cache.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        assert!(panel.cache.iter().any(|l| l.text.contains("the answer")));
+        assert!(!panel.cache.iter().any(|l| l.text.contains("working")));
+
+        // Resolution (reply was a tool call / final message landed): the
+        // long thought survives as the elided trace instead of vanishing.
+        assert!(panel.remove_stream_line("s1"));
+        panel.rewrap(80, &theme);
+        assert!(
+            panel.cache.iter().any(|l| l.text.contains("(thought 500 chars)")),
+            "trace survives retraction"
+        );
+        assert!(!panel.cache.iter().any(|l| l.text.contains("the answer")));
+    }
+
+    #[test]
+    fn stream_start_resets_a_partial_attempt() {
+        let mut panel = ChatPanel::new("me".into());
+        let theme = crate::theme::Theme::default();
+        panel.push_stream_start("p".into(), "kimi".into(), None, "s1");
+        panel.push_stream_delta("p".into(), "kimi".into(), None, "s1", "partial plan…");
+        // A retry after a truncated attempt: back to the spinner, the
+        // partial text must not linger.
+        panel.push_stream_start("p".into(), "kimi".into(), None, "s1");
+        panel.rewrap(80, &theme);
+        assert!(panel.cache.iter().any(|l| l.text.contains("working")));
+        assert!(!panel.cache.iter().any(|l| l.text.contains("partial")));
+    }
+
+    #[test]
+    fn short_thoughts_vanish_on_retract() {
+        let mut panel = ChatPanel::new("me".into());
+        let theme = crate::theme::Theme::default();
+        panel.push_stream_start("p".into(), "kimi".into(), None, "s1");
+        panel.push_stream_thought("s1", "hmm");
+        panel.push_stream_delta("p".into(), "kimi".into(), None, "s1", "TOOL {\"name\":\"glob\"}");
+        panel.rewrap(80, &theme);
+        // Under the elide threshold: nothing worth keeping.
+        assert!(panel.remove_stream_line("s1"));
+        panel.rewrap(80, &theme);
+        assert!(!panel.cache.iter().any(|l| l.text.contains("thought")));
     }
 
     #[test]
