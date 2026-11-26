@@ -142,6 +142,14 @@ layers, the same shape as `Cfg`'s defaults):
    data from a different tokenizer (`--force` re-tokenizes). In the tui run
    `/data add ~/.local/share/llung/data/codeparrot` (read-only to the
    sandboxes).
+   **From an agent (sandbox, no network):** the `web_download` tool
+   fetches each file host-side (operator approves each URL, or
+   `/grant web_download perpetual`; hosts limited by
+   `LLUNG_DOWNLOAD_ALLOW`, default `huggingface.co,github.com`, `*` = any)
+   into `$LLUNG_RUNS_DIR/downloads/`; then
+   `prep/codeparrot.py --src $LLUNG_RUNS_DIR/downloads/codeparrot --out
+   $LLUNG_RUNS_DIR/data/codeparrot`. A missing shard stops it with the
+   exact `web_download` call to make (docstring lists the three files).
 2. **Glue (`models/`):** `latent_lm.py:PretrainLM` gives LatentLM a plain
    next-token `forward` (it subclasses LatentLM, so checkpoints load
    straight back into LatentLM for MUX training).

@@ -17,6 +17,19 @@ never maps to a special id), and writes the `tokens` task layout
 
 Then make <out> visible to the sandboxes, read-only:  /data add <out>
 
+Inside a sandbox (no network) the agent fetches the files with the
+`web_download` tool first (host-side, operator-approved, saved under
+$LLUNG_RUNS_DIR/downloads/), then points --src at them:
+
+    web_download url=<HF>/datasets/codeparrot/codeparrot-clean/resolve/main/file-000000000001.json.gz dest=codeparrot/file-000000000001.json.gz
+    web_download url=<HF>/datasets/codeparrot/codeparrot-clean-valid/resolve/main/file-000000000054.json.gz dest=codeparrot/file-000000000054.json.gz
+    web_download url=<HF>/codeparrot/codeparrot-small/resolve/main/pytorch_model.bin dest=codeparrot/pytorch_model.bin
+    python experiments/prep/codeparrot.py --src $LLUNG_RUNS_DIR/downloads/codeparrot \
+        --out $LLUNG_RUNS_DIR/data/codeparrot
+
+One train shard holds ~100k files (well over 20M tokens); a missing
+shard stops the run with the exact web_download call to make.
+
 Note: codeparrot-small was trained on codeparrot-clean's train split,
 so the warm-started model has seen the train subset. The val tokens
 come from the separate valid split.
@@ -27,6 +40,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import shutil
 import time
 import urllib.request
 from pathlib import Path
@@ -53,9 +67,22 @@ def _open(url: str):
     return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "llung-prep"}), timeout=60)
 
 
-def download(url: str, dest: Path) -> None:
+def _local(src: Path, url: str) -> Path:
+    """The --src copy of `url` (its file name), or exit naming the download."""
+    path = src / url.rsplit("/", 1)[-1]
+    if not path.exists():
+        sys.exit(f"missing {path}\n  fetch it (host-side): web_download "
+                 f'{{"url": "{url}", "dest": "{src.name}/{path.name}"}}\n  then rerun.')
+    return path
+
+
+def download(url: str, dest: Path, src: Path | None = None) -> None:
     if dest.exists():
         typer.echo(f"have {dest.name}")
+        return
+    if src is not None:
+        shutil.copyfile(_local(src, url), dest)
+        typer.echo(f"copied {dest}")
         return
     part = dest.with_suffix(dest.suffix + ".part")
     with _open(url) as resp, part.open("wb") as f:
@@ -69,10 +96,13 @@ def download(url: str, dest: Path) -> None:
     typer.echo(f"wrote {dest}")
 
 
-def documents(urls: list[str]) -> Iterator[str]:
-    """Stream `content` fields shard by shard, decompressing on the fly."""
+def documents(urls: list[str], src: Path | None = None) -> Iterator[str]:
+    """Stream `content` fields shard by shard, decompressing on the fly.
+    With `src`, shards are read from local files (opened lazily, so only
+    the shards the budget reaches must exist)."""
     for url in urls:
-        with _open(url) as resp, gzip.GzipFile(fileobj=resp) as gz:
+        opened = _local(src, url).open("rb") if src is not None else _open(url)
+        with opened as resp, gzip.GzipFile(fileobj=resp) as gz:
             for line in io.TextIOWrapper(gz, encoding="utf-8"):
                 yield json.loads(line)["content"]
 
@@ -107,9 +137,11 @@ def main(
     val_tokens: Annotated[int, typer.Option(help="Val token budget (held-out split).")] = 1_000_000,
     weights: Annotated[bool, typer.Option(help=f"Also fetch {MODEL}'s weights (~450 MB).")] = True,
     force: Annotated[bool, typer.Option(help="Re-tokenize even if train.bin/val.bin exist.")] = False,
+    src: Annotated[Path | None, typer.Option(help="Read shards/weights from this dir (web_download'ed) instead of the network.")] = None,
 ):
     """Tokenize a CodeParrot subset (and fetch codeparrot-small) for the `tokens` task."""
     out = out.expanduser()
+    src = src.expanduser() if src is not None else None
     out.mkdir(parents=True, exist_ok=True)
     eot, vocab, tok_sha = codetok.EOS, codetok.VOCAB_SIZE, codetok.sha256()
     assert vocab <= 65536, "uint16 storage needs vocab <= 65536"
@@ -125,10 +157,10 @@ def main(
             counts[split] = dest.stat().st_size // 2
             typer.echo(f"have {dest.name} ({counts[split]:,} tokens; --force to redo)")
             continue
-        counts[split] = write_tokens(documents(urls), eot, budget, dest)
+        counts[split] = write_tokens(documents(urls, src), eot, budget, dest)
 
     if weights:
-        download(f"{HF}/{MODEL}/resolve/main/pytorch_model.bin", out / "codeparrot-small.bin")
+        download(f"{HF}/{MODEL}/resolve/main/pytorch_model.bin", out / "codeparrot-small.bin", src)
 
     meta = {
         "dtype": "uint16",

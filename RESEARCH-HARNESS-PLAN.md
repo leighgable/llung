@@ -54,7 +54,7 @@ GPU profile).
 - GPU gating: torch sessions always build their `Sandbox` with
   `enable_gpu()`. Map the session spawn to a new effect `gpu:torch` in
   `crates/agent/src/permissions.rs` and `crates/agent/src/effects.rs`
-  (Tier::Gpu — like `gpu:futhark`, NO implicit standing grant;
+  (Tier::Gpu — like `gpu:futhark`; prompt `Y` or
   `/grant gpu:torch perpetual` for trusted loops, `once` while developing).
 - Tool schema: update `REPL_TOOL_SCHEMA` in `crates/agent/src/tools.rs`
   (`"interp": "python | chibi-scheme | futhark | torch"`, description mentions

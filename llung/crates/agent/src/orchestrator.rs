@@ -2554,6 +2554,35 @@ mod tests {
         );
     }
 
+    /// GPU effects offer "always" too: the standing grant names the
+    /// exact effect, and later calls run unattended.
+    #[tokio::test]
+    async fn gpu_prompt_allows_a_standing_grant() {
+        let (mut ctx, mut perm_rx) = ctx_with_perm();
+        let answerer = tokio::spawn(async move {
+            let req = perm_rx.recv().await.expect("a permission request");
+            assert_eq!(req.effect, "gpu:futhark");
+            assert!(req.allow_standing, "gpu must offer 'always'");
+            let _ = req.respond.send(PermissionAnswer::Standing);
+            perm_rx
+        });
+        // Bad args: the executor fails fast, after the grant is recorded.
+        let _ = execute_secured_tool(&mut ctx, "gpu:futhark".into(), b"{}".to_vec()).await;
+        let mut perm_rx = answerer.await.unwrap();
+        let covered = |effect: &str, ctx: &AgentLoopContext| {
+            ctx.kernel.check_standing(&Manifest {
+                agent_id: ctx.self_being_id.clone(),
+                target_effect: effect.into(),
+                arguments: vec![],
+                nonce: 0,
+            })
+        };
+        assert!(covered("gpu:futhark", &ctx), "standing gpu grant recorded");
+        assert!(!covered("gpu:torch", &ctx), "only the named gpu effect");
+        let _ = execute_secured_tool(&mut ctx, "gpu:futhark".into(), b"{}".to_vec()).await;
+        assert!(perm_rx.try_recv().is_err(), "no second prompt");
+    }
+
     /// Denial: the model gets a tool error, the merkle history records a
     /// Denied receipt, and nothing is consumed — the next attempt asks
     /// again and can still be allowed.

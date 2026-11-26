@@ -893,7 +893,7 @@ impl App {
                         self.answer_permission(PermissionAnswer::Standing);
                     } else {
                         self.system(
-                            "gpu:* never gets an implicit 'always' — use `/grant <effect> perpetual`",
+                            "this tier has no 'always' — use `/grant <effect> perpetual`",
                         );
                     }
                 }
@@ -2867,7 +2867,7 @@ impl App {
             "  /branch tip — return to the newest branch".into(),
             "  /tools [name] — list tools, or show one tool's description and arguments".into(),
             "  /grant list — standing tool grants per local agent".into(),
-            "  /grant <effect> perpetual [agent] — pre-authorize a tool tier (e.g. bash, repl); agent defaults to all".into(),
+            "  /grant <effect> perpetual [agent] — pre-authorize a tool (e.g. bash, repl, gpu:torch); agent defaults to all · or answer Y at a prompt".into(),
             "  /grant revoke <effect> [agent] — remove a standing grant".into(),
             "  /grant pending — show the permission prompt queue".into(),
             "  /key list — API keys per provider · /key set <provider> — store one (hidden input, login keyring) · /key delete <provider>".into(),

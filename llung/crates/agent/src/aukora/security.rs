@@ -85,15 +85,20 @@ pub async fn secure_execute_agent_tool_in(
             // approved this URL (or holds a standing grant) upstream.
             // Only the one known net effect: `net:<anything>` must not
             // become a fetch under another name (and another grant).
-            if effect.name != "web_fetch" {
-                return Err(format!(
-                    "effect '{}' (tier 'net') has no executor — only web_fetch",
-                    manifest.target_effect
-                ));
-            }
-            let output = crate::web::run(&arguments_json, places)
-                .await
-                .map_err(|e| format!("Fetch failed: {e}"))?;
+            let output = match effect.name {
+                "web_fetch" => crate::web::run(&arguments_json, places)
+                    .await
+                    .map_err(|e| format!("Fetch failed: {e}"))?,
+                "web_download" => crate::web::download(&arguments_json, places)
+                    .await
+                    .map_err(|e| format!("Download failed: {e}"))?,
+                _ => {
+                    return Err(format!(
+                        "effect '{}' (tier 'net') has no executor — only web_fetch / web_download",
+                        manifest.target_effect
+                    ));
+                }
+            };
             receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
             state.advance_history_root(&receipt);
             return Ok((receipt, output));

@@ -53,6 +53,26 @@ struct FetchArgs {
     max_chars: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DownloadArgs {
+    url: String,
+    /// Relative path under `<runs>/downloads/` (default: the URL's file name).
+    #[serde(default)]
+    dest: Option<String>,
+    /// Replace an existing file (default: keep it and report it).
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// web_download's hosts when `LLUNG_DOWNLOAD_ALLOW` is unset: dataset and
+/// weight hosts (huggingface.co covers its hf.co CDNs, github.com its
+/// githubusercontent.com raw/release hosts). `*` allows any public host.
+const DEFAULT_DOWNLOAD_ALLOW: &str = "huggingface.co,github.com";
+/// web_download size cap (a guard against a runaway stream, not a quota).
+const MAX_DOWNLOAD_BYTES: u64 = 64 << 30;
+/// web_download: no total deadline (multi-GB files), but a stalled read fails.
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Fetch policy; `run` builds it from the environment, tests directly.
 #[derive(Clone, Debug, Default)]
 struct Policy {
@@ -64,17 +84,30 @@ struct Policy {
     github_api: Option<String>,
     github_raw: Option<String>,
     github_token: Option<String>,
+    /// The env var the allowlist came from (error messages).
+    allow_var: &'static str,
 }
 
 impl Policy {
     fn from_env() -> Self {
         Self {
-            allow: std::env::var("LLUNG_FETCH_ALLOW")
-                .unwrap_or_default()
-                .split(',')
-                .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
-                .filter(|h| !h.is_empty())
-                .collect(),
+            allow: parse_allow(&std::env::var("LLUNG_FETCH_ALLOW").unwrap_or_default()),
+            allow_var: "LLUNG_FETCH_ALLOW",
+            ..Default::default()
+        }
+    }
+
+    /// web_download's policy: its OWN allowlist (`LLUNG_DOWNLOAD_ALLOW`,
+    /// default [`DEFAULT_DOWNLOAD_ALLOW`]), so a standing web_download
+    /// grant stays bounded to dataset/weight hosts.
+    fn download_from_env() -> Self {
+        let raw = std::env::var("LLUNG_DOWNLOAD_ALLOW")
+            .unwrap_or_else(|_| DEFAULT_DOWNLOAD_ALLOW.to_string());
+        let allow = parse_allow(&raw);
+        Self {
+            // `*` = any public host (an empty list means "no allowlist").
+            allow: if allow.iter().any(|h| h == "*") { Vec::new() } else { allow },
+            allow_var: "LLUNG_DOWNLOAD_ALLOW",
             ..Default::default()
         }
     }
@@ -90,6 +123,9 @@ impl Policy {
                 // Allowing github.com covers the API and raw hosts the
                 // GitHub routing below fetches from.
                 || (a == "github.com" && host.ends_with("githubusercontent.com"))
+                // huggingface.co `resolve/` URLs redirect to *.hf.co
+                // (cdn-lfs, cas-bridge.xethub).
+                || (a == "huggingface.co" && (host == "hf.co" || host.ends_with(".hf.co")))
         })
     }
 
@@ -100,6 +136,13 @@ impl Policy {
     fn raw(&self) -> &str {
         self.github_raw.as_deref().unwrap_or("https://raw.githubusercontent.com")
     }
+}
+
+fn parse_allow(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 /// Tier::Net executor.
@@ -185,7 +228,8 @@ async fn vet(url: &Url, policy: &Policy) -> Result<Option<SocketAddr>, String> {
     let host = url.host_str().ok_or("web_fetch: URL has no host")?;
     if !policy.host_allowed(host) {
         return Err(format!(
-            "web_fetch: host '{host}' is not in LLUNG_FETCH_ALLOW ({})",
+            "web_fetch: host '{host}' is not in {} ({})",
+            if policy.allow_var.is_empty() { "the allowlist" } else { policy.allow_var },
             policy.allow.join(", ")
         ));
     }
@@ -215,14 +259,47 @@ async fn vet(url: &Url, policy: &Policy) -> Result<Option<SocketAddr>, String> {
 }
 
 async fn get(url: Url, accept: Option<&str>, policy: &Policy) -> Result<Fetched, String> {
+    let (url, mut resp) = open(url, accept, policy, false).await?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("web_fetch: {url}: {e}"))? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(format!(
+                "web_fetch: {url} is larger than {} MiB",
+                MAX_BODY_BYTES / (1024 * 1024)
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Fetched { url, content_type, body })
+}
+
+/// Follow redirects (each hop vetted and DNS-pinned) to a successful
+/// response; the caller reads the body. `long` swaps the 30 s total
+/// deadline for a per-read timeout (web_download's multi-GB files).
+async fn open(
+    url: Url,
+    accept: Option<&str>,
+    policy: &Policy,
+    long: bool,
+) -> Result<(Url, reqwest::Response), String> {
     let mut url = url;
     for _ in 0..=MAX_REDIRECTS {
         let pin = vet(&url, policy).await?;
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(TIMEOUT)
             .user_agent(USER_AGENT);
+        builder = if long {
+            builder.read_timeout(DOWNLOAD_READ_TIMEOUT)
+        } else {
+            builder.timeout(TIMEOUT)
+        };
         if let (Some(addr), Some(host)) = (pin, url.host_str()) {
             builder = builder.resolve(host, addr);
         }
@@ -239,7 +316,7 @@ async fn get(url: Url, accept: Option<&str>, policy: &Policy) -> Result<Fetched,
         }) {
             req = req.bearer_auth(token);
         }
-        let mut resp = req.send().await.map_err(|e| format!("web_fetch: {url}: {e}"))?;
+        let resp = req.send().await.map_err(|e| format!("web_fetch: {url}: {e}"))?;
         let status = resp.status();
         if status.is_redirection() {
             let location = resp
@@ -266,25 +343,134 @@ async fn get(url: Url, accept: Option<&str>, policy: &Policy) -> Result<Fetched,
             };
             return Err(format!("web_fetch: HTTP {status} for {url}{hint}"));
         }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("web_fetch: {url}: {e}"))? {
-            if body.len() + chunk.len() > MAX_BODY_BYTES {
-                return Err(format!(
-                    "web_fetch: {url} is larger than {} MiB",
-                    MAX_BODY_BYTES / (1024 * 1024)
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        return Ok(Fetched { url, content_type, body });
+        return Ok((url, resp));
     }
     Err(format!("web_fetch: more than {MAX_REDIRECTS} redirects"))
+}
+
+// ---------------------------------------------------------------------
+// web_download: a file to disk, for the sandboxes
+// ---------------------------------------------------------------------
+
+/// Tier::Net executor for `web_download`: stream one URL to
+/// `<runs>/downloads/<dest>` (writable and visible in every sandbox, so
+/// network-less sandboxed code — data prep, weight conversion — reads
+/// the file). Same SSRF vetting as web_fetch; hosts from
+/// `LLUNG_DOWNLOAD_ALLOW`.
+pub async fn download(arguments_json: &str, places: &crate::places::Places) -> Result<String, String> {
+    download_with(arguments_json, places, &Policy::download_from_env()).await
+}
+
+/// Validate `dest`: relative, no `..`, no hidden/odd components.
+fn download_dest(dest: Option<&str>, url: &Url) -> Result<std::path::PathBuf, String> {
+    let raw = match dest.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
+        None => url
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .filter(|s| !s.is_empty())
+            .ok_or("web_download: the URL has no file name — pass 'dest'")?
+            .to_string(),
+    };
+    let mut out = std::path::PathBuf::new();
+    for part in raw.split('/').filter(|p| !p.is_empty()) {
+        let ok = !part.starts_with('.')
+            && part.len() <= 128
+            && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '='));
+        if !ok {
+            return Err(format!(
+                "web_download: bad dest component '{part}' (relative path under downloads/; \
+                 [A-Za-z0-9._-+=], no leading dot, no '..')"
+            ));
+        }
+        out.push(part);
+    }
+    if out.as_os_str().is_empty() {
+        return Err("web_download: empty dest".into());
+    }
+    Ok(out)
+}
+
+async fn download_with(
+    arguments_json: &str,
+    places: &crate::places::Places,
+    policy: &Policy,
+) -> Result<String, String> {
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+
+    let args: DownloadArgs = serde_json::from_str(arguments_json)
+        .map_err(|e| format!("web_download: arguments must be JSON with a 'url' string: {e}"))?;
+    let url = Url::parse(args.url.trim())
+        .map_err(|e| format!("web_download: bad url '{}': {e}", args.url))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("web_download: only http(s) URLs (got '{}')", url.scheme()));
+    }
+    let rel = download_dest(args.dest.as_deref(), &url)?;
+    let root = places
+        .runs_ready()
+        .map_err(|e| format!("web_download: {e}"))?
+        .join("downloads");
+    let path = root.join(&rel);
+    if path.exists() && !args.overwrite {
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return Ok(format!(
+            "Already downloaded: {} ({size} bytes). Pass overwrite=true to fetch again.",
+            path.display()
+        ));
+    }
+    let parent = path.parent().unwrap_or(&root);
+    std::fs::create_dir_all(parent).map_err(|e| format!("web_download: {}: {e}", parent.display()))?;
+
+    let (final_url, mut resp) = open(url.clone(), None, policy, true).await?;
+    let total = resp.content_length();
+    if total.is_some_and(|t| t > MAX_DOWNLOAD_BYTES) {
+        return Err(format!("web_download: {url} is larger than {} GiB", MAX_DOWNLOAD_BYTES >> 30));
+    }
+    let part = path.with_file_name(format!(
+        "{}.part",
+        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+    ));
+    let result: Result<(u64, [u8; 32]), String> = async {
+        let mut file = tokio::fs::File::create(&part)
+            .await
+            .map_err(|e| format!("web_download: {}: {e}", part.display()))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut written = 0u64;
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("web_download: {url}: {e}"))? {
+            written += chunk.len() as u64;
+            if written > MAX_DOWNLOAD_BYTES {
+                return Err(format!("web_download: {url} is larger than {} GiB", MAX_DOWNLOAD_BYTES >> 30));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("web_download: {}: {e}", part.display()))?;
+        }
+        file.flush().await.map_err(|e| format!("web_download: {e}"))?;
+        if let Some(t) = total.filter(|&t| t != written) {
+            return Err(format!("web_download: {url}: got {written} of {t} bytes (connection cut)"));
+        }
+        Ok((written, hasher.finalize().into()))
+    }
+    .await;
+    let (written, digest) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    std::fs::rename(&part, &path).map_err(|e| format!("web_download: {}: {e}", path.display()))?;
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let via = if final_url != url { format!(" (via {})", final_url.host_str().unwrap_or("?")) } else { String::new() };
+    Ok(format!(
+        "Downloaded {url}{via}\n-> {} ({written} bytes, {:.1} MiB)\nsha256 {hex}\n\
+         Sandboxes read it at that path (the runs directory, $LLUNG_RUNS_DIR/downloads/{}).",
+        path.display(),
+        written as f64 / (1024.0 * 1024.0),
+        rel.display(),
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -762,6 +948,61 @@ mod tests {
         assert!(out.contains("★ 7 · Rust · MIT · default branch main"), "{out}");
         assert!(out.contains("- src/\n- Cargo.toml (2.0 KB)"), "dirs first: {out}");
         assert!(out.contains("A readme."));
+    }
+
+    #[test]
+    fn download_allowlist_covers_hf_cdns_and_star_opens_it() {
+        let p = Policy { allow: parse_allow(DEFAULT_DOWNLOAD_ALLOW), ..Default::default() };
+        assert!(p.host_allowed("huggingface.co"));
+        assert!(p.host_allowed("cdn-lfs.hf.co"));
+        assert!(p.host_allowed("cas-bridge.xethub.hf.co"));
+        assert!(p.host_allowed("objects.githubusercontent.com"));
+        assert!(!p.host_allowed("evilhf.co"));
+        assert!(!p.host_allowed("example.com"));
+    }
+
+    #[test]
+    fn download_dest_is_confined() {
+        let u = Url::parse("https://huggingface.co/d/resolve/main/file-1.json.gz?x=1").unwrap();
+        assert_eq!(download_dest(None, &u).unwrap(), std::path::PathBuf::from("file-1.json.gz"));
+        assert_eq!(
+            download_dest(Some("cp/a.gz"), &u).unwrap(),
+            std::path::PathBuf::from("cp/a.gz")
+        );
+        for bad in ["../x", "a/../../x", ".ssh/k", "a b", "x/.", "/"] {
+            assert!(download_dest(Some(bad), &u).is_err(), "{bad}");
+        }
+        assert_eq!(download_dest(Some("/abs/x"), &u).unwrap(), std::path::PathBuf::from("abs/x"));
+        let bare = Url::parse("https://huggingface.co/").unwrap();
+        assert!(download_dest(None, &bare).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_streams_to_runs_downloads() {
+        let body = "x".repeat(5000);
+        let base = stub(vec![
+            ("/moved", "HTTP/1.1 302 Found\r\nlocation: /blob.bin\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()),
+            ("/blob.bin", ok("application/octet-stream", &body)),
+        ])
+        .await;
+        let policy = Policy { allow_private: true, ..Default::default() };
+        let pl = places("download");
+        let args = serde_json::json!({ "url": format!("{base}/moved"), "dest": "set/a.bin" }).to_string();
+        let out = download_with(&args, &pl, &policy).await.unwrap();
+        let path = pl.runs().join("downloads/set/a.bin");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        assert!(out.contains("5000 bytes") && out.contains("sha256 "), "{out}");
+        assert!(!pl.runs().join("downloads/set/a.bin.part").exists());
+        // Second call keeps the file.
+        let out = download_with(&args, &pl, &policy).await.unwrap();
+        assert!(out.starts_with("Already downloaded"), "{out}");
+        // Loopback is refused without allow_private; hosts outside the list too.
+        let err = download_with(&args.replace("set/a", "set/b"), &pl, &Policy::default()).await.unwrap_err();
+        assert!(err.contains("private/local"), "{err}");
+        let strict = Policy { allow: vec!["huggingface.co".into()], allow_private: true, ..Default::default() };
+        let err = download_with(&args.replace("set/a", "set/c"), &pl, &strict).await.unwrap_err();
+        assert!(err.contains("not in"), "{err}");
+        std::fs::remove_dir_all(pl.runs().parent().unwrap()).ok();
     }
 
     /// Live network (run with `--ignored`): a real repo, a real file,

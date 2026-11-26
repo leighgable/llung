@@ -11,8 +11,8 @@
 //   n → Deny     record a Denied receipt in the merkle history, tell the
 //                model the operator said no
 //
-// `allow_standing` is false for tiers that never get implicit perpetual
-// grants (Gpu): those require an explicit, named `/grant`.
+// `allow_standing` is `Tier::standing_allowed()` (every tier today; a
+// standing grant always names one exact effect, e.g. `gpu:torch`).
 
 use crate::effects::Tier;
 use tokio::sync::oneshot;
@@ -28,8 +28,8 @@ pub struct PermissionRequest {
     /// Short human-readable summary of the arguments (see
     /// `summarize_arguments`).
     pub summary: String,
-    /// False when the tier forbids implicit standing grants (Gpu): the
-    /// UI must not offer "always" here — `/grant` is the only path.
+    /// False when the tier forbids standing grants: the UI must not
+    /// offer "always" here — `/grant` is the only path.
     pub allow_standing: bool,
     /// Answer channel; the UI sends exactly one.
     pub respond: oneshot::Sender<PermissionAnswer>,
@@ -107,7 +107,15 @@ pub fn summarize_arguments(effect: &crate::effects::Effect<'_>, arguments: &[u8]
         Tier::Net => json
             .get("url")
             .and_then(|u| u.as_str())
-            .map(|u| format!("GET {}", truncate(u, 200)))
+            .map(|u| {
+                let verb = if effect.name == "web_download" { "DOWNLOAD" } else { "GET" };
+                let dest = json
+                    .get("dest")
+                    .and_then(|d| d.as_str())
+                    .map(|d| format!(" -> downloads/{}", truncate(d, 80)))
+                    .unwrap_or_default();
+                format!("{verb} {}{dest}", truncate(u, 200))
+            })
             .unwrap_or_else(|| truncate(&args, 120)),
         _ => truncate(&args, 120),
     }
@@ -155,6 +163,9 @@ mod tests {
         let e = classify("web_fetch");
         let s = summarize_arguments(&e, br#"{"url": "https://github.com/a/b?x=1"}"#);
         assert_eq!(s, "GET https://github.com/a/b?x=1");
+        let e = classify("web_download");
+        let s = summarize_arguments(&e, br#"{"url": "https://huggingface.co/x.gz", "dest": "cp/x.gz"}"#);
+        assert_eq!(s, "DOWNLOAD https://huggingface.co/x.gz -> downloads/cp/x.gz");
     }
 
     #[test]

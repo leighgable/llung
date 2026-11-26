@@ -15,8 +15,8 @@
 //   Edit        edit:      edit                    host::       no
 //   ProcBash    proc:      bash (Phase 3)          bwrap        YES
 //   Repl        repl:      python, chibi, futhark  REPL mgr     YES
-//   Gpu         gpu:       futhark, torch          bwrap+GPU    YES, never implicit
-//   Net         net:       web_fetch               host HTTP    YES
+//   Gpu         gpu:       futhark, torch          bwrap+GPU    YES
+//   Net         net:       web_fetch, web_download host HTTP    YES
 //
 // Bare (prefix-less) names resolve through the registry: known host-tool
 // names map to their tier, everything else stays Wasm (preserving the
@@ -41,8 +41,8 @@ pub enum Tier {
     /// Long-running interpreter sessions (Phase 4). Prompts once per
     /// session.
     Repl,
-    /// GPU-backed execution (futhark opencl/cuda). Always prompts;
-    /// never covered by an implicit standing grant.
+    /// GPU-backed execution (futhark opencl/cuda, torch). Prompts
+    /// unless a standing grant names the exact effect (`gpu:torch`).
     Gpu,
     /// Outbound network access from the host (web_fetch). Always
     /// prompts (the URL is in the prompt): fetched text is untrusted
@@ -80,11 +80,12 @@ impl Tier {
         matches!(self, Tier::ProcBash | Tier::Repl | Tier::Gpu | Tier::Net)
     }
 
-    /// May a standing (perpetual) grant authorize this tier? Gpu is the
-    /// exception: it always needs an explicit, named grant — never an
-    /// implied one — so a stray standing rule can't unlock the GPU.
+    /// May the prompt offer "always" (a standing grant) for this tier?
+    /// Every tier, Gpu included: a standing grant names one exact effect
+    /// (`gpu:torch`, never `gpu:*`), the prompt shows that effect, and
+    /// research agents need unattended GPU access. `/grant revoke` undoes it.
     pub fn standing_allowed(&self) -> bool {
-        !matches!(self, Tier::Gpu)
+        true
     }
 }
 
@@ -107,6 +108,7 @@ const BARE_TIERS: &[(&str, Tier)] = &[
     // Runtime run inside bubblewrap (sandbox/pdf.rs), never in-process.
     ("pdf_read", Tier::FsRead),
     ("web_fetch", Tier::Net),
+    ("web_download", Tier::Net),
     ("edit", Tier::Edit),
     ("bash", Tier::ProcBash),
     ("repl", Tier::Repl),
@@ -168,6 +170,7 @@ mod tests {
         assert_eq!(classify("pdf_read").tier, Tier::FsRead);
         assert_eq!(classify("web_fetch").tier, Tier::Net);
         assert_eq!(classify("net:web_fetch").name, "web_fetch");
+        assert_eq!(classify("web_download").tier, Tier::Net);
         assert!(Tier::Net.requires_prompt(), "network access always asks");
         assert!(Tier::Net.standing_allowed());
         assert!(!Tier::FsRead.requires_prompt(), "reading a PDF does not");
@@ -215,7 +218,7 @@ mod tests {
 
         assert!(Tier::Wasm.standing_allowed());
         assert!(Tier::ProcBash.standing_allowed());
-        assert!(!Tier::Gpu.standing_allowed(), "GPU never gets implicit standing grants");
+        assert!(Tier::Gpu.standing_allowed(), "GPU may be granted perpetually (exact effect)");
     }
 
     #[test]
