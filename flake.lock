@@ -71,6 +71,22 @@
         "type": "github"
       }
     },
+    "prefix-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795691819,
+        "narHash": "sha256-4phN31HmGSkjMJjz+2pNg6IerZ2bhO+MaomyHg0mVhs=",
+        "owner": "leighgable",
+        "repo": "prefix",
+        "rev": "c763f264d86d17cc708ced269b2e43678211ec09",
+        "type": "github"
+      },
+      "original": {
+        "owner": "leighgable",
+        "repo": "prefix",
+        "type": "github"
+      }
+    },
     "pyproject-build-systems": {
       "inputs": {
         "nixpkgs": [
@@ -121,6 +137,7 @@
       "inputs": {
         "llama-cpp": "llama-cpp",
         "nixpkgs": "nixpkgs",
+        "prefix-src": "prefix-src",
         "pyproject-build-systems": "pyproject-build-systems",
         "pyproject-nix": "pyproject-nix",
         "rust-overlay": "rust-overlay",

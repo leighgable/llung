@@ -6,6 +6,7 @@ pub mod interface;
 pub mod orchestrator;
 pub mod paths;
 pub mod permissions;
+pub mod places;
 pub mod sandbox;
 pub mod tools;
 

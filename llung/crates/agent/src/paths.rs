@@ -3,10 +3,9 @@
 // Where things live, independent of the process's working directory:
 //
 // * `tools_dir()` — the wasm tool components (`<name>.wasm`).
-// * `ro_binds()`  — extra read-only data roots (`LLUNG_RO_BINDS`).
-// * `agent_readable()` — the single read rule for files an AGENT names:
-//   the workspace plus the read-only binds. The same set the bash/repl
-//   sandboxes mount, so every tool agrees on what the agent can see.
+// * `agent_readable_in()` — the path-confinement primitive behind
+//   `places::Places::{readable, writable}`.
+// (Workspace / runs / data directories live in `crate::places`.)
 
 use std::path::{Path, PathBuf};
 
@@ -48,16 +47,9 @@ pub fn tool_wasm_path(name: &str) -> PathBuf {
     tools_dir().join(format!("{name}.wasm"))
 }
 
-/// Extra read-only data roots from `LLUNG_RO_BINDS`: colon-separated
-/// absolute host paths (e.g. `~/Code/data:/mnt/traces`); nonexistent
-/// entries are skipped. The sandboxes bind each at its own path; the
-/// host-side readers accept files under them.
-pub fn ro_binds() -> Vec<PathBuf> {
-    parse_ro_binds(std::env::var("LLUNG_RO_BINDS").ok().as_deref())
-}
-
-/// Pure parser behind [`ro_binds`] (unit-testable). `~` is expanded so
-/// `LLUNG_RO_BINDS=~/Code/data` works as people expect.
+/// Parse `LLUNG_RO_BINDS`: colon-separated host paths (e.g.
+/// `~/Code/data:/mnt/traces`); `~` is expanded, nonexistent entries are
+/// skipped. One input to [`crate::places`] (the env layer).
 pub fn parse_ro_binds(value: Option<&str>) -> Vec<PathBuf> {
     let Some(value) = value else {
         return Vec::new();
@@ -70,31 +62,22 @@ pub fn parse_ro_binds(value: Option<&str>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Resolve a path an AGENT asked to read, enforcing the read rule: it
-/// must lie inside `workspace` or one of [`ro_binds`]. Relative paths
-/// resolve against the workspace; `~` is expanded. Both sides are
-/// canonicalized, so `..` and symlinks can't escape. Returns the
-/// canonical path to read.
-pub fn agent_readable(path: &str, workspace: &Path) -> Result<PathBuf, String> {
-    agent_readable_in(path, workspace, &ro_binds())
-}
-
-/// [`agent_readable`] with explicit roots (unit-testable).
-pub fn agent_readable_in(
-    path: &str,
-    workspace: &Path,
-    ro_binds: &[PathBuf],
-) -> Result<PathBuf, String> {
+/// Resolve a path an AGENT named, enforcing that it lies under one of
+/// `roots`. Relative paths resolve against `base` (the workspace); `~`
+/// is expanded. Both sides are canonicalized, so `..` and symlinks can't
+/// escape. Returns the canonical path. A path outside every root fails
+/// with an error starting `outside:` (callers phrase the message; see
+/// [`crate::places::Places::readable`]).
+pub fn agent_readable_in(path: &str, base: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     let expanded = PathBuf::from(shellexpand::tilde(path).as_ref());
     let full = if expanded.is_absolute() {
         expanded
     } else {
-        workspace.join(expanded)
+        base.join(expanded)
     };
     let canonical = full
         .canonicalize()
-        .map_err(|e| format!("cannot read '{path}': {e}"))?;
-    let roots = std::iter::once(workspace.to_path_buf()).chain(ro_binds.iter().cloned());
+        .map_err(|e| format!("cannot access '{path}': {e}"))?;
     for root in roots {
         if let Ok(root) = root.canonicalize() {
             if canonical.starts_with(&root) {
@@ -102,12 +85,7 @@ pub fn agent_readable_in(
             }
         }
     }
-    Err(format!(
-        "'{path}' is outside what this agent may read (the workspace {} and \
-         LLUNG_RO_BINDS). Ask the operator to add its directory to \
-         LLUNG_RO_BINDS, or to copy the file into the workspace.",
-        workspace.display()
-    ))
+    Err(format!("outside: '{path}'"))
 }
 
 #[cfg(test)]
@@ -168,8 +146,8 @@ mod tests {
         std::fs::write(ws.0.join("in.csv"), "a\n1\n").unwrap();
         std::fs::write(data.0.join("flights.csv"), "a\n1\n").unwrap();
         std::fs::write(secret.0.join("id_ed25519"), "KEY").unwrap();
-        let binds = vec![data.0.clone()];
 
+        let binds = vec![ws.0.clone(), data.0.clone()];
         // Workspace: relative and absolute.
         assert!(agent_readable_in("in.csv", &ws.0, &binds).is_ok());
         let abs = ws.0.join("in.csv");
@@ -180,7 +158,7 @@ mod tests {
         // Anything else is refused, with guidance.
         let s = secret.0.join("id_ed25519");
         let err = agent_readable_in(s.to_str().unwrap(), &ws.0, &binds).unwrap_err();
-        assert!(err.contains("LLUNG_RO_BINDS"), "{err}");
+        assert!(err.starts_with("outside:"), "{err}");
         // `..` can't climb out of the workspace...
         let climb = format!("../{}/id_ed25519", secret.0.file_name().unwrap().to_str().unwrap());
         assert!(agent_readable_in(&climb, &ws.0, &binds).is_err());

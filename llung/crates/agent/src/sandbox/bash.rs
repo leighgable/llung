@@ -6,7 +6,6 @@
 // cap. `writable=true` is where Phase 5's grant prompt hooks in.
 
 use serde::Deserialize;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -32,15 +31,6 @@ struct BashArgs {
     memory_mb: Option<u64>,
 }
 
-/// Workspace the sandbox sees: LLUNG_WORKSPACE override, else the
-/// harness process cwd.
-fn workspace() -> Result<PathBuf, String> {
-    if let Ok(w) = std::env::var("LLUNG_WORKSPACE") {
-        return Ok(PathBuf::from(w));
-    }
-    std::env::current_dir().map_err(|e| format!("bash: cannot resolve workspace: {e}"))
-}
-
 /// Synchronous argument validation (unit-testable without a runtime).
 fn parse_args(arguments_json: &str) -> Result<BashArgs, String> {
     let args: BashArgs = serde_json::from_str(arguments_json)
@@ -51,14 +41,12 @@ fn parse_args(arguments_json: &str) -> Result<BashArgs, String> {
     Ok(args)
 }
 
-pub async fn run(arguments_json: &str) -> Result<String, String> {
-    run_with_binds(arguments_json, &crate::paths::ro_binds()).await
-}
-
-/// [`run`] with the read-only data binds passed in (tests inject them
-/// instead of mutating the process-global LLUNG_RO_BINDS, which every
-/// concurrently spawning sandbox test would also see).
-async fn run_with_binds(arguments_json: &str, ro_binds: &[PathBuf]) -> Result<String, String> {
+/// Run `cmd` in the sandbox. Mounts come from `places` (see
+/// `crate::places`): the workspace (ro unless `writable`), the data
+/// directories ro at their own paths, and the runs directory rw —
+/// the agent's scratch area, writable without approval. The runs path
+/// is also exported as `$LLUNG_RUNS_DIR`.
+pub async fn run(arguments_json: &str, places: &crate::places::Places) -> Result<String, String> {
     let args = parse_args(arguments_json)?;
     let timeout_secs = args
         .timeout_secs
@@ -66,7 +54,7 @@ async fn run_with_binds(arguments_json: &str, ro_binds: &[PathBuf]) -> Result<St
         .clamp(1, MAX_TIMEOUT_SECS);
     let memory_mb = args.memory_mb.unwrap_or(DEFAULT_MEMORY_MB).clamp(16, 1 << 20);
     let writable = args.writable.unwrap_or(false);
-    let workspace = workspace()?;
+    let workspace = places.workspace().to_path_buf();
 
     // Escape hatch for hosts without bubblewrap (macOS dev, exotic
     // CI): LLUNG_SANDBOX=off runs the command directly with the same
@@ -77,16 +65,29 @@ async fn run_with_binds(arguments_json: &str, ro_binds: &[PathBuf]) -> Result<St
 
     let mut sb = Sandbox::baseline("sh", vec!["-c".into(), args.cmd.clone()]);
     sb.workspace(&workspace, writable);
-    // Operator data roots (LLUNG_RO_BINDS, e.g. ~/Code/data): visible
-    // read-only at their own paths — same set the repl sessions and
-    // plot_device's host-side reader accept.
-    for dir in ro_binds {
-        sb.bind_ro(dir, dir);
+    // Data directories (e.g. ~/Code/data): read-only at their own
+    // paths — the same set the repl sessions and plot_device's
+    // host-side reader accept.
+    for dir in places.data_dirs() {
+        sb.bind_ro(&dir, &dir);
+    }
+    // Runs: writable scratch. A chosen-but-missing runs dir (unmounted
+    // drive) is reported in the output, not created.
+    let mut runs_note = None;
+    match places.runs_ready() {
+        Ok(runs) => {
+            sb.bind_rw(&runs, &runs);
+            sb.setenv("LLUNG_RUNS_DIR", runs.to_string_lossy().into_owned());
+        }
+        Err(e) => runs_note = Some(e),
     }
     sb.memory_max(format!("{memory_mb}M"));
     let out = sb.run(Duration::from_secs(timeout_secs)).await?;
 
     let mut text = String::new();
+    if let Some(note) = &runs_note {
+        text.push_str(&format!("[runs directory not mounted: {note}]\n"));
+    }
     if let Some(warn) = &out.degraded {
         text.push_str(&format!("[sandbox: degraded — {warn}]\n"));
     }
@@ -194,7 +195,49 @@ mod tests {
     /// process cwd as the workspace (read-only).
     async fn bash(cmd: &str) -> Result<String, String> {
         let args = serde_json::json!({"cmd": cmd, "timeout_secs": 10}).to_string();
-        run(&args).await
+        run(&args, &crate::places::current()).await
+    }
+
+    fn places_with(data: Vec<std::path::PathBuf>, runs: &std::path::Path) -> crate::places::Places {
+        crate::places::Places::fixed(std::env::current_dir().unwrap(), runs, data)
+    }
+
+    /// The runs directory is writable (no approval) while the workspace
+    /// stays read-only, and its path is exported as $LLUNG_RUNS_DIR.
+    #[tokio::test]
+    async fn runs_dir_is_writable_and_exported() {
+        if skip_without_bwrap() {
+            return;
+        }
+        let runs = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("llung-bash-runs-{}", std::process::id()));
+        std::fs::create_dir_all(&runs).unwrap();
+        let places = places_with(vec![], &runs);
+        let args = serde_json::json!({
+            "cmd": "echo ok > \"$LLUNG_RUNS_DIR/marker\" && cat \"$LLUNG_RUNS_DIR/marker\"",
+            "timeout_secs": 10
+        })
+        .to_string();
+        let out = run(&args, &places).await;
+        let written = std::fs::read_to_string(runs.join("marker")).ok();
+        std::fs::remove_dir_all(&runs).ok();
+        assert!(out.expect("runs is writable").contains("ok"));
+        assert_eq!(written.as_deref(), Some("ok\n"));
+
+        // A chosen runs dir that is missing (unmounted drive): the
+        // command still runs, the output says why runs isn't there, and
+        // nothing is created.
+        let gone = runs.join("not-mounted");
+        let out = run(
+            &serde_json::json!({"cmd": "echo hi", "timeout_secs": 10}).to_string(),
+            &places_with(vec![], &gone),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("runs directory not mounted"), "{out}");
+        assert!(!gone.exists());
     }
 
     /// LLUNG_RO_BINDS directories (operator data outside the
@@ -210,10 +253,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("llung-bash-robind-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("flights.csv"), "month,passengers\n1949-01,112\n").unwrap();
-        let binds = vec![dir.clone()];
+        let places = places_with(vec![dir.clone()], &std::env::temp_dir().join("llung-unused-runs"));
         let args = |cmd: String| serde_json::json!({"cmd": cmd, "timeout_secs": 10}).to_string();
-        let read = run_with_binds(&args(format!("head -2 {}/flights.csv", dir.display())), &binds).await;
-        let write = run_with_binds(&args(format!("echo x > {}/new.txt", dir.display())), &binds).await;
+        let read = run(&args(format!("head -2 {}/flights.csv", dir.display())), &places).await;
+        let write = run(&args(format!("echo x > {}/new.txt", dir.display())), &places).await;
         std::fs::remove_dir_all(&dir).ok();
 
         let read = read.expect("bound data is readable");

@@ -37,14 +37,56 @@ their workspace). Logs go to `~/.local/state/llung/llung.log`
 torch research interpreter is devShell-only. The python research env is
 `packages.python-env`.
 
-### What agents can see
+### Agent places: workspace, runs, data
 
-Agents read files from the workspace (`LLUNG_WORKSPACE`, default: the
-launch directory) plus read-only data directories listed in
-`LLUNG_RO_BINDS` (colon-separated, `~` allowed, e.g.
-`LLUNG_RO_BINDS=~/Code/data`). The bash and repl sandboxes mount exactly
-those, and `plot_device` refuses agent-named paths outside them (your own
-`/plot` is unrestricted).
+Agents work with three kinds of directory, each with its own rules:
+
+| place | what | agent access | default |
+|---|---|---|---|
+| **workspace** | the code agents read and edit | read; sandbox writes need your approval | the launch directory |
+| **runs** | scratch: experiment runs, checkpoints, plots | read + write, no prompt (`$LLUNG_RUNS_DIR` in sandboxes) | `~/.local/share/llung/runs` (`~/Library/Application Support/llung/runs` on macOS) |
+| **data** | input directories (CSV files, traces) | read-only | none |
+
+Change them from the tui; changes are saved per machine in
+`~/.config/llung/places.json` and apply immediately:
+
+    /places                      # show all three and where each came from
+    /workspace ~/Code/project    # or: /workspace reset (back to the launch dir)
+    /runs /mnt/scratch/runs      # must already exist; /runs reset
+    /data add ~/Code/data        # /data rm ~/Code/data
+
+Local agents are told what changed at their next turn (the prompt leads
+with a notice), and their REPL sessions restart on next use so the
+mounts match. Nothing about places is sent over the network.
+
+A chosen runs directory that doesn't exist is refused, never created: an
+unmounted drive's mount point would otherwise quietly fill the system
+disk with checkpoints. (The default location is created on demand.)
+
+For dev shells and Nix wrappers, `LLUNG_WORKSPACE`, `LLUNG_RUNS_DIR` and
+`LLUNG_RO_BINDS` (colon-separated) override the saved values at launch.
+GUI builds (macOS, iOS) don't see a shell environment, so nothing
+depends on them.
+
+Every tool honours the same places: the bash and repl sandboxes mount
+exactly these; glob/grep are confined to them; `edit` writes only to the
+workspace and runs; `plot_device` and `show_image` refuse paths outside
+them (your own `/plot` is unrestricted). Every turn's prompt tells the
+agent its places, so it doesn't guess paths.
+
+Tool calls: each agent's prompt teaches the tool-call format its model
+was trained on, read from the model's chat template (llama-server
+`/props`): Qwen-family XML (`<tool_call><function=…>`, e.g. SenseNova),
+Hermes JSON, or else a compact `TOOL {...}` line (cloud models).
+`LLUNG_TOOL_PROTOCOL=line|xml|hermes` overrides. All formats are parsed
+regardless. A reply that looks like a tool call but doesn't parse is
+fed back with the exact format, never published: published markup
+becomes history the model imitates.
+
+To debug a turn, rebuild the exact prompt an agent saw and replay it
+against the live model:
+
+    cargo run -p agent --example replay_turn -- <topic> "<trigger text>" --send 4
 
 Other knobs: `LLUNG_TOOLS_DIR` overrides where the wasm tools are found
 (default: next to the executable, else the source tree, so launch from
@@ -54,10 +96,15 @@ keep streaming are never cut off.
 
 ### ML research harness
 
-`experiments/` holds the agent-driven trainer (`core/train.py`, modes
-ga/pretrain/distill/rl), the observability contract
-(`core/monitor.py`, `metrics.csv` + DONE/FAILED sentinels), and
-`show_image` publishes matplotlib plots from the torch REPL as chat
-attachments. See `RESEARCH-HARNESS-PLAN.md`.
+`experiments/` holds the agent-driven, architecture-agnostic trainer:
+a typer CLI (`core/cli.py`: new / check / launch / status / ls / stop)
+over one engine (`core/train.py`, modes pretrain/distill/ga/rl) into
+which you plug any `nn.Module` by naming its factory in the run config.
+The observability contract is `metrics.csv` + DONE/FAILED sentinels
+(`core/monitor.py`), and `show_image` publishes matplotlib plots from
+the torch REPL as chat attachments. Runs go to the runs directory
+(above), not the repo. The agent is only told about the trainer when
+its workspace contains `experiments/core/cli.py`. See
+`experiments/README.md` and `RESEARCH-HARNESS-PLAN.md`.
 
 License: MIT 

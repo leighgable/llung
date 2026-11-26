@@ -14,11 +14,16 @@ pub const HOST_TOOLS: &[&str] = &["glob", "grep", "edit"];
 
 /// Dispatch to a host tool. Returns `None` when `name` is not a host
 /// tool, so the caller falls through to the wasm runtime path.
-pub fn dispatch(name: &str, arguments_json: &str) -> Option<Result<String, String>> {
+/// `scope`: the agent's places (confined), or `None` for the operator.
+pub fn dispatch(
+    name: &str,
+    arguments_json: &str,
+    scope: Option<&crate::places::Places>,
+) -> Option<Result<String, String>> {
     match name {
-        "glob" => Some(glob::run(arguments_json)),
-        "grep" => Some(grep::run(arguments_json)),
-        "edit" => Some(edit::run(arguments_json)),
+        "glob" => Some(glob::run_in(arguments_json, scope)),
+        "grep" => Some(grep::run_in(arguments_json, scope)),
+        "edit" => Some(edit::run_in(arguments_json, scope)),
         _ => None,
     }
 }

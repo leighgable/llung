@@ -99,6 +99,13 @@ pub trait Backend: Send + Sync {
     fn try_duplicate(&self) -> Option<Box<dyn Backend>> {
         None
     }
+
+    /// The model's chat template, when the server exposes it
+    /// (llama-server `/props`). Used to pick the tool-call format the
+    /// model was trained on ([`crate::tools::ToolProtocol`]).
+    fn chat_template(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async { None })
+    }
 }
 
 pub struct OpenAiCompatible {
@@ -583,6 +590,35 @@ impl Backend for OpenAiCompatible {
     fn try_duplicate(&self) -> Option<Box<dyn Backend>> {
         // Cheap to clone: two strings plus a shared connection pool.
         Some(Box::new(self.clone()))
+    }
+
+    fn chat_template(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async move {
+            // Cloud endpoints (they carry an API key) have no /props.
+            if self.api_key.is_some() {
+                return None;
+            }
+            let root = self.base_url.trim_end_matches('/');
+            let root = root.strip_suffix("/v1").unwrap_or(root);
+            let url = format!("{root}/props");
+            let resp = self
+                .client
+                .get(url)
+                .query(&[("model", self.model.as_str())])
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let props: serde_json::Value = resp.json().await.ok()?;
+            props
+                .get("chat_template")?
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        })
     }
 
     fn chat_stream<'a>(

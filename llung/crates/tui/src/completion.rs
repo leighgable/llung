@@ -97,7 +97,9 @@ fn file_completion(text: &str, token: &str, start: usize, end: usize) -> Option<
     let mention = token.starts_with('@');
     let command = text.split(' ').next().unwrap_or("");
     let token_idx = text[..start].split(' ').filter(|t| !t.is_empty()).count();
-    let command_path = matches!(command, "/attach" | "/plot") && token_idx == 1;
+    let command_path = (matches!(command, "/attach" | "/plot" | "/workspace" | "/runs")
+        && token_idx == 1)
+        || (command == "/data" && token_idx == 2);
     if !mention && !command_path {
         return None;
     }

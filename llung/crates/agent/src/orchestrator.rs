@@ -1,6 +1,5 @@
 // crates/agent/src/orchestrator.rs
 use crate::aukora::kernel::{Grant, KernelState, Manifest, StandingGrant};
-use crate::aukora::security::secure_execute_agent_tool;
 use crate::aukora::supervisor::SupervisorKey;
 use crate::permissions::{PermissionAnswer, PermissionRequest};
 use crate::config::AgentConfig;
@@ -84,11 +83,18 @@ pub struct AgentLoopContext {
     /// Channel to the UI's permission prompt: the harness asks the
     /// operator before running prompt-required effect tiers.
     pub perm_tx: mpsc::Sender<PermissionRequest>,
-    /// The agent's workspace root, resolved ONCE at construction
-    /// (LLUNG_WORKSPACE or the process cwd). Tools like show_image and
-    /// the sandbox binders agree on it without re-reading the
-    /// environment — and tests don't need to mutate env vars.
-    pub workspace: std::path::PathBuf,
+    /// Where the agent works (workspace, runs, data dirs): the places
+    /// snapshot this agent last saw. Refreshed from
+    /// [`crate::places::current`] at the start of every turn, so the
+    /// operator can hot-swap directories; every tool in a turn uses the
+    /// same snapshot.
+    pub places: std::sync::Arc<crate::places::Places>,
+    /// Place changes the agent hasn't been told about yet (shown as a
+    /// NOTICE in the next turn's prompt; cleared once a turn succeeds).
+    pub pending_place_changes: Vec<String>,
+    /// The tool-call format this agent's prompt teaches, resolved on the
+    /// first turn (see [`resolve_tool_protocol`]). `None` = not yet.
+    pub tool_protocol: Option<crate::tools::ToolProtocol>,
     /// Background compactor cache: (chain tip message id, flattened
     /// compressed view). When a turn's chain tip matches, the view is
     /// reused instead of rebuilding the summary tree synchronously.
@@ -175,10 +181,6 @@ impl AgentLoopContext {
             }),
         );
         kernel.pinned_keys.insert(supervisor.public_pin());
-        let workspace = std::env::var("LLUNG_WORKSPACE")
-            .map(std::path::PathBuf::from)
-            .or_else(|_| std::env::current_dir())
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
         Self {
             config,
             backend,
@@ -189,7 +191,9 @@ impl AgentLoopContext {
             topic,
             self_being_id,
             self_name,
-            workspace,
+            places: crate::places::current(),
+            pending_place_changes: Vec::new(),
+            tool_protocol: None,
             kernel,
             supervisor,
             wasm_tx: agent_rt::spawn_wasm_worker(),
@@ -324,7 +328,14 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
 
     let trigger_id = id_of(&structured);
     let trigger = structured.clone();
-    if let Err(e) = generate_reply(&mut *ctx, &text, trigger_id.as_deref(), trigger.as_ref()).await {
+    refresh_places(ctx);
+    resolve_tool_protocol(ctx).await;
+    let result = generate_reply(&mut *ctx, &text, trigger_id.as_deref(), trigger.as_ref()).await;
+    if result.is_ok() {
+        // The model saw the NOTICE; don't repeat it.
+        ctx.pending_place_changes.clear();
+    }
+    if let Err(e) = result {
         tracing::error!("Agent turn failed: {e}");
         // Never go silent: a broken model backend (connection
         // refused, timeout, ...) must show up in the chat as an
@@ -342,6 +353,47 @@ async fn handle_event(ctx: &mut AgentLoopContext, event: NetworkEvent) {
             tracing::error!("failed to publish turn-error notice: {pe}");
         }
     }
+}
+
+/// Pick the tool-call format to teach: `LLUNG_TOOL_PROTOCOL` if set,
+/// else whatever the model's own chat template uses (llama-server
+/// `/props`), else the compact TOOL line. Resolved once per agent; an
+/// unreachable server is retried next turn.
+async fn resolve_tool_protocol(ctx: &mut AgentLoopContext) {
+    if ctx.tool_protocol.is_some() {
+        return;
+    }
+    if let Some(p) = std::env::var("LLUNG_TOOL_PROTOCOL")
+        .ok()
+        .and_then(|v| crate::tools::ToolProtocol::parse(&v))
+    {
+        ctx.tool_protocol = Some(p);
+        return;
+    }
+    match ctx.backend.chat_template().await {
+        Some(template) => {
+            let p = crate::tools::ToolProtocol::from_chat_template(&template);
+            tracing::info!(agent = %ctx.self_name, protocol = ?p, "tool protocol from chat template");
+            ctx.tool_protocol = Some(p);
+        }
+        None => {} // Line for now; ask again next turn
+    }
+}
+
+/// Adopt the live places snapshot if the operator changed it since this
+/// agent's last turn, remembering what changed so the next prompt can
+/// tell the model (paths in its history may now be stale).
+fn refresh_places(ctx: &mut AgentLoopContext) {
+    let now = crate::places::current();
+    if now.generation == ctx.places.generation {
+        return;
+    }
+    let changes = ctx.places.diff(&now);
+    if !changes.is_empty() {
+        tracing::info!(agent = %ctx.self_name, ?changes, "places changed");
+        ctx.pending_place_changes.extend(changes);
+    }
+    ctx.places = now;
 }
 
 /// Periodic self-compaction (OptChat's background compactor): compress
@@ -581,11 +633,13 @@ async fn execute_secured_tool(
     let grant = create_self_grant(&manifest, &ctx.supervisor);
 
     // Build receipt via Aukora kernel + wasm runtime
-    let (_receipt, output) = secure_execute_agent_tool(
+    let places = ctx.places.clone();
+    let (_receipt, output) = crate::aukora::security::secure_execute_agent_tool_in(
         &mut ctx.kernel,
         &ctx.wasm_tx, // agent-rt wasm worker handle
         manifest,
         grant,
+        &places,
     )
     .await?;
 
@@ -659,25 +713,20 @@ struct ShowImageArgs {
     caption: Option<String>,
 }
 
-/// Resolve a tool-supplied path against the workspace, refusing
-/// escapes: `..` segments and absolute paths outside the workspace
-/// both canonicalize past the workspace root and are rejected.
-fn resolve_in_workspace(workspace: &std::path::Path, arg: &str) -> Result<std::path::PathBuf, String> {
-    let joined = if std::path::Path::new(arg).is_absolute() {
-        std::path::PathBuf::from(arg)
-    } else {
-        workspace.join(arg)
-    };
-    let canon = joined
-        .canonicalize()
-        .map_err(|e| format!("'{arg}' does not resolve: {e}"))?;
-    let root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    if !canon.starts_with(&root) {
-        return Err(format!("'{arg}' escapes the workspace"));
-    }
-    Ok(canon)
+/// Resolve a tool-supplied image path: relative paths resolve against
+/// the workspace; the file must lie in the workspace or the runs
+/// directory (where plots are saved). `..` segments and absolute paths
+/// elsewhere canonicalize outside both roots and are rejected.
+fn resolve_image_path(places: &crate::places::Places, arg: &str) -> Result<std::path::PathBuf, String> {
+    crate::paths::agent_readable_in(arg, places.workspace(), &places.writable_roots()).map_err(
+        |e| {
+            if e.starts_with("outside:") {
+                format!("'{arg}' escapes the workspace and the runs directory")
+            } else {
+                e
+            }
+        },
+    )
 }
 
 /// `show_image` (plan Phase 2): publish a workspace image — a
@@ -692,7 +741,7 @@ async fn show_image(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let args: ShowImageArgs = serde_json::from_slice(arguments)
         .map_err(|e| format!("show_image: arguments must be JSON with 'path': {e}"))?;
-    let path = resolve_in_workspace(&ctx.workspace, &args.path)
+    let path = resolve_image_path(&ctx.places, &args.path)
         .map_err(|e| format!("show_image: {e}"))?;
     let meta = std::fs::metadata(&path)
         .map_err(|e| format!("show_image: cannot stat '{}': {e}", args.path))?;
@@ -811,13 +860,47 @@ fn turn_prompt_inner(
     feedback: Option<&str>,
     trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
+    assemble_turn_prompt(
+        &ctx.self_name,
+        &ctx.places,
+        ctx.tool_protocol.unwrap_or_default(),
+        &ctx.pending_place_changes,
+        context,
+        trigger_text,
+        feedback,
+        trigger_attachment,
+    )
+}
+
+/// The turn prompt from its parts — public so diagnostics
+/// (`examples/replay_turn.rs`) rebuild EXACTLY what an agent sent.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_turn_prompt(
+    self_name: &str,
+    places: &crate::places::Places,
+    protocol: crate::tools::ToolProtocol,
+    pending_place_changes: &[String],
+    context: &str,
+    trigger_text: &str,
+    feedback: Option<&str>,
+    trigger_attachment: Option<&llung_core::network::message::Attachment>,
+) -> Vec<ChatMessage> {
     // The triggering message carries the tool protocol AND the
     // optional image: a multimodal backend (SenseNova + mmproj) sees
     // the attachment here; a text-only one just reads the caption.
+    // A pending places change leads the message: it is the most
+    // important (and most recent) fact about the agent's environment.
+    let notice = if pending_place_changes.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", crate::tools::places_changed_notice(&pending_place_changes))
+    };
     let mut trigger_msg = ChatMessage::user(format!(
-        "New message: {}\n\n{}",
+        "{}New message: {}\n\n{}\n\n{}",
+        notice,
         trigger_text,
-        crate::tools::tool_instructions(),
+        crate::tools::tool_instructions(places, protocol),
+        crate::tools::environment_note(places),
     ));
     if let Some(att) = trigger_attachment {
         trigger_msg = trigger_msg.with_attachment(att.clone());
@@ -828,7 +911,7 @@ fn turn_prompt_inner(
              History is compressed; lines are numbered like [3] or [2-5] \
              — use the zoom tool to expand a range to its full text. \
              Respond concisely.",
-            ctx.self_name
+            self_name
         )),
         ChatMessage::user(context.to_string()),
         trigger_msg,
@@ -1025,7 +1108,7 @@ async fn generate_reply(
                          were rejected: {e}. The zoom tool takes integer 'start' \
                          and 'end' (end greater than start) — the [n] or [a-b] \
                          indices shown on the history lines. Reply with exactly \
-                         one corrected TOOL line, or just answer normally."
+                         one corrected tool call, or just answer normally."
                     );
                     prompt = turn_prompt_feedback(
                         ctx,
@@ -1099,6 +1182,12 @@ async fn generate_reply(
     // zoom loop: bounded rounds, every call/response pair published.
     let mut steps = 0u32;
     let mut step_log: Vec<String> = Vec::new();
+    // Unparseable tool markup gets fed back (bounded) instead of being
+    // published: in the chat it would become history the model then
+    // imitates. A corrected call re-enters the tool loop.
+    let protocol = ctx.tool_protocol.unwrap_or_default();
+    let mut malformed_rounds = 0u32;
+    loop {
     'tool: while let Some(call) = crate::tools::parse_tool_call(&reply) {
         // The streamed preview was raw tool-call text: withdraw it.
         let _ = ctx
@@ -1116,8 +1205,8 @@ async fn generate_reply(
         let (content, error) = loop {
             // Confined: the host reads this file outside any sandbox,
             // so the agent may only name workspace / LLUNG_RO_BINDS paths.
-            let workspace = ctx.workspace.clone();
-            let resolved = crate::tools::resolve_data_file(call.clone(), Some(&workspace)).await;
+            let places = ctx.places.clone();
+            let resolved = crate::tools::resolve_data_file(call.clone(), Some(&places)).await;
             let result: Result<String, (String, String)> = match resolved {
                 Ok(resolved) => {
                     match execute_secured_tool(
@@ -1147,7 +1236,7 @@ async fn generate_reply(
                     let feedback = format!(
                         "Your last reply was a tool call to '{name}', but it \
                          failed: {e}. Correct the arguments and reply with \
-                         exactly one corrected TOOL line, or just answer \
+                         exactly one corrected tool call, or just answer \
                          normally."
                     );
                     prompt = turn_prompt_feedback(
@@ -1244,7 +1333,8 @@ async fn generate_reply(
         feedback.push_str(&format!(
             "Tool '{tool_name}' {}returned:\n```\n{}\n```\n\
              Continue working toward the request: reply with exactly one \
-             TOOL line to run another tool, or answer normally.",
+             tool call (in the format shown above) to run another tool, \
+             or answer normally.",
             if error { "FAILED and " } else { "" },
             truncate_for_feedback(&content),
         ));
@@ -1265,6 +1355,57 @@ async fn generate_reply(
             &reply_id,
         )
         .await?;
+    }
+
+        if !crate::tools::looks_like_tool_markup(&reply) || malformed_rounds >= MAX_TOOL_ROUNDS {
+            break;
+        }
+        malformed_rounds += 1;
+        tracing::warn!(agent = %ctx.self_name, "unparseable tool markup; feeding back the format");
+        let feedback = format!(
+            "Your last reply looks like a tool call, but it could not be \
+             parsed, so nothing ran. Reply with exactly one tool call in \
+             exactly this format:\n{}\nor answer normally, without any tool \
+             markup.",
+            protocol.format()
+        );
+        prompt = turn_prompt_feedback(
+            ctx,
+            &context,
+            trigger_text,
+            &feedback,
+            trigger_attachment.as_ref(),
+        );
+        reply = ask_streamed(
+            &*ctx.backend,
+            &ctx.stream_tx,
+            &ctx.topic,
+            &ctx.self_being_id,
+            &ctx.self_name,
+            &prompt,
+            &reply_id,
+        )
+        .await?;
+    }
+    if crate::tools::looks_like_tool_markup(&reply) {
+        // Still malformed after the feedback rounds: say so in prose
+        // rather than publishing markup into the history.
+        let _ = ctx
+            .stream_tx
+            .send(AgentStream::Retract {
+                topic: ctx.topic.clone(),
+                message_id: reply_id,
+            })
+            .await;
+        return publish_agent_text_on(
+            ctx,
+            trigger_id.map(str::to_string),
+            "⚠ I tried to call a tool, but couldn't get the call format right, \
+             so nothing ran. Please try asking again."
+                .to_string(),
+            None,
+        )
+        .await;
     }
 
     // Prompt-parroting (common with tiny models): publishing the echo
@@ -1341,6 +1482,7 @@ fn create_self_grant(manifest: &Manifest, supervisor: &SupervisorKey) -> Grant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aukora::security::secure_execute_agent_tool;
     use crate::aukora::kernel::{Manifest, ReceiptStatus, compute_sha256};
 
     fn landscape_wasm() -> Option<std::path::PathBuf> {
@@ -1704,9 +1846,10 @@ mod tests {
             arguments: format!("{{\"path\":{:?}}}", path.display().to_string()),
         };
 
-        let ok = crate::tools::resolve_data_file(call(&ws.join("in.csv")), Some(&ws)).await;
+        let places = crate::places::Places::fixed(&ws, base.join("runs"), vec![]);
+        let ok = crate::tools::resolve_data_file(call(&ws.join("in.csv")), Some(&places)).await;
         assert!(ok.unwrap().arguments.contains("a\\n1"));
-        let err = crate::tools::resolve_data_file(call(&outside.join("secret.csv")), Some(&ws))
+        let err = crate::tools::resolve_data_file(call(&outside.join("secret.csv")), Some(&places))
             .await
             .unwrap_err();
         assert!(err.contains("outside what this agent may read"), "{err}");
@@ -2012,6 +2155,98 @@ mod tests {
         assert!(matches!(kinds[0], MessageKind::ToolCall { .. }));
         assert!(matches!(kinds[1], MessageKind::ToolResponse { .. }));
         assert!(matches!(kinds[2], MessageKind::Agent));
+    }
+
+    fn scripted_ctx(replies: Vec<String>) -> (AgentLoopContext, ScriptBackend, mpsc::Receiver<NetworkCommand>) {
+        let backend = ScriptBackend::new(replies);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (stream_tx, _stream_rx) = mpsc::channel(64);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let being = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let ctx = AgentLoopContext::new(
+            AgentConfig::default(),
+            Box::new(backend.clone()),
+            crate::history::HistoryCompressor::new(
+                Box::new(CountingSummarizer {
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                128_000,
+            ),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            being,
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+        (ctx, backend, cmd_rx)
+    }
+
+    fn published(cmd_rx: &mut mpsc::Receiver<NetworkCommand>) -> Vec<ChatMessage> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let NetworkCommand::PublishMessage { contents, .. } = cmd {
+                out.push(serde_json::from_slice(&contents).unwrap());
+            }
+        }
+        out
+    }
+
+    /// Unparseable tool markup is fed back with the exact format (never
+    /// published), and the corrected call runs.
+    #[tokio::test]
+    async fn malformed_tool_markup_is_fed_back_not_published() {
+        let (mut ctx, backend, mut cmd_rx) = scripted_ctx(vec![
+            // A call in no syntax we parse (unknown wrapper, no name).
+            "<tool_call>\n<call>glob **/*.toml</call>\n</tool_call>".to_string(),
+            r#"TOOL {"name":"glob","arguments":{"pattern":"Cargo.toml"}}"#.to_string(),
+            "found it".to_string(),
+        ]);
+        generate_reply(&mut ctx, "alice: @tester find the manifest", None, None)
+            .await
+            .unwrap();
+        let prompts = backend.prompts();
+        assert_eq!(prompts.len(), 3);
+        let fb = &prompts[1].last().unwrap().content;
+        assert!(fb.contains("could not be parsed") && fb.contains("TOOL {"), "{fb}");
+        let msgs = published(&mut cmd_rx);
+        assert!(msgs.iter().all(|m| !m.content.contains("<tool_call>")), "markup published");
+        assert!(matches!(msgs[0].kind, MessageKind::ToolCall { .. }));
+        assert_eq!(msgs.last().unwrap().content, "found it");
+    }
+
+    /// A model that never gets the format right: a prose notice, not
+    /// markup, lands in the chat.
+    #[tokio::test]
+    async fn persistently_malformed_markup_becomes_a_prose_notice() {
+        let bad = "<tool_call><call>?</call></tool_call>".to_string();
+        let (mut ctx, backend, mut cmd_rx) = scripted_ctx(vec![bad; 1 + MAX_TOOL_ROUNDS as usize]);
+        generate_reply(&mut ctx, "alice: @tester do it", None, None).await.unwrap();
+        assert_eq!(backend.prompts().len(), 1 + MAX_TOOL_ROUNDS as usize);
+        let msgs = published(&mut cmd_rx);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].content.contains("couldn't get the call format right"));
+    }
+
+    /// The taught format follows the protocol: the native XML for
+    /// Qwen-family templates, and the feedback repeats it.
+    #[tokio::test]
+    async fn native_protocol_is_taught_and_parsed() {
+        let (mut ctx, backend, mut cmd_rx) = scripted_ctx(vec![
+            "<tool_call>\n<function=glob>\n<parameter=pattern>\nCargo.toml\n</parameter>\n</function>\n</tool_call>".to_string(),
+            "done".to_string(),
+        ]);
+        ctx.tool_protocol = Some(crate::tools::ToolProtocol::QwenXml);
+        generate_reply(&mut ctx, "alice: @tester find it", None, None).await.unwrap();
+        let first = &backend.prompts()[0];
+        let taught = &first[2].content;
+        assert!(taught.contains("<function=TOOL_NAME>") && !taught.contains("TOOL {"), "{taught}");
+        let msgs = published(&mut cmd_rx);
+        assert!(matches!(&msgs[0].kind, MessageKind::ToolCall { tool_name, .. } if tool_name == "glob"));
     }
 
     #[tokio::test]
@@ -2461,6 +2696,43 @@ mod tests {
             ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// When the operator changes the places, the agent adopts the new
+    /// snapshot at its next turn and the prompt leads with a NOTICE
+    /// listing what changed; the Files section shows the new paths.
+    #[tokio::test]
+    async fn places_change_is_announced_in_the_next_prompt() {
+        let (mut ctx, _cmd_rx) = ctx_with_rx();
+        // Pretend the agent last saw an older snapshot.
+        ctx.places = std::sync::Arc::new(crate::places::Places::fixed(
+            "/old/workspace",
+            "/old/runs",
+            vec![],
+        ));
+        refresh_places(&mut ctx);
+        let live = crate::places::current();
+        assert_eq!(ctx.places.generation, live.generation, "adopted the live snapshot");
+        assert!(
+            ctx.pending_place_changes
+                .iter()
+                .any(|c| c.contains("/old/workspace") && c.contains(&live.workspace().display().to_string())),
+            "{:?}",
+            ctx.pending_place_changes
+        );
+        let prompt = turn_prompt(&ctx, "history", "@tester hi", None);
+        let last = format!("{:?}", prompt.last().unwrap());
+        assert!(last.contains("NOTICE"), "{last}");
+        assert!(last.contains("/old/workspace"), "{last}");
+        assert!(last.contains(&format!("your workspace is {}", live.workspace().display())), "{last}");
+
+        // Once told (a successful turn clears it), no repeat — and no
+        // notice while nothing changes.
+        ctx.pending_place_changes.clear();
+        refresh_places(&mut ctx);
+        assert!(ctx.pending_place_changes.is_empty());
+        let prompt = turn_prompt(&ctx, "history", "@tester hi", None);
+        assert!(!format!("{:?}", prompt.last().unwrap()).contains("NOTICE"));
     }
 
     /// The plan's Phase-2 acceptance: an orchestrator-level show_image

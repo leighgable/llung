@@ -15,16 +15,33 @@ const MAX_RESULTS: usize = 1000;
 struct GlobArgs {
     /// Glob pattern, e.g. "**/*.rs" (any depth) or "*.rs".
     pattern: String,
-    /// Root directory to search (default: process cwd).
+    /// Root directory to search (default: the workspace for agents,
+    /// the process cwd for the operator).
     #[serde(default)]
     path: Option<String>,
 }
 
+/// Operator-side glob (unconfined).
 pub fn run(arguments_json: &str) -> Result<String, String> {
+    run_in(arguments_json, None)
+}
+
+/// `scope`: `Some(places)` for AGENT calls — the root defaults to the
+/// workspace, relative roots resolve against it, and the root must lie
+/// under a readable place (workspace, runs, data).
+pub fn run_in(
+    arguments_json: &str,
+    scope: Option<&crate::places::Places>,
+) -> Result<String, String> {
     let args: GlobArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("glob: arguments must be JSON with a 'pattern' string: {e}"))?;
     if args.pattern.trim().is_empty() {
         return Err("glob: 'pattern' must not be empty".into());
+    }
+    if let Some(places) = scope {
+        let root = args.path.as_deref().unwrap_or(".");
+        let root = places.readable(root).map_err(|e| format!("glob: {e}"))?;
+        return walk(&args.pattern, root);
     }
     let root = args.path.as_deref().unwrap_or(".");
     let root = shellexpand::tilde(root).to_string();
@@ -34,12 +51,16 @@ pub fn run(arguments_json: &str) -> Result<String, String> {
     // — "data/flights.csv" under ~/Code became a miss under the repo.)
     let root_path = std::path::absolute(PathBuf::from(root.as_ref() as &str))
         .map_err(|e| format!("glob: bad path '{root}': {e}"))?;
+    walk(&args.pattern, root_path)
+}
+
+fn walk(pattern: &str, root_path: PathBuf) -> Result<String, String> {
     if !root_path.is_dir() {
         return Err(format!("glob: '{}' is not a directory", root_path.display()));
     }
-    let matcher = globset::GlobBuilder::new(&args.pattern)
+    let matcher = globset::GlobBuilder::new(pattern)
         .build()
-        .map_err(|e| format!("glob: bad pattern '{}': {e}", args.pattern))?
+        .map_err(|e| format!("glob: bad pattern '{pattern}': {e}"))?
         .compile_matcher();
 
     let mut out = String::new();

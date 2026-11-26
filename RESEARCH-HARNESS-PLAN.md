@@ -66,26 +66,38 @@ New top-level `experiments/` directory, bind-mounted rw into the torch sandbox
 (workspaces already are; follow the same mount convention as the repl
 workspace). Only two files are "framework"; everything else is per-run data:
 
-### 1.1 `experiments/core/train.py` — ONE mode-agnostic driver
+### 1.1 `experiments/core/` — ONE architecture-agnostic engine + a CLI
 
 ```
-python3 core/train.py --mode {ga,pretrain,distill,rl} --config runs/<id>/config.yaml
+python3 core/cli.py new <run> --model <file.py:Factory> [--mode {pretrain,distill,ga,rl}] [-s k=v]
+python3 core/cli.py {check,run,launch,status,ls,stop} <run>
 ```
 
-- Plain YAML config, everything seeded, full provenance copied into the run dir.
+- `core/train.py` is the engine and knows NO architecture: `model.factory`
+  (`file.py:Name` / `pkg.module:Name`, rest of the section = kwargs)
+  returns any `nn.Module`; `task.factory` is a built-in toy task
+  (`core/tasks.py`: parity, lastbit) or a plug-in with `val`,
+  `sample(n, step)` and optional `loss` / `metrics` / `distill_loss` /
+  `reward`. The contract lives in train.py's docstring.
+- `core/cli.py` (typer) is the single entry point for humans and agents;
+  `check` validates a plug-in (shapes, params, gradient flow) before a
+  run is launched.
+- Plain YAML config (`new` writes every default out), everything seeded,
+  full provenance in the run dir (`meta.json` + `src/` snapshot of the
+  plug-in sources).
 - Loop shape shared by all modes: init → loop {step → log → checkpoint} → finish.
-  GA is "one epoch = evaluate N genomes" (no autograd); pretrain is epochs;
-  distill adds a frozen teacher forward to the loss (`teacher_checkpoint` in
-  config); rl adds rollout collection + vector policy update. Keep it
-  200–400 lines of obvious code — the agent will patch it per experiment.
-- Outputs per `experiments/runs/<run-id>/`: `metrics.csv`
-  (`step,train_loss,val_loss,gen_best,gen_mean,grad_norm,...` — mode-dependent
-  columns, header written first), TensorBoard `events.out.tfevents.*`
-  (`torch.utils.tensorboard.SummaryWriter`), `checkpoints/`, and on exit
-  `DONE` (with exit code) or `FAILED` (with traceback). Sentinel files are how
-  the agent learns a run ended — polling a directory is idempotent IPC.
-- First milestone config: GA evolving a small gated RNN on a parity/sequence
-  task. It needs no gradient plumbing and validates the whole loop fastest.
+  GA is "one generation = evaluate N parameter vectors" (no autograd);
+  pretrain is epochs; distill adds a frozen teacher forward to the loss
+  (teacher rebuilt from its checkpoint's config + source snapshot); rl
+  is a contextual bandit over the model's output logits (REINFORCE).
+- Outputs per `<runs>/<run-id>/`: `metrics.csv` (mode columns + task
+  metrics, header written first), TensorBoard `events.out.tfevents.*`,
+  `checkpoints/`, `PID` (pid + pid namespace), and on exit `DONE` (with
+  exit code) or `FAILED` (with traceback; also on `stop`). Sentinel files
+  are how the agent learns a run ended — polling a directory is
+  idempotent IPC.
+- First milestone: plug in a small recurrent model, run it on the parity
+  task in every mode.
 
 ### 1.2 `experiments/core/monitor.py` — the agent's observability
 
@@ -96,31 +108,22 @@ REPL and reads the string. TensorBoard is the *human's* tool; run it on the
 host against `experiments/runs/`, the agent never talks to it. (`tbparse` is
 in the closure if event-scalar access is ever needed.)
 
-### 1.3 Detached launch convention (documented, not coded)
+### 1.3 Detached launch (`cli.py launch`)
 
-The REPL call that starts a run:
-
-```python
-import os, subprocess
-p = subprocess.Popen(["python3", "core/train.py", "--mode", "ga",
-                      "--config", "runs/exp07/config.yaml"],
-                     cwd="runs/exp07", stdout=open("train.log", "w"),
-                     stderr=subprocess.STDOUT,
-                     start_new_session=True)  # own process group — killable
-open("PID", "w").write(str(p.pid))
-```
-
-Returns instantly. Later REPL calls poll for `DONE`/`FAILED` and call
-`monitor.summarize`. This composes with the existing per-process cgroup
-isolation pattern from the repl sessions (see `sandbox/repl.rs` header).
+`launch` spawns `cli.py run <config>` with `start_new_session=True` (own
+process group, so it can be killed), output to `train.log`, and writes `PID`. It returns
+instantly. Later calls poll with `status` / `ls`. `stop` SIGTERMs the
+group (the engine turns that into FAILED) and SIGKILLs after a timeout.
+Sandboxes have private pid namespaces, so liveness is only knowable from
+the launching session; elsewhere the state reads `RUNNING?` and `status`
+shows the last write time.
 
 ### 1.4 Agent operating manual
 
 Add to the spawned agent's system prompt (or a pinned first message in its
 topic — see `orchestrator.rs::turn_prompt`, the tool-protocol block):
-workspace conventions in prose — "experiments live in `experiments/`; write
-configs with `edit`; launch detached via `repl(interp=torch)`; monitor with
-monitor.py; never edit a running run's config; use `plot_device` on
+workspace conventions in prose — "experiments live in `experiments/`; drive
+them with `core/cli.py` (new → check → launch → status) from `repl(interp=torch)`; never edit a running run's config; use `plot_device` on
 metrics.csv for a quick look; use `show_image` to publish matplotlib plots."
 
 ## Phase 2 — `show_image` host tool
@@ -227,7 +230,7 @@ Acceptance: `cargo test -p agent -p tui` green; spawn via
 | Phase | Gate |
 |---|---|
 | 0 | torch REPL session survives across calls; matmul on iGPU inside bwrap; `gpu:torch` prompt appears and `/grant gpu:torch perpetual` silences it |
-| 1 | manual end-to-end: ask the agent to run a GA (pop=50, 20 gens, parity task); it writes config, launches detached, polls DONE, plots fitness with `plot_device` |
+| 1 | manual end-to-end: plug in a model, ask the agent to train it on parity (e.g. GA, pop=50, 20 gens); it runs `new`/`check`/`launch`, polls `status` to DONE, plots with `plot_device` |
 | 2 | agent saves `loss.png` via matplotlib and publishes it; image renders in TUI (Kitty) and syncs to a second device via relay |
 | 3 | spawned agents talk SenseNova; model id auto-discovered; no SmolVLM strings left outside git history |
 

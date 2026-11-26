@@ -185,15 +185,12 @@ impl HistoryCompressor {
     /// Level-0 node for one message. Free node when it fits: verbatim,
     /// no model call, full text kept so zoom is free too.
     async fn leaf_for(&self, msg: &ChatMessage, offset: usize) -> SummaryNode {
-        let line = format!(
-            "{}: {}",
-            kind_tag(&msg.kind),
-            flatten_newlines(&msg.content)
-        );
+        let rendered = render_message(msg);
+        let line = flatten_newlines(&rendered);
 
         if line.len() <= NODE_BYTES {
             let mut node = SummaryNode::leaf(line, (offset, offset + 1), true);
-            node.full_text = Some(msg.content.clone());
+            node.full_text = Some(rendered);
             return node;
         }
 
@@ -219,8 +216,19 @@ impl HistoryCompressor {
             }
             // NODE is a target the summarizer may miss (a backend that
             // rambles): enforce it so the flattened cut never
-            // re-expands a "merged" line.
-            _ => head(&self.backend.summarize(&msg.content).await, NODE_BYTES),
+            // re-expands a "merged" line. The speaker prefix survives
+            // summarization: the model must know who said what.
+            _ => {
+                let rendered = render_message(msg);
+                let summary = self.backend.summarize(&rendered).await;
+                let label = speaker_label(msg);
+                let summary = if summary.starts_with(&label) {
+                    summary
+                } else {
+                    format!("{label}: {summary}")
+                };
+                head(&summary, NODE_BYTES)
+            }
         }
     }
 
@@ -452,11 +460,54 @@ fn zoom_node(node: &mut SummaryNode, messages: &[ChatMessage]) {
         .get(start..end)
         .unwrap_or(&[])
         .iter()
-        .map(|m| format!("[{}]: {}", m.sender_name, m.content))
+        .map(render_message)
         .collect();
     node.full_text = Some(full.join("\n"));
     node.zoomed = true;
     node.size_bytes = node.full_text.as_ref().map(|t| t.len()).unwrap_or(0);
+}
+
+/// Who a history line is from: `luigi`, `sensei`, or `note`.
+fn speaker_label(msg: &ChatMessage) -> String {
+    match msg.kind {
+        MessageKind::System | MessageKind::Notes => "note".into(),
+        _ if msg.sender_name.is_empty() => kind_tag(&msg.kind).into(),
+        _ => msg.sender_name.clone(),
+    }
+}
+
+/// One message as the agent sees it in its history view: always
+/// attributed, tool traffic in a neutral `name(args)` form.
+///
+/// Neutral on purpose: history lines act as few-shot examples. A tool
+/// call shown in some concrete call syntax teaches that syntax, and an
+/// agent reply that was published as text because its tool markup
+/// didn't parse would teach the model to repeat the broken markup —
+/// observed live (sensenova copied its own malformed `<tool name=…>`
+/// three turns in a row). Such replies are replaced by a placeholder.
+pub fn render_message(msg: &ChatMessage) -> String {
+    let who = speaker_label(msg);
+    match &msg.kind {
+        MessageKind::ToolCall { tool_name, arguments } => {
+            format!("{who} ran tool {tool_name}({arguments})")
+        }
+        MessageKind::ToolResponse { tool_name, error, .. } => {
+            let status = if *error { "FAILED" } else { "returned" };
+            format!("tool {tool_name} {status}: {}", msg.content.trim_end())
+        }
+        MessageKind::Agent if crate::tools::looks_like_tool_markup(&msg.content) => {
+            format!("{who}: (a malformed tool call — it was not executed)")
+        }
+        MessageKind::Media(att) => {
+            let caption = msg.content.trim();
+            if caption.is_empty() {
+                format!("{who} sent image {}", att.filename)
+            } else {
+                format!("{who} sent image {}: {caption}", att.filename)
+            }
+        }
+        _ => format!("{who}: {}", msg.content),
+    }
 }
 
 fn flatten_newlines(text: &str) -> String {
@@ -691,8 +742,37 @@ mod tests {
             "free nodes must not call the model"
         );
         assert!(tree.verbatim, "two short children join for free");
-        assert!(tree.summary.contains("user: hello there"));
-        assert!(tree.summary.contains("talk: hi! how can I help?"));
+        assert!(tree.summary.contains("peer: hello there"));
+        assert!(tree.summary.contains("peer: hi! how can I help?"));
+    }
+
+    /// History lines are attributed, tool traffic is rendered neutrally,
+    /// and agent replies that were published tool markup (unparsed
+    /// calls) never reappear as examples for the model to copy.
+    #[test]
+    fn rendering_attributes_and_neutralizes_tool_markup() {
+        let mut call = chat_msg(
+            MessageKind::ToolCall { tool_name: "glob".into(), arguments: r#"{"pattern":"*.csv"}"#.into() },
+            r#"{"pattern":"*.csv"}"#,
+        );
+        call.sender_name = "sensei".into();
+        assert_eq!(render_message(&call), r#"sensei ran tool glob({"pattern":"*.csv"})"#);
+        let resp = chat_msg(
+            MessageKind::ToolResponse { tool_name: "glob".into(), result_summary: String::new(), error: true },
+            "no such dir\n",
+        );
+        assert_eq!(render_message(&resp), "tool glob FAILED: no such dir");
+        let mut bad = chat_msg(
+            MessageKind::Agent,
+            "<tool_call>\n<tool name=\"bash\" arguments='{}'>\n</tool_call>",
+        );
+        bad.sender_name = "sensei".into();
+        let r = render_message(&bad);
+        assert!(r.starts_with("sensei: (a malformed tool call"), "{r}");
+        assert!(!r.contains("<tool"), "{r}");
+        let mut note = chat_msg(MessageKind::System, "luigi joined");
+        note.sender_name = "luigi".into();
+        assert_eq!(render_message(&note), "note: luigi joined");
     }
 
     #[tokio::test]

@@ -118,7 +118,7 @@ pub const PLOT_DEVICE_TOOL_SCHEMA: &str = r#"
         "type": "object",
         "properties": {
             "csv": {"type": "string", "description": "The CSV data itself. Omit when 'path' is given — the chat host reads the file and injects the content."},
-            "path": {"type": "string", "description": "Path to a CSV file in the workspace or an operator data directory (LLUNG_RO_BINDS); the chat host reads it and injects the content as 'csv'. Use this instead of pasting data. Other paths are refused."},
+            "path": {"type": "string", "description": "Path to a CSV file in the workspace, the runs directory, or a data directory; the chat host reads it and injects the content as 'csv'. Use this instead of pasting data. Other paths are refused."},
             "kind": {"type": "string", "default": "scatter", "description": "Plot kind: scatter (default; 3D when 'z' is given), line, histogram, or cdf."},
             "x": {"type": "string", "description": "Domain column (scatter/line): header NAME or 0-based index. OMIT to use the row index (0,1,2,…) — the usual choice for a series over time. For histogram/cdf, x is the VALUE column."},
             "y": {"type": "string", "default": "1", "description": "Value column (scatter/line): name or index."},
@@ -180,7 +180,7 @@ pub const EDIT_TOOL_SCHEMA: &str = r#"
 pub const BASH_TOOL_SCHEMA: &str = r#"
 {
     "name": "bash",
-    "description": "Run a shell command in an isolated sandbox (bubblewrap) with a read-only workspace, memory limit, and timeout. The sandbox sees ONLY the workspace plus operator data directories (LLUNG_RO_BINDS, read-only at their own paths). Use for builds, tests, and any computation the file tools can't do.",
+    "description": "Run a shell command in an isolated sandbox (bubblewrap) with a read-only workspace, memory limit, and timeout. The sandbox sees ONLY the workspace, the data directories (read-only at their own paths), and the runs directory (writable, $LLUNG_RUNS_DIR). Use for builds, tests, and any computation the file tools can't do.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -235,11 +235,11 @@ pub const GPU_TORCH_TOOL_SCHEMA: &str = r#"
 pub const SHOW_IMAGE_TOOL_SCHEMA: &str = r#"
 {
     "name": "show_image",
-    "description": "Publish an image file (plot, figure) from the workspace to the chat as an attachment. Use after saving a matplotlib PNG (plt.savefig); do NOT paste image data into chat.",
+    "description": "Publish an image file (plot, figure) from the workspace or the runs directory to the chat as an attachment. Use after saving a matplotlib PNG (plt.savefig); do NOT paste image data into chat.",
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Image file path, relative to the workspace root. Paths escaping the workspace (..) are rejected."},
+            "path": {"type": "string", "description": "Image file path: absolute, or relative to the workspace root. Must be inside the workspace or the runs directory."},
             "caption": {"type": "string", "description": "OPTIONAL short caption shown under the image."}
         },
         "required": ["path"]
@@ -373,11 +373,12 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
             name: "show_image",
             description: "Publish a workspace image (matplotlib PNG plot) to the chat as an attachment",
             schema: SHOW_IMAGE_TOOL_SCHEMA,
-            usage: "show_image: publish an image file from the workspace as a chat attachment. \
-                     Save the plot first inside a gpu:torch session (matplotlib Agg backend, \
-                     e.g. plt.savefig('experiments/runs/exp07/loss.png')), then call show_image \
-                     with that path. args: path (required, inside the workspace), caption \
-                     (optional). Never paste image data into chat.",
+            usage: "show_image: publish an image file as a chat attachment. Save the plot \
+                     first into the runs directory from a repl/gpu:torch session (matplotlib Agg \
+                     backend, e.g. plt.savefig(os.environ['LLUNG_RUNS_DIR'] + '/exp07/loss.png')), \
+                     then call show_image with that absolute path. args: path (required, in the \
+                     workspace or runs directory), caption (optional). Never paste image data \
+                     into chat.",
         },
         ToolSpec {
             name: "bash",
@@ -408,74 +409,243 @@ fn is_known_tool(name: &str) -> bool {
     tool_catalog().iter().any(|t| t.name == name)
 }
 
+/// How the model is asked to write a tool call. The harness parses all
+/// of them either way ([`parse_tool_call`]); this only picks what the
+/// prompt TEACHES. Models trained on a native tool format follow their
+/// own format far more reliably than ours: SenseNova (Qwen-family
+/// template) told to write `TOOL {...}` blended the two into markup
+/// nothing could parse, 4/4 replies; told its native XML, 4/4 clean.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolProtocol {
+    /// `TOOL {"name":…,"arguments":{…}}` — compact, for models without
+    /// a native format (and cloud models, which follow it well).
+    #[default]
+    Line,
+    /// `<tool_call><function=NAME><parameter=K>v</parameter>…` —
+    /// Qwen3-coder / Qwen3.5 / SenseNova chat templates.
+    QwenXml,
+    /// `<tool_call>{"name":…,"arguments":{…}}</tool_call>` — Hermes /
+    /// Qwen2.5 chat templates.
+    HermesJson,
+}
+
+impl ToolProtocol {
+    /// `LLUNG_TOOL_PROTOCOL` values: line | xml | hermes.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "line" | "tool" => Some(Self::Line),
+            "xml" | "qwen" | "qwen-xml" => Some(Self::QwenXml),
+            "hermes" | "json" => Some(Self::HermesJson),
+            _ => None,
+        }
+    }
+
+    /// Pick the protocol a model was trained on from its chat template
+    /// (llama-server's `/props`): the template spells out the format it
+    /// renders tool calls in.
+    pub fn from_chat_template(template: &str) -> Self {
+        if template.contains("<function=") {
+            Self::QwenXml
+        } else if template.contains("<tool_call>") {
+            Self::HermesJson
+        } else {
+            Self::Line
+        }
+    }
+
+    /// The call format as shown in the prompt (and in feedback).
+    pub fn format(&self) -> &'static str {
+        match self {
+            Self::Line => "TOOL {\"name\":\"<tool>\",\"arguments\":{...}}",
+            Self::QwenXml => {
+                "<tool_call>\n<function=TOOL_NAME>\n<parameter=ARG_NAME>\nvalue\n</parameter>\n</function>\n</tool_call>"
+            }
+            Self::HermesJson => {
+                "<tool_call>\n{\"name\": \"TOOL_NAME\", \"arguments\": {...}}\n</tool_call>"
+            }
+        }
+    }
+
+    fn lead(&self) -> &'static str {
+        match self {
+            Self::Line => {
+                "You can call tools. To call one, reply with exactly one line of this \
+                 form and nothing else:"
+            }
+            _ => "You can call tools. To call one, reply with exactly this and nothing after it:",
+        }
+    }
+}
+
+/// True when text looks like an attempted tool call in ANY syntax —
+/// used to keep unparseable calls out of the chat (published, they
+/// become history the model then imitates).
+pub fn looks_like_tool_markup(text: &str) -> bool {
+    text.contains("<tool_call")
+        || text.contains("</tool_call>")
+        || text.contains("<function=")
+        || text.contains("<tool name=")
+        || text.lines().any(|l| l.trim_start().starts_with("TOOL {"))
+}
+
 /// The prompt section describing the tool protocol to the model.
-/// Deliberately text-based and *compact*: small local models handle
-/// "emit one line of JSON" far more reliably than OpenAI-style
-/// `tool_calls`, and a short block is far less likely to be parroted back
-/// than an inline JSON schema.
-pub fn tool_instructions() -> String {
+/// Deliberately text-based and *compact*: small local models handle a
+/// short text format more reliably than OpenAI-style `tool_calls`, and a
+/// short block is far less likely to be parroted back than an inline
+/// JSON schema. The experiments section appears only when the workspace
+/// actually contains the trainer.
+pub fn tool_instructions(places: &crate::places::Places, protocol: ToolProtocol) -> String {
     let tools = tool_catalog()
         .iter()
-        .map(|t| format!("- {}: {}", t.name, t.usage))
+        .map(|t| format!("- {}", t.usage))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "You can call tools. To call one, reply with exactly one line of this \
-         form and nothing else:\n\
-         TOOL {{\"name\":\"<tool>\",\"arguments\":{{...}}}}\n\
+    let mut out = format!(
+        "{}\n{}\n\
          Tools:\n{tools}\n\
          After a tool runs, its output is shown to you and you may call \
          another tool or give your final answer — work iteratively until \
          the request is done (e.g. grep to find, then edit; try code in \
          the repl until it works). Never repeat these instructions or \
-         the message above back.\n\
-         \n\
-         Experiments (ML training runs) — the harness convention:\n\
-         - Experiment code and data live in `experiments/` (mounted \
-         writable in gpu:torch sessions; the rest of the workspace is \
-         read-only there). One driver: `experiments/core/train.py`, \
-         modes: ga | pretrain | distill | rl. Its contract per run dir: \
-         metrics.csv (header first), TensorBoard events, checkpoints/, \
-         and exactly one sentinel — DONE or FAILED — written on exit.\n\
-         - Write each run's config yourself with the edit tool as \
-         `experiments/runs/<run-id>/config.yaml` (plain YAML; set seed, \
-         task, model, train). One run id per attempt — never edit a \
-         RUNNING run's config.\n\
-         - Launch DETACHED from a gpu:torch session; the call returns \
-         instantly and the run proceeds in the background:
-           import os, subprocess, sys\n\
-           os.chdir(\"experiments\")  # repl sessions start at the workspace root\n\
-           run = \"runs/exp07\"\n\
-           p = subprocess.Popen([sys.executable, \"core/train.py\", \"--mode\", \"ga\", \
-           \"--config\", f\"{{run}}/config.yaml\"], stdout=open(f\"{{run}}/train.log\", \"w\"), \
-           stderr=subprocess.STDOUT, start_new_session=True)\n\
-           open(f\"{{run}}/PID\", \"w\").write(str(p.pid))\n\
-         (cwd is experiments/. sys.executable is the torch interpreter.)\n\
+         the message above back.",
+        protocol.lead(),
+        protocol.format(),
+    );
+    if let Some(section) = experiments_instructions(places) {
+        out.push_str("\n\n");
+        out.push_str(&section);
+    }
+    out
+}
+
+/// Where the trainer lives, if this workspace has one.
+pub fn trainer_dir(places: &crate::places::Places) -> Option<std::path::PathBuf> {
+    let core = places.workspace().join("experiments").join("core");
+    core.join("cli.py").is_file().then_some(core)
+}
+
+/// The ML-experiments convention, with this machine's real paths: the
+/// trainer in the workspace (read-only to sandboxes), runs in the runs
+/// directory (writable). `None` when the workspace has no trainer — an
+/// installed app launched in some other project must not be told about
+/// `experiments/core/cli.py`.
+pub fn experiments_instructions(places: &crate::places::Places) -> Option<String> {
+    let core = trainer_dir(places)?;
+    let core = core.display();
+    let runs = places.runs().display();
+    Some(format!(
+        "Experiments (ML training runs) — the harness convention:\n\
+         - Harness: {core}/cli.py (typer; `--help` on any command), \
+         engine {core}/train.py (modes: pretrain | distill | ga | rl). \
+         It knows NO architecture: config.yaml's model.factory names one \
+         ('file.py:Name' -> an nn.Module, the rest of the model section \
+         is its kwargs); task.factory is a built-in task (parity, lastbit: \
+         x (B,T,1) bits -> logits (B,2); tokens: a pre-tokenized corpus \
+         in a data dir, ids (B,T) -> logits (B,T,V)) or your own. Warm \
+         start any model from weights with the init section \
+         (init.checkpoint, optional init.convert key renamer); check \
+         prints what was copied. The plug-in contract is train.py's \
+         docstring. Code/LM experiments share ONE tokenizer: import \
+         codetok (experiments/codetok: vocab 32896, ids EOS PAD BOT EOT \
+         IM_START THINK ..., codetok.chat for SFT ids + loss mask); \
+         never invent token ids. Code is read-only \
+         inside sandboxes (patch it with the edit tool); a one-off model \
+         variant may be written into the run dir instead — relative \
+         factories resolve there first. Runs live in the runs directory \
+         {runs} (writable in every repl / gpu:torch / bash sandbox, also \
+         $LLUNG_RUNS_DIR); each gets metrics.csv, TensorBoard events, \
+         checkpoints/, src/ (plug-in snapshot) and exactly one sentinel \
+         — DONE or FAILED — on exit.\n\
+         - Drive it from a gpu:torch session (sys.executable is the \
+         torch interpreter; define the helper once per session):\n\
+           import subprocess, sys\n\
+           def lab(*a): r = subprocess.run([sys.executable, \"{core}/cli.py\", *a], \
+         capture_output=True, text=True); print(r.stdout + r.stderr)\n\
+           lab(\"new\", \"exp07\", \"--model\", \"models/mynet.py:Net\", \"--mode\", \"pretrain\", \
+         \"-s\", \"model.hidden=64\", \"-s\", \"train.epochs=20\")\n\
+           lab(\"check\", \"exp07\")   # shapes, param count, gradient flow; writes nothing\n\
+           lab(\"launch\", \"exp07\")  # DETACHED: returns at once, run proceeds in background\n\
+           lab(\"status\", \"exp07\")  # poll (idempotent): state, alerts, last metrics rows\n\
+           lab(\"ls\"); lab(\"stop\", \"exp07\")\n\
+         (Run ids resolve under {runs}, e.g. {runs}/exp07.) Always check \
+         before launch. One run id per attempt; never touch a RUNNING \
+         run's config. status alerts on plateaus and grad-norm spikes, \
+         and reports DEAD if the process vanished without a sentinel. \
+         For any objective that is not a plain loss, set what progress \
+         means in config.yaml: monitor: {{watch: [{{metric: val_acc, goal: \
+         max, patience: 3}}], show: [...]}} (check verifies the names). \
+         Quick look: plot_device with the metrics.csv path. Real plot: \
+         plt.savefig into the run dir, then show_image with that path — \
+         never paste image data into chat.\n\
+         - After changing anything in {core}, run the property suite \
+         from a gpu:torch session (cwd in the runs dir: hypothesis needs \
+         a writable directory): subprocess.run([sys.executable, '-m', \
+         'pytest', '{core}/tests', '-q', '-p', 'no:cacheprovider'], \
+         cwd=\"{runs}\").\n\
          - Need a new python package? Edit pyproject.toml dependencies, \
-           then run bash (writable=true): uv lock — the torch \
-           interpreter env rebuilds with it. (uv and git are available \
-           inside the sandbox.)
-\
-         - The trainer has a property suite: run \
-           subprocess.run([sys.executable, '-m', 'pytest', 'core/tests', \
-           '-q']) from a gpu:torch session after changing core/train.py \
-           or core/monitor.py — properties (GA elitism, seeded \
-           reproducibility, sentinels) must hold for every seed.
-\
-         - External data (e.g. teacher traces on a drive) is available \
-           read-only under its own absolute path when the operator set \
-           LLUNG_RO_BINDS — stream shards from there; write only into \
-           the run dir. Never try to write to those paths.
-\
-         - Monitor by polling the run dir (idempotent — safe to repeat): \
-           import os, sys; os.chdir(\"experiments\"); sys.path.insert(0, \"core\"); \
-           import monitor; print(monitor.summarize(\"runs/exp07\")). DONE/FAILED \
-           tell you a run ended; monitor.summarize prints the last metrics \
-           rows plus alerts (plateaus, grad-norm spikes). For a quick \
-           visual glance at metrics.csv curves use plot_device with the \
-           csv path. For a REAL plot, save a PNG (matplotlib, \
-           plt.savefig) from the gpu:torch session and publish it with \
-           the show_image tool — never paste image data into chat."
+         then run bash (writable=true): uv lock. (uv and git are \
+         available inside the sandbox.)\n\
+         - External data (e.g. teacher traces) is in the read-only data \
+         directories listed under Files — stream shards from there; write \
+         only into the run dir."
+    ))
+}
+
+/// The prompt section telling the model WHERE it is: the workspace
+/// (absolute; relative tool paths resolve against it), the runs
+/// directory, and the read-only data directories. Without it the model
+/// guesses paths (`data/flights.csv`, or absolute paths it can't read)
+/// and burns its tool budget on misses.
+pub fn environment_note(places: &crate::places::Places) -> String {
+    let mut note = format!(
+        "Files: your workspace is {} — relative paths in tool arguments \
+         resolve against it. It is read-only in sandboxes unless a write \
+         is approved.",
+        places.workspace().display()
+    );
+    match places.runs_ready() {
+        Ok(runs) => note.push_str(&format!(
+            " Your runs directory (scratch: experiment runs, checkpoints, \
+             plots — writable, $LLUNG_RUNS_DIR in sandboxes) is {}.",
+            runs.display()
+        )),
+        Err(e) => note.push_str(&format!(" Runs directory UNAVAILABLE: {e}")),
+    }
+    let data = places.data_dirs();
+    if data.is_empty() {
+        note.push_str(
+            " There are no data directories: you can read NOTHING else. If \
+             asked about a file elsewhere, don't search for it — say the \
+             operator must run /data add <dir> (or copy it into the \
+             workspace).",
+        );
+    } else {
+        let dirs = data
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        note.push_str(&format!(
+            " Read-only data directories (use these absolute paths as-is): \
+             {dirs}. Nothing else is readable."
+        ));
+    }
+    note
+}
+
+/// Told once, at the agent's first turn after the operator changed the
+/// places: what changed, and that REPL state may be gone.
+pub fn places_changed_notice(changes: &[String]) -> String {
+    format!(
+        "NOTICE: since your last turn the operator changed where you work:\n{}\n\
+         Paths from earlier messages may be stale — use the Files section \
+         below. REPL sessions restart on their next use (their variables \
+         are gone).",
+        changes
+            .iter()
+            .map(|c| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 
@@ -487,13 +657,13 @@ const MAX_DATA_FILE_BYTES: usize = 256 * 1024;
 /// injects the content as `csv` before the sandboxed call. The `path`
 /// key is kept (panels show it) alongside the injected `csv`.
 ///
-/// `confine_to`: `Some(workspace)` for AGENT calls — the read happens
+/// `confine_to`: `Some(places)` for AGENT calls — the read happens
 /// outside any sandbox, so the path must pass
-/// [`crate::paths::agent_readable`] (workspace + LLUNG_RO_BINDS; no
+/// [`crate::places::Places::readable`] (workspace, runs, data dirs; no
 /// `..`/symlink escapes). `None` for the local user's own `/plot`.
 pub async fn resolve_data_file(
     mut call: ToolCall,
-    confine_to: Option<&std::path::Path>,
+    confine_to: Option<&crate::places::Places>,
 ) -> Result<ToolCall, String> {
     if call.name != "plot_device" {
         return Ok(call);
@@ -508,7 +678,7 @@ pub async fn resolve_data_file(
         return Ok(call);
     };
     let expanded = match confine_to {
-        Some(workspace) => crate::paths::agent_readable(path, workspace)?,
+        Some(places) => places.readable(path)?,
         None => std::path::PathBuf::from(shellexpand::tilde(path).as_ref()),
     };
     let meta = std::fs::metadata(&expanded)
@@ -542,7 +712,7 @@ pub async fn run_tool_locally(name: &str, arguments_json: &str) -> Result<String
     // The local user acting: no agent read confinement.
     let call = resolve_data_file(call, None).await?;
     // Host-native tools (glob, grep, edit) run in-process — no wasm file.
-    if let Some(result) = host::dispatch(name, &call.arguments) {
+    if let Some(result) = host::dispatch(name, &call.arguments, None) {
         return result;
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -568,6 +738,7 @@ pub fn looks_like_echo(reply: &str) -> bool {
         || reply.contains("Available tools")
         || reply.contains("TOOLS:")
         || reply.contains("<tool>")
+        || reply.contains("TOOL_NAME")
 }
 
 /// A tool call parsed out of a model reply.
@@ -586,7 +757,15 @@ pub struct ToolCall {
 /// Two syntaxes are accepted — small models invent the second one:
 ///   TOOL {"name":"landscape","arguments":{"expr":"sin(x)"}}   (canonical)
 ///   TOOL landscape {"expr":"sin(x)"}                          (bare name)
+///
+/// Models trained on a native tool format often ignore the TOOL line
+/// and emit their own markup instead (SenseNova / Qwen-family chat
+/// templates). Those are accepted too — see [`parse_native_tool_call`].
 pub fn parse_tool_call(reply: &str) -> Option<ToolCall> {
+    parse_tool_line(reply).or_else(|| parse_native_tool_call(reply))
+}
+
+fn parse_tool_line(reply: &str) -> Option<ToolCall> {
     for line in reply.lines() {
         let mut search = line;
         while let Some(pos) = search.find("TOOL") {
@@ -603,6 +782,122 @@ pub fn parse_tool_call(reply: &str) -> Option<ToolCall> {
         }
     }
     None
+}
+
+/// Native tool-call markup that local models emit from their chat
+/// templates instead of the TOOL line:
+///
+///   <tool_call>{"name":"glob","arguments":{...}}</tool_call>       (Hermes / Qwen2.5)
+///   <function=glob><parameter=pattern>**/*.csv</parameter></function> (Qwen3-coder)
+///   <function=glob><function=arguments>{...}</function>              (SenseNova, seen live)
+///
+/// The name must be in the catalog, so prose mentioning these tags
+/// doesn't trigger anything.
+fn parse_native_tool_call(reply: &str) -> Option<ToolCall> {
+    // <function=NAME> ... (parameters or a JSON object)
+    let mut search = reply;
+    while let Some(pos) = search.find("<function=") {
+        let after = &search[pos + "<function=".len()..];
+        search = after;
+        let Some(close) = after.find('>') else { break };
+        let name = after[..close].trim().trim_matches(|c| c == '"' || c == '\'');
+        if !is_known_tool(name) {
+            continue; // e.g. the inner <function=arguments> wrapper
+        }
+        let body = &after[close + 1..];
+        let body = body.split("</tool_call>").next().unwrap_or(body);
+        if body.contains("<parameter=") {
+            return Some(ToolCall {
+                name: name.to_string(),
+                arguments: parse_xml_parameters(body).to_string(),
+            });
+        }
+        if let Some(json) = extract_json_object(body) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                if let Some(call) = tool_call_from_value(value, Some(name)) {
+                    return Some(call);
+                }
+            }
+        }
+        // A known tool with no arguments at all: <function=artist></function>
+        if extract_json_object(body).is_none() {
+            return Some(ToolCall {
+                name: name.to_string(),
+                arguments: "{}".into(),
+            });
+        }
+    }
+    // <tool name="glob" arguments={...}> — a hybrid SenseNova invented
+    // when taught the TOOL line (arguments bare, or quoted with '…' or
+    // even "…" around unescaped JSON): take the first JSON object after
+    // `arguments=`.
+    let mut search = reply;
+    while let Some(pos) = search.find("<tool name=") {
+        let after = &search[pos + "<tool name=".len()..];
+        search = after;
+        let name: String = after
+            .trim_start_matches(['"', '\''])
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ':')
+            .collect();
+        if !is_known_tool(&name) {
+            continue;
+        }
+        let end = after.find("</tool_call>").unwrap_or(after.len());
+        let body = &after[..end];
+        let Some(args_at) = body.find("arguments=") else {
+            return Some(ToolCall { name, arguments: "{}".into() });
+        };
+        if let Some(json) = extract_json_object(&body[args_at..]) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                if value.is_object() {
+                    return Some(ToolCall { name, arguments: value.to_string() });
+                }
+            }
+        }
+    }
+    // <tool_call>{"name": ..., "arguments": ...}</tool_call>
+    let mut search = reply;
+    while let Some(pos) = search.find("<tool_call>") {
+        let after = &search[pos + "<tool_call>".len()..];
+        search = after;
+        if let Some(json) = extract_json_object(after) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                if let Some(call) = tool_call_from_value(value, None) {
+                    return Some(call);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `<parameter=key>value</parameter>` pairs into a JSON object. Values
+/// that parse as JSON (numbers, booleans, arrays, objects) keep their
+/// type; anything else is a string. A missing `</parameter>` ends at
+/// the next tag.
+fn parse_xml_parameters(body: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("<parameter=") {
+        rest = &rest[pos + "<parameter=".len()..];
+        let Some(close) = rest.find('>') else { break };
+        let key = rest[..close].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        rest = &rest[close + 1..];
+        let end = ["</parameter>", "<parameter=", "</function>"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+        let raw = rest[..end].trim();
+        rest = &rest[end..];
+        let value = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+    serde_json::Value::Object(map)
 }
 
 /// A word immediately after the TOOL marker (`TOOL landscape {...}`),
@@ -664,10 +959,15 @@ fn tool_call_from_value(
         if !is_known_tool(name) {
             return None;
         }
-        let arguments = value
+        let mut arguments = value
             .get("arguments")
+            .or_else(|| value.get("parameters"))
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        // OpenAI style: arguments as a JSON-encoded string.
+        if let Some(s) = arguments.as_str() {
+            arguments = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+        }
         if !arguments.is_object() {
             return None;
         }
@@ -742,6 +1042,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_native_tool_markup() {
+        // Exactly what SenseNova emitted live (published as text before).
+        let call = parse_tool_call(
+            "<tool_call>\n<function=glob>\n<function=arguments>\n{\"pattern\": \"**/flights.csv\", \"path\": \"/home/leigh/Code/llung\"}\n</function>\n</tool_call>",
+        )
+        .expect("sensenova markup");
+        assert_eq!(call.name, "glob");
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        assert_eq!(args["pattern"], "**/flights.csv");
+
+        // Qwen3-coder parameters, typed values preserved.
+        let call = parse_tool_call(
+            "<tool_call>\n<function=plot_device>\n<parameter=path>\n/data/flights.csv\n</parameter>\n<parameter=width>\n80\n</parameter>\n</function>\n</tool_call>",
+        )
+        .expect("qwen3 markup");
+        assert_eq!(call.name, "plot_device");
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        assert_eq!(args["path"], "/data/flights.csv");
+        assert_eq!(args["width"], 80);
+
+        // Hermes JSON, including OpenAI-style string arguments.
+        let call = parse_tool_call(
+            "<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"fn main\"}}\n</tool_call>",
+        )
+        .expect("hermes markup");
+        assert_eq!(call.name, "grep");
+        let call = parse_tool_call(
+            "<tool_call>{\"name\": \"grep\", \"arguments\": \"{\\\"pattern\\\": \\\"x\\\"}\"}</tool_call>",
+        )
+        .expect("string arguments");
+        assert!(call.arguments.contains("\"pattern\":\"x\""));
+
+        // The hybrid SenseNova invented (all three quoting styles seen live).
+        for reply in [
+            "<tool_call>\n<tool name=\"glob\" arguments={\"pattern\":\"**/*.csv\"}}\n</tool_call>",
+            "<tool_call>\n<tool name=\"plot_device\" arguments=\"{\"path\":\"/d/b.csv\",\"kind\":\"histogram\"}\">\n</tool_call>",
+            "<tool_call>\n<tool name=\"bash\" arguments='{\"cmd\":\"head -n 1 /d/b.csv\"}'>\n</tool_call>",
+        ] {
+            let call = parse_tool_call(reply).unwrap_or_else(|| panic!("hybrid: {reply}"));
+            let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+            assert!(args.is_object() && !args.as_object().unwrap().is_empty(), "{reply}");
+        }
+        // `<function=tool>` wrapping a Hermes object (seen live).
+        let call = parse_tool_call(
+            "<tool_call>\n<function=tool>\n{\"name\":\"glob\",\"arguments\":{\"pattern\":\"*.csv\"}}\n</tool_call>",
+        )
+        .expect("function=tool wrapper");
+        assert_eq!(call.name, "glob");
+
+        // Unknown tools and prose are not calls.
+        assert!(parse_tool_call("<function=rm_rf>{}</function>").is_none());
+        assert!(parse_tool_call("use <tool_call> tags to call tools").is_none());
+    }
+
+    #[test]
     fn tool_marker_mid_line_is_found() {
         let call = parse_tool_call(
             "Sure! TOOL {\"name\":\"landscape\",\"arguments\":{\"expr\":\"x^2-y^2\"}} hope this helps",
@@ -804,8 +1159,80 @@ mod tests {
     }
 
     #[test]
+    fn environment_note_names_every_place() {
+        let base = std::env::temp_dir().join(format!("llung-envnote-{}", std::process::id()));
+        let (ws, runs, data) = (base.join("ws"), base.join("runs"), base.join("data"));
+        for d in [&ws, &runs, &data] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let none = environment_note(&crate::places::Places::fixed(&ws, &runs, vec![]));
+        assert!(none.contains(&ws.display().to_string()));
+        assert!(none.contains(&runs.display().to_string()));
+        assert!(none.contains("/data add"));
+        let some = environment_note(&crate::places::Places::fixed(&ws, &runs, vec![data.clone()]));
+        assert!(some.contains(&data.display().to_string()));
+        // A chosen runs dir that is gone is flagged, not hidden.
+        let gone = environment_note(&crate::places::Places::fixed(&ws, base.join("gone"), vec![]));
+        assert!(gone.contains("UNAVAILABLE"), "{gone}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn experiments_section_only_with_a_trainer_and_uses_real_paths() {
+        let base = std::env::temp_dir().join(format!("llung-expsec-{}", std::process::id()));
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let places = crate::places::Places::fixed(&ws, "/mnt/drive/runs", vec![]);
+        assert!(experiments_instructions(&places).is_none());
+        assert!(!tool_instructions(&places, ToolProtocol::Line).contains("Experiments"));
+        std::fs::create_dir_all(ws.join("experiments/core")).unwrap();
+        std::fs::write(ws.join("experiments/core/cli.py"), "").unwrap();
+        let section = experiments_instructions(&places).expect("trainer present");
+        assert!(section.contains(&format!("{}/experiments/core/cli.py", ws.display())));
+        assert!(section.contains("/mnt/drive/runs/exp07"));
+        assert!(tool_instructions(&places, ToolProtocol::Line).contains("Experiments"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn protocol_follows_the_chat_template() {
+        assert_eq!(
+            ToolProtocol::from_chat_template("...<tool_call>\\n<function=' + tool_call.name..."),
+            ToolProtocol::QwenXml
+        );
+        assert_eq!(
+            ToolProtocol::from_chat_template("<tool_call>\\n{\"name\": ..."),
+            ToolProtocol::HermesJson
+        );
+        assert_eq!(ToolProtocol::from_chat_template("{{ messages }}"), ToolProtocol::Line);
+        let places = crate::places::Places::fixed("/w", "/r", vec![]);
+        let xml = tool_instructions(&places, ToolProtocol::QwenXml);
+        assert!(xml.contains("<function=TOOL_NAME>") && !xml.contains("TOOL {"));
+        assert!(tool_instructions(&places, ToolProtocol::Line).contains("TOOL {"));
+        // The catalog lines don't repeat the tool name ("- glob: glob: ...").
+        assert!(!xml.contains("- glob: glob:"));
+        // Whatever we teach must round-trip through the parser.
+        let taught = "<tool_call>\n<function=glob>\n<parameter=pattern>\n*.csv\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tool_call(taught).unwrap().name, "glob");
+    }
+
+    #[test]
+    fn tool_markup_is_recognized() {
+        assert!(looks_like_tool_markup("<tool_call>\n<tool name=\"x\">"));
+        assert!(looks_like_tool_markup("sure\nTOOL {\"name\":\"nope\"}"));
+        assert!(!looks_like_tool_markup("I used the glob tool and found 3 files."));
+    }
+
+    #[test]
+    fn notice_lists_changes() {
+        let n = places_changed_notice(&["workspace changed: /a → /b".into()]);
+        assert!(n.contains("- workspace changed: /a → /b"));
+        assert!(n.contains("restart"));
+    }
+
+    #[test]
     fn instructions_list_every_tool() {
-        let instructions = tool_instructions();
+        let instructions = tool_instructions(&crate::places::current(), ToolProtocol::Line);
         for spec in tool_catalog() {
             assert!(instructions.contains(spec.name), "catalog missing {}", spec.name);
         }

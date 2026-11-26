@@ -13,13 +13,16 @@ dependencies = [
     "pyyaml>=6.0.4",
     "tbparse>=0.0.9",
     "tensorboard>=2.21.0",
+    "tokenizers>=0.23.3",
     "torch>=2.15.0",
     "torchvision>=0.29.2",
+    "transformers==5.22.2",
+    "typer>=0.29.2",
 ]
 
 [tool.pytest.ini_options]
 # The trainer's test-suite lives with the harness it tests.
-testpaths = ["experiments/core/tests"]
+testpaths = ["experiments/core/tests", "experiments/models/tests"]
 
 [project.optional-dependencies]
 test = ["mypy", "nox", "ruff"]

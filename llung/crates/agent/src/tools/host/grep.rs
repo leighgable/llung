@@ -66,7 +66,17 @@ impl Sink for CollectSink<'_> {
     }
 }
 
+/// Operator-side grep (unconfined).
 pub fn run(arguments_json: &str) -> Result<String, String> {
+    run_in(arguments_json, None)
+}
+
+/// `scope`: `Some(places)` for AGENT calls — same rule as glob: the
+/// root defaults to the workspace and must lie under a readable place.
+pub fn run_in(
+    arguments_json: &str,
+    scope: Option<&crate::places::Places>,
+) -> Result<String, String> {
     let args: GrepArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("grep: arguments must be JSON with a 'pattern' string: {e}"))?;
     if args.pattern.is_empty() {
@@ -76,10 +86,15 @@ pub fn run(arguments_json: &str) -> Result<String, String> {
         .map_err(|e| format!("grep: bad pattern '{}': {e}", args.pattern))?;
 
     let root = args.path.as_deref().unwrap_or(".");
-    let root = shellexpand::tilde(root).to_string();
-    // Absolute root: result lines carry absolute paths (see glob.rs).
-    let root_path = std::path::absolute(PathBuf::from(root.as_ref() as &str))
-        .map_err(|e| format!("grep: bad path '{root}': {e}"))?;
+    let root_path = match scope {
+        Some(places) => places.readable(root).map_err(|e| format!("grep: {e}"))?,
+        None => {
+            let root = shellexpand::tilde(root).to_string();
+            // Absolute root: result lines carry absolute paths (see glob.rs).
+            std::path::absolute(PathBuf::from(root.as_ref() as &str))
+                .map_err(|e| format!("grep: bad path '{root}': {e}"))?
+        }
+    };
     if !root_path.exists() {
         return Err(format!("grep: '{}' does not exist", root_path.display()));
     }

@@ -64,10 +64,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== assembled prompt ===");
     println!("[system] You are <name>, a helpful agent ... (fixed string)");
     println!("[user: context]\n{view}");
-    let tool_block = agent::tools::tool_instructions();
+    let places = agent::places::current();
+    let tool_block = agent::tools::tool_instructions(&places, agent::tools::ToolProtocol::Line);
     println!(
-        "[user: new message]\nNew message: {}\n\n{}",
-        trigger.content, tool_block
+        "[user: new message]\nNew message: {}\n\n{}\n\n{}",
+        trigger.content,
+        tool_block,
+        agent::tools::environment_note(&places)
     );
 
     std::fs::remove_file(&tmp).ok();

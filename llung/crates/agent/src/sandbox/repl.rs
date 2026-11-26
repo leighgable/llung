@@ -138,6 +138,7 @@ impl Interp {
                     gpu,
                     extra_ro_binds: empty.clone(),
                     rw_subdirs: Vec::new(),
+                    require_runs: false,
                 }
             };
         match self {
@@ -175,8 +176,8 @@ impl Interp {
                 // just the fat torch closure with the GPU sandbox
                 // always on. Reached via the gpu:torch effect; the
                 // plain repl tool refuses this interpreter. The
-                // trainer writes experiment runs under experiments/,
-                // mounted read-write over the ro workspace.
+                // trainer writes runs into the runs directory (mounted
+                // rw in every session); torch REQUIRES it.
                 let _ = backend;
                 let mut cfg = base(
                     SentinelStyle::Print,
@@ -185,17 +186,11 @@ impl Interp {
                     vec!["-i".into(), "-q".into(), "-B".into()],
                     true,
                 );
-                cfg.rw_subdirs = vec!["experiments".into()];
+                cfg.require_runs = true;
                 Ok(cfg)
             }
         }
     }
-}
-
-/// LLUNG_RO_BINDS (see [`crate::paths::ro_binds`]): each existing
-/// entry bound read-only under its own path.
-fn extra_ro_binds_from_env() -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
-    crate::paths::ro_binds().into_iter().map(|p| (p.clone(), p)).collect()
 }
 
 /// How the sentinel expression is injected after each input.
@@ -284,9 +279,13 @@ pub struct SessionConfig {
     /// workspace. Real interpreter configs leave this empty.
     pub extra_ro_binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     /// Workspace subdirectories mounted READ-WRITE over the ro
-    /// workspace mount (the torch trainer's `experiments/`). Created
-    /// if missing at spawn time.
+    /// workspace mount. Created if missing at spawn time. (The built-in
+    /// interpreters use the runs directory instead; see `places`.)
     pub rw_subdirs: Vec<std::path::PathBuf>,
+    /// Refuse to start without a mounted runs directory (torch: the
+    /// trainer's checkpoints must not silently go nowhere). Other
+    /// sessions just start without it.
+    pub require_runs: bool,
 }
 
 impl SessionConfig {
@@ -392,12 +391,15 @@ pub struct ReplSession {
     /// Set when the interpreter can no longer be talked to (write
     /// failure or a timed-out runaway); the manager then drops it.
     dead: bool,
+    /// `Places::generation` the mounts were built from. A session from
+    /// an older generation is restarted (mounts can't change live).
+    generation: u64,
 }
 
 impl ReplSession {
     /// Spawn the interpreter inside a fresh bubblewrap sandbox with the
     /// toolchain closure bound and stdout merged with stderr.
-    async fn spawn(config: &SessionConfig) -> Result<ReplSession, String> {
+    async fn spawn(config: &SessionConfig, places: &crate::places::Places) -> Result<ReplSession, String> {
         if std::env::var("LLUNG_SANDBOX").as_deref() == Ok("off") {
             return Err("repl: LLUNG_SANDBOX=off is not supported for repl sessions (they need persistent pipes)".into());
         }
@@ -417,10 +419,7 @@ impl ReplSession {
         for (src, dest) in &config.extra_ro_binds {
             sb.bind_ro(src, dest);
         }
-        let workspace = std::env::var("LLUNG_WORKSPACE")
-            .map(std::path::PathBuf::from)
-            .or_else(|_| std::env::current_dir())
-            .map_err(|e| format!("repl: cannot resolve workspace: {e}"))?;
+        let workspace = places.workspace().to_path_buf();
         sb.workspace(&workspace, false);
         // Bind-mount rw_subdirs AFTER the ro workspace mount: bwrap
         // applies mounts in order, so the later rw bind of the subdir
@@ -435,13 +434,24 @@ impl ReplSession {
             }
             sb.bind_rw(&path, &path);
         }
-        // Operator-level extra read-only binds (LLUNG_RO_BINDS): data
-        // that is too big for the workspace — e.g. TBs of precomputed
-        // teacher traces on an external drive. Same absolute path
-        // inside the sandbox, read at native bind-mount speed, never
-        // writable. Nonexistent entries are skipped.
-        for (src, dest) in extra_ro_binds_from_env() {
-            sb.bind_ro(src, dest);
+        // Data directories: data that is too big for the workspace —
+        // e.g. TBs of precomputed teacher traces on an external drive.
+        // Same absolute path inside the sandbox, read at native
+        // bind-mount speed, never writable. Missing ones are skipped.
+        for dir in places.data_dirs() {
+            sb.bind_ro(&dir, &dir);
+        }
+        // Runs: the writable scratch area (checkpoints, metrics,
+        // plots), also exported as $LLUNG_RUNS_DIR. bwrap orders mounts
+        // by depth, so a runs dir inside the workspace or a data dir
+        // stays writable.
+        match places.runs_ready() {
+            Ok(runs) => {
+                sb.bind_rw(&runs, &runs);
+                sb.setenv("LLUNG_RUNS_DIR", runs.to_string_lossy().into_owned());
+            }
+            Err(e) if config.require_runs => return Err(format!("repl: {e}")),
+            Err(e) => tracing::warn!("repl session starts without a runs directory: {e}"),
         }
         if config.gpu {
             sb.enable_gpu();
@@ -455,6 +465,20 @@ impl ReplSession {
             if let Ok(hsa) = std::env::var("HSA_OVERRIDE_GFX_VERSION") {
                 sb.setenv("HSA_OVERRIDE_GFX_VERSION", hsa);
             }
+            // Triton (torch kernels, e.g. the `prefix` attention kernels)
+            // JIT-compiles and AUTOTUNES on first use: minutes per
+            // process. HOME is a fresh tmpfs here, so its default cache
+            // (~/.triton) would be lost every session: keep the cache in
+            // the runs dir instead, and persist autotune results too.
+            // Deliberately NOT the host's ~/.triton: a cache the sandbox
+            // can write and the host then loads kernels from would be an
+            // escape hatch.
+            if let Ok(runs) = places.runs_ready() {
+                let cache = runs.join(".cache").join("triton");
+                sb.setenv("TRITON_CACHE_DIR", cache.to_string_lossy().into_owned());
+            }
+            sb.setenv("TRITON_CACHE_AUTOTUNING", "1");
+            sb.setenv("TRITON_DEFAULT_FP_FUSION", "1");
         }
         let mut child = sb.spawn_piped().await?;
         let stdin = child.stdin.take().expect("stdin is piped");
@@ -511,6 +535,7 @@ impl ReplSession {
             style: config.sentinel,
             prompt: config.prompt,
             dead: false,
+            generation: places.generation,
         })
     }
 
@@ -672,6 +697,21 @@ impl ReplManager {
         config: &SessionConfig,
         args: &ReplArgs,
     ) -> Result<String, String> {
+        let places = crate::places::current();
+        self.evaluate_in(agent, config, args, &places).await
+    }
+
+    /// [`Self::evaluate`] with explicit places. A live session spawned
+    /// under a different places generation is restarted first (its
+    /// mounts are stale), and the output says so — the model must know
+    /// its variables are gone.
+    pub async fn evaluate_in(
+        &mut self,
+        agent: &str,
+        config: &SessionConfig,
+        args: &ReplArgs,
+        places: &crate::places::Places,
+    ) -> Result<String, String> {
         let name = args
             .session
             .clone()
@@ -680,8 +720,15 @@ impl ReplManager {
         if self.sessions.get(&key).is_some_and(|s| s.dead) {
             self.sessions.remove(&key);
         }
+        let mut restarted = false;
+        if self.sessions.get(&key).is_some_and(|s| s.generation != places.generation) {
+            if let Some(mut stale) = self.sessions.remove(&key) {
+                stale.kill().await;
+            }
+            restarted = true;
+        }
         if !self.sessions.contains_key(&key) {
-            let session = ReplSession::spawn(config).await?;
+            let session = ReplSession::spawn(config, places).await?;
             self.sessions.insert(key.clone(), session);
         }
         let timeout = Duration::from_secs(
@@ -693,6 +740,11 @@ impl ReplManager {
         let result = session.evaluate(&args.input, timeout).await;
         if session.dead {
             self.sessions.remove(&key);
+        }
+        if restarted {
+            return result
+                .map(|out| format!("{RESTART_NOTE}\n{out}"))
+                .map_err(|e| format!("{RESTART_NOTE}\n{e}"));
         }
         result
     }
@@ -713,6 +765,11 @@ impl ReplManager {
     }
 }
 
+/// Prefixed to the first output of a session restarted because the
+/// places changed.
+pub const RESTART_NOTE: &str = "[session restarted: the operator changed the workspace/runs/data \
+                                directories — earlier variables and imports are gone]";
+
 fn config_default_session(config: &SessionConfig) -> String {
     // Matches Interp::default_session for the built-in configs; custom
     // (test) configs fall back to the program name.
@@ -728,7 +785,11 @@ fn config_default_session(config: &SessionConfig) -> String {
 /// Tier::Repl executor: the `repl` tool (python, chibi-scheme, futhark
 /// c backend). Non-c futhark backends and the torch interpreter are
 /// refused here — they require the `gpu:futhark` / `gpu:torch` effects.
-pub async fn run(agent: &str, arguments_json: &str) -> Result<String, String> {
+pub async fn run(
+    agent: &str,
+    arguments_json: &str,
+    places: &crate::places::Places,
+) -> Result<String, String> {
     let (interp, backend, args) = parse_args(arguments_json)?;
     if interp == Interp::Torch {
         return Err(
@@ -751,7 +812,7 @@ pub async fn run(agent: &str, arguments_json: &str) -> Result<String, String> {
     manager()
         .lock()
         .await
-        .evaluate(agent, &config, &args)
+        .evaluate_in(agent, &config, &args, places)
         .await
 }
 
@@ -759,7 +820,12 @@ pub async fn run(agent: &str, arguments_json: &str) -> Result<String, String> {
 /// the opencl backend, or the torch trainer interpreter — both inside
 /// the GPU-enabled sandbox. The human grant prompt sits in the
 /// orchestrator (Phase 5), on top of the kernel check.
-pub async fn run_gpu(agent: &str, effect_name: &str, arguments_json: &str) -> Result<String, String> {
+pub async fn run_gpu(
+    agent: &str,
+    effect_name: &str,
+    arguments_json: &str,
+    places: &crate::places::Places,
+) -> Result<String, String> {
     match effect_name {
         "futhark" => {
             let (interp, _backend, mut args) = parse_args(arguments_json)?;
@@ -771,7 +837,7 @@ pub async fn run_gpu(agent: &str, effect_name: &str, arguments_json: &str) -> Re
             manager()
                 .lock()
                 .await
-                .evaluate(agent, &config, &args)
+                .evaluate_in(agent, &config, &args, places)
                 .await
         }
         "torch" => {
@@ -783,7 +849,7 @@ pub async fn run_gpu(agent: &str, effect_name: &str, arguments_json: &str) -> Re
             manager()
                 .lock()
                 .await
-                .evaluate(agent, &config, &args)
+                .evaluate_in(agent, &config, &args, places)
                 .await
         }
         other => Err(format!(
@@ -843,6 +909,7 @@ done
             gpu: false,
             extra_ro_binds: vec![(script.to_path_buf(), in_sandbox)],
             rw_subdirs: Vec::new(),
+            require_runs: false,
         }
     }
 
@@ -1061,7 +1128,7 @@ done
         assert_eq!(Interp::parse("pytorch").unwrap(), Interp::Torch);
         assert_eq!(Interp::parse("python-torch").unwrap(), Interp::Torch);
         assert_eq!(Interp::Torch.default_session(), "torch");
-        assert!(run("tester", &serde_json::json!({"interp": "torch", "input": "1"}).to_string())
+        assert!(run("tester", &serde_json::json!({"interp": "torch", "input": "1"}).to_string(), &crate::places::current())
             .await
             .unwrap_err()
             .contains("gpu:torch"));
@@ -1100,16 +1167,64 @@ done
             .await
             .expect("matmul");
         assert!(out.contains("matmul_sum 0.0"), "8x0 @ 8x1 must sum to 0: {out:?}");
+        // Triton's cache must outlive the session (HOME is a tmpfs):
+        // it lives in the runs dir, with autotune results persisted.
+        args.input = "import os; print('triton_cache', os.environ['TRITON_CACHE_DIR'].startswith(os.environ['LLUNG_RUNS_DIR']), os.environ['TRITON_CACHE_AUTOTUNING'])".into();
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-torch", &config, &args)
+            .await
+            .expect("triton env");
+        assert!(out.contains("triton_cache True 1"), "{out:?}");
         manager().lock().await.kill_session("test-torch:acc").await;
     }
 
+    /// The `prefix` Triton kernels (flake input prefix-src) run forward
+    /// AND backward inside the GPU sandbox. Ignored by default: a fresh
+    /// test runs dir means a cold Triton cache (minutes of JIT +
+    /// autotune). `cargo test -p agent prefix_kernel -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn prefix_kernel_runs_in_the_gpu_sandbox() {
+        if skip_without_bwrap() || closure::which("torch-python").is_none() {
+            eprintln!("torch-python not on PATH; skipping");
+            return;
+        }
+        let config = SessionConfig::for_interp(Interp::Torch, Backend::C).unwrap();
+        let args = ReplArgs {
+            interp: "torch".into(),
+            input: "import torch\n\
+                    from prefix.kernels.ops import prefix_sliding_attention\n\
+                    from prefix.kernels.reference import attention_ref\n\
+                    q, k, v = (torch.randn(1, 2, 128, 64, device='cuda', requires_grad=True) for _ in range(3))\n\
+                    out = prefix_sliding_attention(q, k, v, prefix_length=8, window_size=32)\n\
+                    out.sum().backward()\n\
+                    ref, _ = attention_ref(q.detach(), k.detach(), v.detach(), prefix_length=8, window_size=32)\n\
+                    print('prefix_err', (out - ref).abs().max().item() < 1e-4, q.grad is not None)"
+                .into(),
+            session: Some("prefix".into()),
+            timeout_secs: Some(900),
+            backend: None,
+        };
+        let out = manager()
+            .lock()
+            .await
+            .evaluate("test-prefix", &config, &args)
+            .await
+            .expect("prefix kernels in the sandbox");
+        assert!(out.contains("prefix_err True True"), "{out:?}");
+        manager().lock().await.kill_session("test-prefix:prefix").await;
+    }
+
     #[test]
-    fn torch_config_uses_gpu_and_mounts_experiments_rw() {
+    fn torch_config_uses_gpu_and_requires_runs() {
         let cfg = SessionConfig::for_interp(Interp::Torch, Backend::C).unwrap();
         assert!(cfg.gpu, "torch sessions always spawn in the GPU sandbox");
         assert_eq!(cfg.program, "torch-python");
         assert_eq!(cfg.sentinel, SentinelStyle::Print, "it IS python");
-        assert_eq!(cfg.rw_subdirs, vec![Path::new("experiments")]);
+        assert!(cfg.rw_subdirs.is_empty(), "the runs directory replaced experiments/");
+        assert!(cfg.require_runs, "checkpoints must not silently go nowhere");
         assert!(
             cfg.deps.contains(&"gcc"),
             "triton compiles runtime shims at kernel-launch time"
@@ -1133,7 +1248,8 @@ done
         // then run it as a subprocess and report back.
             input: r#"
 import os, subprocess, sys
-os.makedirs("experiments/triton-smoke", exist_ok=True)
+smoke = os.path.join(os.environ["LLUNG_RUNS_DIR"], "triton-smoke")
+os.makedirs(smoke, exist_ok=True)
 src = '''
 import torch, triton, triton.language as tl
 @triton.jit
@@ -1149,8 +1265,8 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print("triton_ok", torch.allclose(out, x + y))
 '''
-open("experiments/triton-smoke/k.py", "w").write(src)
-r = subprocess.run([sys.executable, "experiments/triton-smoke/k.py"], capture_output=True, text=True, timeout=180)
+open(os.path.join(smoke, "k.py"), "w").write(src)
+r = subprocess.run([sys.executable, os.path.join(smoke, "k.py")], capture_output=True, text=True, timeout=180)
 print(r.stdout.strip() or r.stderr[-500:])
 "#
             .into(),
@@ -1169,8 +1285,8 @@ print(r.stdout.strip() or r.stderr[-500:])
             "custom triton kernels must compile and run in the sandbox: {out:?}"
         );
         manager().lock().await.kill_session("test-torch:triton").await;
-        // Workspace fixture cleanup (host side; the sandbox bind is rw).
-        let _ = std::fs::remove_dir_all("experiments/triton-smoke");
+        // Fixture cleanup (host side; the runs bind is rw).
+        let _ = std::fs::remove_dir_all(crate::places::current().runs().join("triton-smoke"));
     }
 
     #[test]
@@ -1190,11 +1306,10 @@ print(r.stdout.strip() or r.stderr[-500:])
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LLUNG_RO_BINDS data is actually readable inside a session — the
-    /// streaming-traces path. SAFETY: scoped env override; the worst a
-    /// concurrent session spawn picks up is one extra ro temp-dir bind.
+    /// Data directories are actually readable inside a session — the
+    /// streaming-traces path. Places passed explicitly: no env mutation.
     #[tokio::test]
-    async fn ro_bind_env_path_is_readable_inside_a_session() {
+    async fn data_dir_is_readable_inside_a_session() {
         if skip_without_bwrap() || closure::which("python3").is_none() {
             eprintln!("python3/bwrap not available; skipping");
             return;
@@ -1215,7 +1330,11 @@ print(r.stdout.strip() or r.stderr[-500:])
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("trace shard 0001.bin"), b"trace-bytes").unwrap();
 
-        unsafe { std::env::set_var("LLUNG_RO_BINDS", &dir) };
+        let places = crate::places::Places::fixed(
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir().join(format!("llung-robind-runs-{}", std::process::id())),
+            vec![dir.clone()],
+        );
         let (interp, backend, mut args) = parse_args(
             &serde_json::json!({"interp": "python", "input": "pass", "timeout_secs": 15})
                 .to_string(),
@@ -1230,15 +1349,43 @@ print(r.stdout.strip() or r.stderr[-500:])
         let out = manager()
             .lock()
             .await
-            .evaluate("test-robind", &config, &args)
+            .evaluate_in("test-robind", &config, &args, &places)
             .await
-            .expect("read through the env bind");
-        unsafe { std::env::remove_var("LLUNG_RO_BINDS") };
+            .expect("read through the data bind");
         assert!(
             out.contains("trace-bytes"),
             "external data must be streamable in the sandbox: {out:?}"
         );
         manager().lock().await.kill_session("test-robind:python").await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Changing the places restarts a live session (its mounts are
+    /// stale) and the output tells the model its state is gone.
+    #[tokio::test]
+    async fn places_change_restarts_the_session_and_says_so() {
+        if skip_without_bwrap() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("llung-repl-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = fake_interp_script(&dir);
+        let config = fake_config(&script);
+        let ws = std::env::current_dir().unwrap();
+        let runs = std::env::temp_dir().join(format!("llung-gen-runs-{}", std::process::id()));
+        let mut v1 = crate::places::Places::fixed(&ws, &runs, vec![]);
+        v1.generation = 7;
+        let mut v2 = v1.clone();
+        v2.generation = 8;
+        let mut mgr = ReplManager::default();
+        let a = mgr.evaluate_in("gen", &config, &fake_args("x", "s", 10), &v1).await.unwrap();
+        assert_eq!(a.trim(), "result 1");
+        let b = mgr.evaluate_in("gen", &config, &fake_args("x", "s", 10), &v1).await.unwrap();
+        assert_eq!(b.trim(), "result 2", "same generation: same session");
+        let c = mgr.evaluate_in("gen", &config, &fake_args("x", "s", 10), &v2).await.unwrap();
+        assert!(c.starts_with(RESTART_NOTE), "{c}");
+        assert!(c.ends_with("result 1"), "fresh interpreter: {c}");
+        mgr.kill_session("gen:s").await;
         std::fs::remove_dir_all(&dir).ok();
     }
 

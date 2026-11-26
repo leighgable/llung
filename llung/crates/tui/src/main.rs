@@ -157,6 +157,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Where the agents' wasm tools resolve (env, next to the exe, or the
     // source tree): the first thing to check when a tool won't load.
     tracing::info!(tools_dir = %agent::paths::tools_dir().display(), "wasm tools");
+    {
+        let places = agent::places::current();
+        tracing::info!(summary = %places.summary(), "agent places");
+        if let Some(err) = agent::places::load_error() {
+            tracing::warn!("saved places unreadable: {err}");
+        }
+    }
 
     let cli = match parse_args() {
         Ok(cli) => cli,

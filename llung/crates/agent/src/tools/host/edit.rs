@@ -26,14 +26,28 @@ struct Edit {
     new: String,
 }
 
+/// Operator-side edit (unconfined).
 pub fn run(arguments_json: &str) -> Result<String, String> {
+    run_in(arguments_json, None)
+}
+
+/// `scope`: `Some(places)` for AGENT calls — the file must lie in the
+/// workspace or the runs directory (relative paths resolve against the
+/// workspace). Data directories are never writable.
+pub fn run_in(
+    arguments_json: &str,
+    scope: Option<&crate::places::Places>,
+) -> Result<String, String> {
     let args: EditArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("edit: arguments must be JSON with 'path' and 'edits' [{{old, new}}]: {e}"))?;
     if args.edits.is_empty() {
         return Err("edit: 'edits' must be a non-empty array of {old, new}".into());
     }
-    let expanded = shellexpand::tilde(&args.path).to_string();
-    let path = std::path::Path::new(expanded.as_ref() as &str);
+    let resolved = match scope {
+        Some(places) => places.writable(&args.path).map_err(|e| format!("edit: {e}"))?,
+        None => std::path::PathBuf::from(shellexpand::tilde(&args.path).as_ref()),
+    };
+    let path = resolved.as_path();
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("edit: cannot stat '{}': {e}", args.path))?;
     if meta.len() as usize > MAX_FILE_BYTES {
@@ -120,6 +134,27 @@ mod tests {
             "edits": [{"old": old, "new": new}],
         })
         .to_string()
+    }
+
+    #[test]
+    fn agent_edits_are_confined_to_workspace_and_runs() {
+        let base = std::env::temp_dir().join(format!("llung-edit-scope-{}", std::process::id()));
+        let (ws, runs, data) = (base.join("ws"), base.join("runs"), base.join("data"));
+        for d in [&ws, &runs, &data] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("f.txt"), "old\n").unwrap();
+        }
+        let places = crate::places::Places::fixed(&ws, &runs, vec![data.clone()]);
+        let call = |p: &str| serde_json::json!({"path": p, "edits": [{"old": "old", "new": "new"}]}).to_string();
+        // Relative = workspace.
+        assert!(run_in(&call("f.txt"), Some(&places)).is_ok());
+        assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "new\n");
+        assert!(run_in(&call(runs.join("f.txt").to_str().unwrap()), Some(&places)).is_ok());
+        // Data dirs are read-only, even for the host-side edit tool.
+        let err = run_in(&call(data.join("f.txt").to_str().unwrap()), Some(&places)).unwrap_err();
+        assert!(err.contains("outside where this agent may write"), "{err}");
+        assert_eq!(std::fs::read_to_string(data.join("f.txt")).unwrap(), "old\n");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

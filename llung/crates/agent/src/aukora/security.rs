@@ -40,6 +40,20 @@ pub async fn secure_execute_agent_tool(
     manifest: Manifest,
     grant: Grant,
 ) -> Result<(Receipt, String), String> {
+    let places = crate::places::current();
+    secure_execute_agent_tool_in(state, wasm_tx, manifest, grant, &places).await
+}
+
+/// [`secure_execute_agent_tool`] against an explicit places snapshot:
+/// the agent loop passes the one its turn started with, so every tool
+/// in a turn sees the same workspace / runs / data directories.
+pub async fn secure_execute_agent_tool_in(
+    state: &mut KernelState,
+    wasm_tx: &mpsc::Sender<ToolRequest>,
+    manifest: Manifest,
+    grant: Grant,
+    places: &crate::places::Places,
+) -> Result<(Receipt, String), String> {
     // through the Aukora logic first
     // checks anti-replay (nonces) and verifies key pins
     let mut receipt = state
@@ -59,7 +73,7 @@ pub async fn secure_execute_agent_tool(
         crate::effects::Tier::FsRead | crate::effects::Tier::Edit => {
             // Host-native tools execute in-process (no wasm, no
             // external processes).
-            let Some(host_result) = crate::tools::host::dispatch(effect.name, &arguments_json)
+            let Some(host_result) = crate::tools::host::dispatch(effect.name, &arguments_json, Some(places))
             else {
                 return Err(format!(
                     "no host executor for effect '{}' (tier {})",
@@ -75,7 +89,7 @@ pub async fn secure_execute_agent_tool(
         crate::effects::Tier::ProcBash => {
             // bubblewrap-sandboxed shell (proc:bash). Workspace is ro by
             // default; the receipt commits to the captured output.
-            let output = crate::sandbox::bash::run(&arguments_json)
+            let output = crate::sandbox::bash::run(&arguments_json, places)
                 .await
                 .map_err(|e| format!("Bash sandbox failed: {e}"))?;
             receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
@@ -85,7 +99,7 @@ pub async fn secure_execute_agent_tool(
         crate::effects::Tier::Repl => {
             // Stateful sandboxed interpreter session (python,
             // chibi-scheme, futhark c backend).
-            let output = crate::sandbox::repl::run(&manifest.agent_id, &arguments_json)
+            let output = crate::sandbox::repl::run(&manifest.agent_id, &arguments_json, places)
                 .await
                 .map_err(|e| format!("Repl failed: {e}"))?;
             receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
@@ -107,7 +121,7 @@ pub async fn secure_execute_agent_tool(
             // GPU-backed execution (futhark opencl). Phase 5 adds the
             // human grant prompt; the kernel gate above already ran.
             let output =
-                crate::sandbox::repl::run_gpu(&manifest.agent_id, effect.name, &arguments_json)
+                crate::sandbox::repl::run_gpu(&manifest.agent_id, effect.name, &arguments_json, places)
                     .await
                     .map_err(|e| format!("Gpu effect failed: {e}"))?;
             receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
@@ -202,9 +216,13 @@ mod tests {
 
         // Bare name classifies to FsRead and runs in-process.
         let (manifest, grant) = signed_manifest("glob", &args, 1, &supervisor);
-        let (receipt, output) = secure_execute_agent_tool(&mut kernel, &wasm_tx, manifest.clone(), grant)
-            .await
-            .expect("host-tier execution");
+        // The dir is the agent's workspace: host tools are confined to
+        // the places (an outside root is refused — see the test below).
+        let places = crate::places::Places::fixed(&dir, dir.join("runs"), vec![]);
+        let (receipt, output) =
+            secure_execute_agent_tool_in(&mut kernel, &wasm_tx, manifest.clone(), grant, &places)
+                .await
+                .expect("host-tier execution");
 
         assert_eq!(receipt.status, ReceiptStatus::Executed);
         assert_eq!(receipt.manifest_hash, compute_sha256(&manifest));
@@ -224,10 +242,20 @@ mod tests {
             authorized_by: supervisor.public_pin(),
             signature: supervisor.sign(&hash),
         };
-        let err = secure_execute_agent_tool(&mut kernel, &wasm_tx, manifest, grant2)
+        let err = secure_execute_agent_tool_in(&mut kernel, &wasm_tx, manifest, grant2, &places)
             .await
             .unwrap_err();
         assert!(err.contains("Replay"), "got: {err}");
+
+        // Agent host tools are confined: a root outside the places is
+        // refused (the operator's own tools are not).
+        let elsewhere = crate::places::Places::fixed(dir.join("runs"), dir.join("runs2"), vec![]);
+        std::fs::create_dir_all(dir.join("runs")).unwrap();
+        let (manifest, grant) = signed_manifest("glob", &args, 2, &supervisor);
+        let err = secure_execute_agent_tool_in(&mut kernel, &wasm_tx, manifest, grant, &elsewhere)
+            .await
+            .unwrap_err();
+        assert!(err.contains("outside what this agent may read"), "got: {err}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -253,7 +281,8 @@ mod tests {
         })
         .to_string();
         let (manifest, grant) = signed_manifest("fs:glob", &args, 7, &supervisor);
-        let (_receipt, output) = secure_execute_agent_tool(&mut kernel, &wasm_tx, manifest, grant)
+        let places = crate::places::Places::fixed(&dir, dir.join("runs"), vec![]);
+        let (_receipt, output) = secure_execute_agent_tool_in(&mut kernel, &wasm_tx, manifest, grant, &places)
             .await
             .expect("fs:-prefixed glob runs on the host executor");
         assert!(output.contains("x.txt"), "got: {output}");

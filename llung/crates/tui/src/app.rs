@@ -1274,6 +1274,52 @@ impl App {
         }
     }
 
+    /// `/places`: where agents work on this machine.
+    fn places_show(&mut self) {
+        let places = agent::places::current();
+        self.system("Agent places (workspace · runs · data):");
+        for line in places.describe() {
+            self.system(format!("  {line}"));
+        }
+        if let Some(err) = agent::places::load_error() {
+            self.system(format!("  ⚠ could not read the saved places: {err}"));
+        }
+        self.system(
+            "  change: /workspace <dir>|reset · /runs <dir>|reset · /data add|rm <dir>",
+        );
+    }
+
+    /// `/workspace`, `/runs`, `/data add|rm`: apply, save, and report.
+    /// Local agents adopt the change at their next turn (their prompt
+    /// leads with a NOTICE of what changed) and REPL sessions restart
+    /// on next use — nothing is published to the network: paths are
+    /// machine-local.
+    fn places_change(&mut self, change: agent::places::Change) {
+        match agent::places::change(change) {
+            Err(e) => self.system(format!("✗ {e}")),
+            Ok(report) => {
+                if report.changes.is_empty() {
+                    self.system("places unchanged");
+                }
+                for c in &report.changes {
+                    self.system(format!("✓ {c}"));
+                }
+                for w in &report.warnings {
+                    self.system(format!("⚠ {w}"));
+                }
+                if !report.changes.is_empty() {
+                    let n = self.agent_grant_txs.len();
+                    if n > 0 {
+                        self.system(format!(
+                            "{n} local agent(s) will be told at their next turn; their REPL \
+                             sessions restart on next use"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     /// Show a system message in the chat panel.
     fn system(&mut self, text: impl Into<String>) {
         self.chat_panel
@@ -2610,6 +2656,13 @@ impl App {
                     }
                 }
             }
+            "/places" | "/workspace" | "/runs" | "/data" => {
+                match parse_places_command(name, args) {
+                    Err(usage) => self.system(usage),
+                    Ok(None) => self.places_show(),
+                    Ok(Some(change)) => self.places_change(change),
+                }
+            }
             "/key" => {
                 match parse_key_command(args.trim()) {
                     Err(usage) => self.system(usage),
@@ -2780,6 +2833,8 @@ impl App {
             "  /grant pending — show the permission prompt queue".into(),
             "  /key list — API keys per provider · /key set <provider> — store one (hidden input, login keyring) · /key delete <provider>".into(),
             "  /plot <csv-path> [kind=scatter|histogram|cdf] [x=col] [y=col] [z=col] — run plot_device on a file yourself".into(),
+            "  /places — where agents work: workspace (code), runs (writable scratch: checkpoints, plots), data (read-only)".into(),
+            "  /workspace <dir>|reset · /runs <dir>|reset · /data add|rm <dir> — change them (saved; agents are told next turn)".into(),
             "  /attach <path> [caption] — send an image".into(),
             "  /peers · /chats · /media — toggle the sidebars".into(),
             "  /theme <name | light/dark | path.json> · /theme reload — theme picker".into(),
@@ -2998,6 +3053,56 @@ fn parse_key_command(args: &str) -> Result<KeyCommand, String> {
             provider: provider.to_string(),
         }),
         _ => Err(KEY_USAGE.into()),
+    }
+}
+
+const PLACES_USAGE: &str = "\
+Usage: /places | /workspace [<dir> | reset] | /runs [<dir> | reset] | /data [add <dir> | rm <dir>]
+
+workspace — the code agents read (writes need your approval); default:
+            the launch directory
+runs      — agents' writable scratch: experiment runs, checkpoints,
+            plots; default: the app data dir. Must already exist (an
+            unmounted drive is refused, never created)
+data      — read-only input directories (CSV files, traces)
+
+Changes are saved to ~/.config/llung/places.json. LLUNG_WORKSPACE,
+LLUNG_RUNS_DIR and LLUNG_RO_BINDS override the saved values at launch.";
+
+/// `/places`, `/workspace`, `/runs`, `/data`. `Ok(None)` = show.
+fn parse_places_command(
+    name: &str,
+    args: &str,
+) -> Result<Option<agent::places::Change>, String> {
+    use agent::places::Change;
+    // Paths may contain spaces: everything after the subcommand is the
+    // path; surrounding quotes are dropped.
+    let unquote = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
+    let args = args.trim();
+    match name {
+        "/places" if args.is_empty() => Ok(None),
+        "/workspace" | "/runs" => {
+            let value = match args {
+                "" => return Ok(None),
+                "reset" => None,
+                path => Some(unquote(path)),
+            };
+            Ok(Some(if name == "/workspace" {
+                Change::Workspace(value)
+            } else {
+                Change::Runs(value)
+            }))
+        }
+        "/data" => {
+            let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            match (sub, unquote(rest)) {
+                ("" | "list", _) => Ok(None),
+                ("add", p) if !p.is_empty() => Ok(Some(Change::AddData(p))),
+                ("rm" | "remove", p) if !p.is_empty() => Ok(Some(Change::RemoveData(p))),
+                _ => Err(PLACES_USAGE.into()),
+            }
+        }
+        _ => Err(PLACES_USAGE.into()),
     }
 }
 
@@ -3229,6 +3334,23 @@ mod tests {
     #[test]
     fn grant_command_parsing() {
         assert_eq!(parse_grant_command("list"), Ok(GrantCommand::List));
+        {
+            use agent::places::Change;
+            let p = |n: &str, a: &str| format!("{:?}", parse_places_command(n, a));
+            assert_eq!(p("/places", ""), "Ok(None)");
+            assert!(p("/places", "x").starts_with("Err"));
+            assert_eq!(p("/workspace", ""), "Ok(None)");
+            assert_eq!(p("/workspace", "reset"), format!("{:?}", Ok::<_, String>(Some(Change::Workspace(None)))));
+            assert_eq!(
+                p("/runs", " \"/mnt/big drive/runs\" "),
+                format!("{:?}", Ok::<_, String>(Some(Change::Runs(Some("/mnt/big drive/runs".into())))))
+            );
+            assert_eq!(p("/data", "add ~/Code/data"), format!("{:?}", Ok::<_, String>(Some(Change::AddData("~/Code/data".into())))));
+            assert_eq!(p("/data", "rm /x"), format!("{:?}", Ok::<_, String>(Some(Change::RemoveData("/x".into())))));
+            assert_eq!(p("/data", ""), "Ok(None)");
+            assert!(p("/data", "add").starts_with("Err"));
+            assert!(p("/data", "zap /x").starts_with("Err"));
+        }
         assert_eq!(parse_grant_command("pending"), Ok(GrantCommand::Pending));
         assert_eq!(
             parse_grant_command("bash perpetual"),

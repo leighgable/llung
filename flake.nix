@@ -35,6 +35,17 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    # Prefix sliding attention (Triton kernels) for experiments/models'
+    # LatentLM. Source only (flake = false): its own nixpkgs / torch pins
+    # stay out. Built by projectOverlay below into BOTH python envs (dev
+    # venv + the agent's torch-python). Locked to a commit; after pushing
+    # to the prefix repo:
+    #   nix flake update prefix-src && direnv reload
+    prefix-src = {
+      url = "github:leighgable/prefix";
+      flake = false;
+    };
+
   };
 
   outputs =
@@ -45,6 +56,7 @@
       pyproject-build-systems,
       rust-overlay,
       llama-cpp,
+      prefix-src,
       ...
     }:
     let
@@ -72,6 +84,23 @@
           hacks = pkgs.callPackage pyproject-nix.build.hacks { };
 
           projectOverlay = final: prev: {
+            # Not in uv.lock: uv2nix cannot read a path dependency outside
+            # this flake, so it is built here from the prefix-src input.
+            # Runtime deps are listed by hand: torch + triton (kernels),
+            # transformers (prefix.modeling; pinned in ./pyproject.toml).
+            # prefix's own pyproject also lists accelerate / ipython /
+            # pytest, which the kernels never import.
+            prefix = final.stdenv.mkDerivation {
+              pname = "prefix";
+              version = "0.1.0";
+              src = prefix-src;
+              nativeBuildInputs = [ final.pyprojectHook ] ++ final.resolveBuildSystem { uv-build = [ ]; };
+              passthru.dependencies = {
+                torch = [ ];
+                triton = [ ];
+                transformers = [ ];
+              };
+            };
             torch =
               (hacks.nixpkgsPrebuilt {
                 from = python.pkgs.torchWithRocm;
@@ -243,7 +272,7 @@
         let
           inherit (sharedFor system) pkgs rustToolchain python_tool;
           pythonSet = pythonSets.${system}.overrideScope editableOverlay;
-          virtualenv = pythonSet.mkVirtualEnv "llung-dev-env" workspace.deps.all;
+          virtualenv = pythonSet.mkVirtualEnv "llung-dev-env" (workspace.deps.all // { prefix = [ ]; });
           rocmEnv = pkgs.symlinkJoin {
             name = "rocm-combined";
             paths = with pkgs.rocmPackages; [
@@ -278,7 +307,9 @@
           # binary name: repl deps resolve interpreters by name from
           # PATH, and `python3` must keep meaning the lean python_tool
           # closure.
-          python_torch = pythonSets.${system}.mkVirtualEnv "llung-torch-env" workspace.deps.default;
+          python_torch = pythonSets.${system}.mkVirtualEnv "llung-torch-env" (
+            workspace.deps.default // { prefix = [ ]; }
+          );
           torch-interp = pkgs.runCommand "torch-interp" { } ''
             mkdir -p $out/bin
             ln -s ${python_torch}/bin/python3 $out/bin/torch-python
@@ -326,6 +357,10 @@
               export LD_LIBRARY_PATH=${pkgs.ocl-icd}/lib:${rocmEnv}/lib:$LD_LIBRARY_PATH
               export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1             
               export HSA_OVERRIDE_GFX_VERSION="11.5.0"
+              # Triton: persist autotune results (prefix kernels re-tune
+              # for minutes per process otherwise); keep fp fusion on.
+              export TRITON_CACHE_AUTOTUNING=1
+              export TRITON_DEFAULT_FP_FUSION=1
             '';
           };
         }
