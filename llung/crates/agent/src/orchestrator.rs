@@ -95,6 +95,13 @@ pub struct AgentLoopContext {
     /// The tool-call format this agent's prompt teaches, resolved on the
     /// first turn (see [`resolve_tool_protocol`]). `None` = not yet.
     pub tool_protocol: Option<crate::tools::ToolProtocol>,
+    /// How this agent's model is driven (context size, tool-loop
+    /// limits, transcript shape), from its backend. Public so tests and
+    /// embedders can adjust it after construction.
+    pub profile: crate::config::ModelProfile,
+    /// The image `show_image` published during the current tool step,
+    /// handed to the tool result so a vision model sees its own plot.
+    last_published_image: Option<Attachment>,
     /// Background compactor cache: (chain tip message id, flattened
     /// compressed view). When a turn's chain tip matches, the view is
     /// reused instead of rebuilding the summary tree synchronously.
@@ -133,13 +140,22 @@ const MAX_TOOL_ROUNDS: u32 = 3;
 /// one-sentence non-answer as the turn's result (or an error panel for
 /// a transient blip) is worse than a few extra seconds.
 const MAX_ASK_ATTEMPTS: u32 = 3;
-/// Tool executions per turn: after each tool result the model is
-/// re-asked, so it can work iteratively (grep → read → edit → run in
-/// the REPL, correcting as it goes) before producing its final answer.
-const MAX_TOOL_STEPS: u32 = 8;
-/// Cap on a tool result fed back into the prompt (chars), so a chatty
-/// REPL or a huge grep can't blow the turn's context.
-const TOOL_FEEDBACK_CHARS: usize = 4_000;
+/// First retry delay after a transient backend failure; doubles per
+/// attempt unless the server sent `retry-after` (see
+/// `interface::retry_delay`). Tiny in tests.
+const ASK_RETRY_BASE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(5)
+} else {
+    std::time::Duration::from_secs(1)
+};
+// Tool steps per turn and the per-result feedback cap come from the
+// agent's `ModelProfile` (config.rs): 8 / 4 000 chars for small local
+// models, more for frontier models.
+
+/// The re-ask after a tool result in full-transcript mode: the result
+/// itself is the previous transcript message.
+const CONTINUE_NOTE: &str = "Continue working toward the request: reply with exactly one \
+     tool call (in the format shown above) to run another tool, or answer normally.";
 
 impl AgentLoopContext {
     /// Build a context for a freshly-provisioned local agent. Creates the
@@ -181,7 +197,10 @@ impl AgentLoopContext {
             }),
         );
         kernel.pinned_keys.insert(supervisor.public_pin());
+        let profile = crate::config::ModelProfile::for_backend(config.backend);
         Self {
+            profile,
+            last_published_image: None,
             config,
             backend,
             compressor,
@@ -370,6 +389,13 @@ async fn resolve_tool_protocol(ctx: &mut AgentLoopContext) {
         ctx.tool_protocol = Some(p);
         return;
     }
+    // Backends that know their model's best format (cloud models have
+    // no chat template to read it from).
+    if let Some(p) = ctx.backend.preferred_tool_protocol() {
+        tracing::info!(agent = %ctx.self_name, protocol = ?p, "tool protocol preferred by backend");
+        ctx.tool_protocol = Some(p);
+        return;
+    }
     match ctx.backend.chat_template().await {
         Some(template) => {
             let p = crate::tools::ToolProtocol::from_chat_template(&template);
@@ -426,6 +452,12 @@ async fn compress_chain(
         if cached_tip == tip_id {
             return view.clone();
         }
+    }
+    // Fits as-is: no tree, no summarizer calls (the common case with a
+    // frontier model's large budget).
+    if let Some(view) = ctx.compressor.verbatim_view(messages) {
+        ctx.view_cache = Some((tip_id.to_string(), view.clone()));
+        return view;
     }
     let spinner = CompressorSpinner::new(ctx);
     if let Some(spinner) = &spinner {
@@ -566,6 +598,11 @@ async fn execute_secured_tool(
     tool_name: String,
     arguments: Vec<u8>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Before the manifest and the grant prompt: never ask the operator
+    // to approve a tool this install cannot run.
+    if let Some(reason) = crate::tools::unavailable_reason(&tool_name) {
+        return Err(reason.into());
+    }
     let manifest = Manifest {
         agent_id: ctx.self_being_id.clone(),
         target_effect: tool_name,
@@ -653,14 +690,42 @@ async fn execute_secured_tool(
     Ok(output)
 }
 
-/// Cap a tool result that is fed back into the prompt.
-fn truncate_for_feedback(output: &str) -> String {
+/// Cap a tool result that is fed back into the prompt (`limit` chars,
+/// from the agent's profile), so a chatty REPL or a huge grep can't
+/// blow the turn's context.
+fn truncate_for_feedback(output: &str, limit: usize) -> String {
     let total = output.chars().count();
-    if total <= TOOL_FEEDBACK_CHARS {
+    if total <= limit {
         return output.to_string();
     }
-    let kept: String = output.chars().take(TOOL_FEEDBACK_CHARS).collect();
-    format!("{kept}\n… [{} chars truncated]", total - TOOL_FEEDBACK_CHARS)
+    let kept: String = output.chars().take(limit).collect();
+    format!("{kept}\n… [{} chars truncated]", total - limit)
+}
+
+/// Bytes an older tool result keeps once the transcript is over budget.
+const ELIDED_RESULT_BYTES: usize = 1_500;
+
+/// Keep the in-turn transcript (assistant call / user result pairs)
+/// under `budget` bytes: first shrink OLDER results to head + tail
+/// (the newest result is never touched), then drop the oldest pairs.
+fn fit_transcript(transcript: &mut Vec<ChatMessage>, budget: usize) {
+    let size = |t: &[ChatMessage]| t.iter().map(|m| m.content.len()).sum::<usize>();
+    let newest = transcript.len().saturating_sub(1);
+    for i in 0..newest {
+        if size(transcript) <= budget {
+            return;
+        }
+        let msg = &mut transcript[i];
+        if msg.agent_role() == "user" && msg.content.len() > ELIDED_RESULT_BYTES {
+            msg.content = format!(
+                "{} [older result shortened]",
+                crate::history::head_tail(&msg.content, ELIDED_RESULT_BYTES)
+            );
+        }
+    }
+    while size(transcript) > budget && transcript.len() > 2 {
+        transcript.drain(0..2);
+    }
 }
 
 /// One-line description of a tool output for `ToolResponse.result_summary`.
@@ -784,6 +849,7 @@ async fn show_image(
     let filename = attachment.filename.clone();
     let size_kb = attachment.size_bytes / 1024;
     let caption = args.caption.unwrap_or_default();
+    ctx.last_published_image = Some(attachment.clone());
     publish_agent_media_on(ctx, None, attachment, caption).await?;
     Ok(format!("published image {filename} ({size_kb} KB) as cid {cid}"))
 }
@@ -838,25 +904,30 @@ fn turn_prompt(
     trigger_text: &str,
     trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
-    turn_prompt_inner(ctx, context, trigger_text, None, trigger_attachment)
+    turn_prompt_inner(ctx, context, trigger_text, &[], None, trigger_attachment)
 }
 
 /// Like [`turn_prompt`], with tool-error feedback appended as the last
 /// (most-weighted) turn — small models read recent context best.
+/// `transcript`: this turn's tool calls and results so far (empty
+/// unless the profile keeps a full transcript), placed between the
+/// trigger and the feedback.
 fn turn_prompt_feedback(
     ctx: &AgentLoopContext,
     context: &str,
     trigger_text: &str,
+    transcript: &[ChatMessage],
     feedback: &str,
     trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
-    turn_prompt_inner(ctx, context, trigger_text, Some(feedback), trigger_attachment)
+    turn_prompt_inner(ctx, context, trigger_text, transcript, Some(feedback), trigger_attachment)
 }
 
 fn turn_prompt_inner(
     ctx: &AgentLoopContext,
     context: &str,
     trigger_text: &str,
+    transcript: &[ChatMessage],
     feedback: Option<&str>,
     trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
@@ -867,6 +938,7 @@ fn turn_prompt_inner(
         &ctx.pending_place_changes,
         context,
         trigger_text,
+        transcript,
         feedback,
         trigger_attachment,
     )
@@ -882,6 +954,7 @@ pub fn assemble_turn_prompt(
     pending_place_changes: &[String],
     context: &str,
     trigger_text: &str,
+    transcript: &[ChatMessage],
     feedback: Option<&str>,
     trigger_attachment: Option<&llung_core::network::message::Attachment>,
 ) -> Vec<ChatMessage> {
@@ -916,6 +989,7 @@ pub fn assemble_turn_prompt(
         ChatMessage::user(context.to_string()),
         trigger_msg,
     ];
+    v.extend(transcript.iter().cloned());
     if let Some(f) = feedback {
         v.push(ChatMessage::user(f.to_string()));
     }
@@ -973,12 +1047,22 @@ async fn ask_streamed(
             Ok(reply) => return Ok(reply),
             Err(e) => {
                 attempt += 1;
-                if attempt >= MAX_ASK_ATTEMPTS {
+                // Permanent failures (400/401/404, a reply cut at
+                // max_tokens) end the turn now; transient ones (429,
+                // 5xx/529, drops) wait — the server's retry-after, or
+                // an exponential backoff — then retry.
+                let delay = if attempt >= MAX_ASK_ATTEMPTS {
+                    None
+                } else {
+                    crate::interface::retry_delay(&*e, attempt - 1, ASK_RETRY_BASE)
+                };
+                let Some(delay) = delay else {
                     return Err(e);
-                }
+                };
                 tracing::warn!(
-                    "backend ask failed ({e}); retrying ({attempt}/{MAX_ASK_ATTEMPTS})"
+                    "backend ask failed ({e}); retrying in {delay:?} ({attempt}/{MAX_ASK_ATTEMPTS})"
                 );
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -1114,6 +1198,7 @@ async fn generate_reply(
                         ctx,
                         &context,
                         trigger_text,
+                        &[],
                         &feedback,
                         trigger_attachment.as_ref(),
                     );
@@ -1146,23 +1231,39 @@ async fn generate_reply(
                 }
             }
         };
-        // Rebuild the tree for this turn and expand the range. The
-        // zoomed view may exceed the byte budget — an explicit expansion
-        // the model asked for, so it stands.
-        let spinner = CompressorSpinner::new(ctx);
-        if let Some(spinner) = &spinner {
-            spinner.show().await;
+        if let Some(full) = ctx.compressor.verbatim_view(&messages) {
+            // Nothing is compressed: zooming can't reveal more. Say so
+            // instead of re-asking the same prompt (which would just
+            // repeat the zoom until the rounds run out).
+            context = full;
+            prompt = turn_prompt_feedback(
+                ctx,
+                &context,
+                trigger_text,
+                &[],
+                "The history above is already shown in full — there is \
+                 nothing to zoom. Answer from it, or call another tool.",
+                trigger_attachment.as_ref(),
+            );
+        } else {
+            // Rebuild the tree for this turn and expand the range. The
+            // zoomed view may exceed the byte budget — an explicit
+            // expansion the model asked for, so it stands.
+            let spinner = CompressorSpinner::new(ctx);
+            if let Some(spinner) = &spinner {
+                spinner.show().await;
+            }
+            let mut tree = ctx.compressor.compress(&messages).await;
+            if let Some(spinner) = spinner {
+                spinner.done().await;
+            }
+            zoom_range(&mut tree, &messages, start, end);
+            // Same budgeted cut; the zoomed range stands even past budget.
+            context = ctx
+                .compressor
+                .flatten_budgeted(&tree, ctx.compressor.context_budget);
+            prompt = turn_prompt(ctx, &context, trigger_text, trigger_attachment.as_ref());
         }
-        let mut tree = ctx.compressor.compress(&messages).await;
-        if let Some(spinner) = spinner {
-            spinner.done().await;
-        }
-        zoom_range(&mut tree, &messages, start, end);
-        // Same budgeted cut; the zoomed range stands even past budget.
-        context = ctx
-            .compressor
-            .flatten_budgeted(&tree, ctx.compressor.context_budget);
-        prompt = turn_prompt(ctx, &context, trigger_text, trigger_attachment.as_ref());
         reply = ask_streamed(
             &*ctx.backend,
             &ctx.stream_tx,
@@ -1182,6 +1283,10 @@ async fn generate_reply(
     // zoom loop: bounded rounds, every call/response pair published.
     let mut steps = 0u32;
     let mut step_log: Vec<String> = Vec::new();
+    // Full-transcript profiles: this turn's calls and results, fed back
+    // as assistant/user pairs (see `ModelProfile::full_transcript`).
+    let mut transcript: Vec<ChatMessage> = Vec::new();
+    ctx.last_published_image = None;
     // Unparseable tool markup gets fed back (bounded) instead of being
     // published: in the chat it would become history the model then
     // imitates. A corrected call re-enters the tool loop.
@@ -1243,6 +1348,7 @@ async fn generate_reply(
                         ctx,
                         &context,
                         trigger_text,
+                        &transcript,
                         &feedback,
                         trigger_attachment.as_ref(),
                     );
@@ -1303,14 +1409,15 @@ async fn generate_reply(
             if error { " (FAILED)" } else { "" }
         ));
         steps += 1;
-        if steps >= MAX_TOOL_STEPS {
+        let max_steps = ctx.profile.max_tool_steps;
+        if steps >= max_steps {
             // The results are all published; hand the turn back with
             // a pointer instead of looping forever.
             return publish_agent_text_on(
                 ctx,
                 trigger_id.map(str::to_string),
                 format!(
-                    "⚠ I hit my per-turn tool budget ({MAX_TOOL_STEPS} calls). \
+                    "⚠ I hit my per-turn tool budget ({max_steps} calls). \
                      The results above are in the chat — ask me to continue \
                      and I'll pick up from them."
                 ),
@@ -1321,27 +1428,53 @@ async fn generate_reply(
         // Feed the result back as the most-recent (most-weighted)
         // turn: the model continues with the next tool call or the
         // final answer. The loop re-judges the reply at 'tool.
-        let mut feedback = String::new();
-        if step_log.len() > 1 {
-            feedback.push_str("Tool calls so far this turn:\n");
-            for line in &step_log[..step_log.len() - 1] {
-                feedback.push_str("- ");
-                feedback.push_str(line);
-                feedback.push('\n');
+        let limit = ctx.profile.tool_feedback_chars;
+        let published_image = ctx.last_published_image.take();
+        let feedback = if ctx.profile.full_transcript {
+            // The model's own call (with its reasoning and arguments)
+            // and the result, kept for the rest of the turn: step 5
+            // still sees what step 1 printed.
+            transcript.push(ChatMessage::assistant(reply.trim()));
+            let mut result = ChatMessage::user(format!(
+                "Tool '{tool_name}' {}returned:\n```\n{}\n```",
+                if error { "FAILED and " } else { "" },
+                truncate_for_feedback(&content, limit),
+            ));
+            if let Some(image) = published_image.filter(|_| ctx.profile.see_own_images && !error) {
+                // Only the newest image rides along: each costs tokens.
+                for older in transcript.iter_mut() {
+                    older.attachment = None;
+                }
+                result = result.with_attachment(image);
             }
-        }
-        feedback.push_str(&format!(
-            "Tool '{tool_name}' {}returned:\n```\n{}\n```\n\
-             Continue working toward the request: reply with exactly one \
-             tool call (in the format shown above) to run another tool, \
-             or answer normally.",
-            if error { "FAILED and " } else { "" },
-            truncate_for_feedback(&content),
-        ));
+            transcript.push(result);
+            fit_transcript(&mut transcript, ctx.profile.transcript_chars);
+            CONTINUE_NOTE.to_string()
+        } else {
+            let mut feedback = String::new();
+            if step_log.len() > 1 {
+                feedback.push_str("Tool calls so far this turn:\n");
+                for line in &step_log[..step_log.len() - 1] {
+                    feedback.push_str("- ");
+                    feedback.push_str(line);
+                    feedback.push('\n');
+                }
+            }
+            feedback.push_str(&format!(
+                "Tool '{tool_name}' {}returned:\n```\n{}\n```\n\
+                 Continue working toward the request: reply with exactly one \
+                 tool call (in the format shown above) to run another tool, \
+                 or answer normally.",
+                if error { "FAILED and " } else { "" },
+                truncate_for_feedback(&content, limit),
+            ));
+            feedback
+        };
         prompt = turn_prompt_feedback(
             ctx,
             &context,
             trigger_text,
+            &transcript,
             &feedback,
             trigger_attachment.as_ref(),
         );
@@ -1373,6 +1506,7 @@ async fn generate_reply(
             ctx,
             &context,
             trigger_text,
+            &transcript,
             &feedback,
             trigger_attachment.as_ref(),
         );
@@ -1704,11 +1838,13 @@ mod tests {
     async fn compress_chain_caches_by_tip_and_recompresses_on_new_tip() {
         use crate::history::NODE_BYTES;
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Budget below the message size: the verbatim shortcut must not
+        // apply, so the tree (and the summarizer) runs.
         let mut ctx = ctx_with(crate::history::HistoryCompressor::new(
             Box::new(CountingSummarizer {
                 calls: calls.clone(),
             }),
-            128_000,
+            1_000,
         ));
 
         // A message over NODE_BYTES forces exactly one summarizer call.
@@ -1975,7 +2111,9 @@ mod tests {
                 Box::new(CountingSummarizer {
                     calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }),
-                128_000,
+                // 0: even an empty history goes through the compressor
+                // (no verbatim shortcut), so its spinner line shows.
+                0,
             )
             .with_label("SmolVLM"),
             test_db(),
@@ -2271,7 +2409,8 @@ mod tests {
                 Box::new(CountingSummarizer {
                     calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }),
-                128_000,
+                // Under one long message's size: compressed, not verbatim.
+                1_000,
             ),
             test_db(),
             cmd_tx,
@@ -2895,5 +3034,204 @@ mod tests {
         assert!(cmd_rx.try_recv().is_err(), "no network commands on refusal");
         std::fs::remove_dir_all(&ws).ok();
     }
-}
 
+    fn roles(prompt: &[ChatMessage]) -> Vec<&'static str> {
+        prompt.iter().map(|m| m.agent_role()).collect()
+    }
+
+    /// Frontier profile: every step's call (with the model's reasoning)
+    /// and result stays in the prompt for the rest of the turn.
+    #[tokio::test]
+    async fn frontier_transcript_keeps_every_step() {
+        let (mut ctx, backend, _rx) = scripted_ctx(vec![
+            r#"Looking at the manifest first. TOOL {"name":"glob","arguments":{"pattern":"Cargo.toml"}}"#.into(),
+            r#"TOOL {"name":"glob","arguments":{"pattern":"src/*.rs"}}"#.into(),
+            "done".into(),
+        ]);
+        ctx.profile = crate::config::ModelProfile::frontier();
+        generate_reply(&mut ctx, "alice: @tester look around", None, None)
+            .await
+            .unwrap();
+
+        let prompts = backend.prompts();
+        assert_eq!(prompts.len(), 3);
+        let last = &prompts[2];
+        assert_eq!(
+            roles(last),
+            ["system", "user", "user", "assistant", "user", "assistant", "user", "user"],
+            "system, history, trigger, (call, result) x2, continue"
+        );
+        assert!(last[3].content.contains("Looking at the manifest first"), "reasoning kept");
+        assert!(last[4].content.starts_with("Tool 'glob' returned"));
+        assert!(last[4].content.contains("Cargo.toml"), "step 1's output survives to step 3");
+        assert!(last[6].content.contains("lib.rs"));
+        assert_eq!(last[7].content, CONTINUE_NOTE);
+    }
+
+    /// Small-model profile: the old shape — latest result plus one-line
+    /// summaries of earlier steps, no assistant turns.
+    #[tokio::test]
+    async fn small_model_feedback_keeps_the_compact_shape() {
+        let (mut ctx, backend, _rx) = scripted_ctx(vec![
+            r#"TOOL {"name":"glob","arguments":{"pattern":"Cargo.toml"}}"#.into(),
+            r#"TOOL {"name":"glob","arguments":{"pattern":"src/*.rs"}}"#.into(),
+            "done".into(),
+        ]);
+        assert_eq!(ctx.profile, crate::config::ModelProfile::small_model());
+        generate_reply(&mut ctx, "alice: @tester look around", None, None)
+            .await
+            .unwrap();
+        let last = &backend.prompts()[2];
+        assert!(!roles(last).contains(&"assistant"));
+        let feedback = &last.last().unwrap().content;
+        assert!(feedback.contains("Tool calls so far this turn"), "{feedback}");
+        assert!(feedback.contains("Tool 'glob' returned"));
+    }
+
+    /// Frontier profile: an image published with show_image rides the
+    /// tool result, so a vision model sees its own plot.
+    #[tokio::test]
+    async fn frontier_sees_the_image_it_published() {
+        let ws = workspace_fixture("feedback");
+        let rel = std::path::Path::new("target").join(ws.file_name().unwrap());
+        std::fs::write(ws.join("loss.png"), tiny_png_bytes()).unwrap();
+        let call = format!(
+            r#"TOOL {{"name":"show_image","arguments":{{"path":"{}"}}}}"#,
+            rel.join("loss.png").display()
+        );
+        for (frontier, expect_image) in [(true, true), (false, false)] {
+            let (mut ctx, backend, _rx) =
+                scripted_ctx(vec![call.clone(), "the curve is flat".into()]);
+            if frontier {
+                ctx.profile = crate::config::ModelProfile::frontier();
+            }
+            generate_reply(&mut ctx, "alice: @tester plot it", None, None)
+                .await
+                .unwrap();
+            let second = &backend.prompts()[1];
+            let with_image: Vec<_> = second.iter().filter(|m| m.attachment.is_some()).collect();
+            assert_eq!(!with_image.is_empty(), expect_image, "frontier={frontier}");
+            if expect_image {
+                assert_eq!(with_image[0].agent_role(), "user");
+                assert!(with_image[0].content.contains("Tool 'show_image' returned"));
+            }
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn transcript_elides_older_results_then_drops_pairs() {
+        let big = "r".repeat(10_000);
+        let mut t = vec![
+            ChatMessage::assistant("call 1"),
+            ChatMessage::user(big.clone()),
+            ChatMessage::assistant("call 2"),
+            ChatMessage::user(big.clone()),
+        ];
+        fit_transcript(&mut t, 12_000);
+        assert_eq!(t.len(), 4, "shrinking the older result was enough");
+        assert!(t[1].content.len() < 2_000 && t[1].content.contains("older result shortened"));
+        assert_eq!(t[3].content, big, "the newest result is never shortened");
+
+        let mut t = vec![
+            ChatMessage::assistant("x".repeat(9_000)),
+            ChatMessage::user("a"),
+            ChatMessage::assistant("call 2"),
+            ChatMessage::user(big.clone()),
+        ];
+        fit_transcript(&mut t, 12_000);
+        assert_eq!(t.len(), 2, "oldest pair dropped");
+        assert_eq!(t[0].content, "call 2");
+    }
+
+    /// Fails with an HTTP status `failures` times, then answers.
+    #[derive(Clone)]
+    struct StatusFlakyBackend {
+        status: u16,
+        failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Backend for StatusFlakyBackend {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = llung_core::network::message::AgentResult<String>> + Send + '_>,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let fail = self.failures.load(SeqCst) > 0;
+            if fail {
+                self.failures.fetch_sub(1, SeqCst);
+            }
+            let status = self.status;
+            Box::pin(async move {
+                if fail {
+                    Err(Box::new(crate::interface::HttpStatusError {
+                        status,
+                        retry_after: None,
+                        message: format!("{status} from the stub"),
+                    }) as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Ok("fine".to_string())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_errors_retry_permanent_ones_do_not() {
+        for (status, expect_ok, expect_calls) in [(529u16, true, 2usize), (429, true, 2), (401, false, 1)] {
+            let backend = StatusFlakyBackend {
+                status,
+                failures: std::sync::Arc::new(1.into()),
+                calls: std::sync::Arc::new(0.into()),
+            };
+            let (stream_tx, _rx) = mpsc::channel(64);
+            let out = ask_streamed(
+                &backend,
+                &stream_tx,
+                "t",
+                "b",
+                "tester",
+                &[ChatMessage::user("hi")],
+                "r1",
+            )
+            .await;
+            assert_eq!(out.is_ok(), expect_ok, "status {status}");
+            assert_eq!(
+                backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+                expect_calls,
+                "status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_preferred_protocol_wins_over_the_default() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(8);
+        let mut ctx = AgentLoopContext::new(
+            AgentConfig {
+                backend: crate::config::BackendKind::Anthropic,
+                ..Default::default()
+            },
+            Box::new(crate::interface::Anthropic::new("claude-sonnet-4-5")),
+            crate::history::HistoryCompressor::rules_only(1_000),
+            test_db(),
+            cmd_tx,
+            "t".into(),
+            "being".into(),
+            "tester".into(),
+            stream_tx,
+            perm_tx,
+        );
+        assert_eq!(ctx.profile, crate::config::ModelProfile::frontier(), "profile from backend");
+        assert!(!ctx.compressor.is_model_backed(), "rules_only is never upgraded");
+        if std::env::var("LLUNG_TOOL_PROTOCOL").is_err() {
+            resolve_tool_protocol(&mut ctx).await;
+            assert_eq!(ctx.tool_protocol, Some(crate::tools::ToolProtocol::QwenXml));
+        }
+    }
+}

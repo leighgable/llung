@@ -92,6 +92,9 @@ pub struct HistoryCompressor {
     /// Which model compresses (e.g. "SmolVLM"), for UI attribution;
     /// see [`Self::display_name`].
     label: Option<String>,
+    /// Rule-based on purpose ([`Self::rules_only`]): never upgraded to
+    /// the agent's own model.
+    pinned_rules: bool,
 }
 
 impl HistoryCompressor {
@@ -100,7 +103,46 @@ impl HistoryCompressor {
             backend,
             context_budget,
             label: None,
+            pinned_rules: false,
         }
+    }
+
+    /// Rule-based truncation ONLY, deliberately: unlike a bare
+    /// [`Self::new`] with [`HeadlineSummarizer`], the agent loop will not
+    /// upgrade it to the agent's own model. For expensive models with a
+    /// budget large enough that compression rarely triggers.
+    pub fn rules_only(context_budget: usize) -> Self {
+        let mut c = Self::new(Box::new(HeadlineSummarizer::new()), context_budget);
+        c.pinned_rules = true;
+        c
+    }
+
+    /// Set the view's byte budget (see [`crate::config::ModelProfile`]).
+    pub fn with_budget(mut self, context_budget: usize) -> Self {
+        self.context_budget = context_budget;
+        self
+    }
+
+    /// The whole history verbatim — every message in full, `[i]`
+    /// numbered like the tree view — when it fits the budget. No tree,
+    /// no summarizer calls: with a large budget (frontier models) most
+    /// turns never pay for compression. `None` when it doesn't fit.
+    pub fn verbatim_view(&self, messages: &[ChatMessage]) -> Option<String> {
+        if messages.is_empty() {
+            let empty = "(no history)";
+            return (empty.len() <= self.context_budget).then(|| empty.into());
+        }
+        let mut parts = Vec::with_capacity(messages.len());
+        let mut total = 0usize;
+        for (i, msg) in messages.iter().enumerate() {
+            let line = format!("[{i}] {}", render_message(msg));
+            total += line.len() + 1;
+            if total > self.context_budget + 1 {
+                return None;
+            }
+            parts.push(line);
+        }
+        Some(parts.join("\n"))
     }
 
     /// Name the model doing the compression (e.g. "SmolVLM") so the UI
@@ -140,7 +182,7 @@ impl HistoryCompressor {
     /// Adopt a chat backend for compression when the embedder configured
     /// a rule-based summarizer only. No-op when already model-backed.
     pub fn upgrade_to_model(&mut self, backend: Box<dyn Backend>) {
-        if !self.is_model_backed() {
+        if !self.is_model_backed() && !self.pinned_rules {
             self.backend = Box::new(ModelSummarizer::new(backend));
         }
     }
@@ -203,16 +245,12 @@ impl HistoryCompressor {
     /// Level-0 summary for one message that doesn't fit verbatim.
     async fn summarize_one(&self, msg: &ChatMessage) -> String {
         match msg.kind {
-            MessageKind::ToolCall {
-                ref tool_name,
-                ref arguments,
-            } => format!(
-                "Called tool '{}' with args: {}",
-                tool_name,
-                arguments.chars().take(60).collect::<String>()
-            ),
-            MessageKind::ToolResponse { ref tool_name, .. } => {
-                format!("Tool '{}' returned result.", tool_name)
+            // Tool traffic: rule-based head + tail, never a model call.
+            // The head says what ran; the tail is where results and
+            // errors are (a status table, a traceback's last line).
+            MessageKind::ToolCall { .. } | MessageKind::ToolResponse { .. } => {
+                let line = flatten_newlines(&render_message(msg));
+                head(&head_tail(&line, NODE_BYTES), NODE_BYTES)
             }
             // NODE is a target the summarizer may miss (a backend that
             // rambles): enforce it so the flattened cut never
@@ -548,25 +586,52 @@ pub struct ModelSummarizer {
     backend: Box<dyn Backend>,
     /// Target byte size for one summary line.
     budget: usize,
+    /// Successful answers by request hash. The tree is rebuilt for every
+    /// new message, so the same long message (or the same pair of
+    /// lines) is asked about again and again; with a paid compressor
+    /// model each repeat costs money and latency. Fallbacks are not
+    /// memoized, so a model that was down gets asked again later.
+    memo: std::sync::Mutex<std::collections::HashMap<u64, String>>,
 }
+
+/// Memo entries kept before the memo is cleared (bounded memory).
+const MEMO_CAPACITY: usize = 4_096;
 
 impl ModelSummarizer {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         Self {
             backend,
             budget: NODE_BYTES,
+            memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// One compression request; None means "fall back to rules".
     async fn ask(&self, system: String, user: String) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            system.hash(&mut h);
+            user.hash(&mut h);
+            h.finish()
+        };
+        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(&key).cloned()) {
+            return Some(hit);
+        }
         let prompt = vec![ChatMessage::system(system), ChatMessage::user(user)];
         let out = self.backend.chat(&prompt).await.ok()?;
         let out = out.trim().replace('\n', " ");
         if out.is_empty() || out.len() > self.budget * 2 {
             return None; // empty or rambling/echoing — let the caller fall back
         }
-        Some(head(&out, self.budget))
+        let out = head(&out, self.budget);
+        if let Ok(mut memo) = self.memo.lock() {
+            if memo.len() >= MEMO_CAPACITY {
+                memo.clear();
+            }
+            memo.insert(key, out.clone());
+        }
+        Some(out)
     }
 }
 
@@ -654,6 +719,27 @@ impl Summarizer for HeadlineSummarizer {
             format!("{}\n{}", head(left, half), head(right, NODE_BYTES - half))
         })
     }
+}
+
+/// `text` cut to about `budget` bytes keeping BOTH ends: ~40% head,
+/// ~60% tail, joined by ` … `. Char-boundary safe.
+pub(crate) fn head_tail(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    const JOIN: &str = " … ";
+    let room = budget.saturating_sub(JOIN.len());
+    let head_bytes = room * 2 / 5;
+    let tail_bytes = room - head_bytes;
+    let mut head_end = head_bytes.min(text.len());
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(tail_bytes);
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{JOIN}{}", &text[..head_end], &text[tail_start..])
 }
 
 /// First `budget` UTF-8 bytes of `text` (cut on a char boundary), with a
@@ -883,4 +969,84 @@ mod tests {
         let flat = c.flatten(&tree);
         assert!(flat.contains(&long), "zoomed nodes show full text");
     }
+
+    #[test]
+    fn verbatim_view_when_it_fits_and_none_when_not() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let long = "y".repeat(NODE_BYTES * 3);
+        let msgs = vec![chat_msg(MessageKind::Human, &long), chat_msg(MessageKind::Human, "short")];
+        let roomy = HistoryCompressor::new(Box::new(FakeBackend::new(calls.clone())), 10_000);
+        let view = roomy.verbatim_view(&msgs).expect("fits");
+        assert!(view.starts_with("[0] ") && view.contains(&long), "full text, indexed");
+        assert!(view.contains("\n[1] "));
+        let tight = HistoryCompressor::new(Box::new(FakeBackend::new(calls.clone())), 1_000);
+        assert!(tight.verbatim_view(&msgs).is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "never a model call");
+    }
+
+    #[tokio::test]
+    async fn long_tool_output_keeps_head_and_tail() {
+        let c = HistoryCompressor::new(Box::new(HeadlineSummarizer::new()), 64_000);
+        let output = format!("epoch 1 loss 2.31\n{}\nFINAL val_acc=0.97", "noise ".repeat(300));
+        let mut m = chat_msg(MessageKind::ToolResponse {
+            tool_name: "gpu:torch".into(),
+            result_summary: String::new(),
+            error: false,
+        }, &output);
+        m.sender_name = String::new();
+        let line = c.summarize_one(&m).await;
+        assert!(line.len() <= NODE_BYTES, "{}", line.len());
+        assert!(line.contains("gpu:torch"), "what ran: {line}");
+        assert!(line.contains("epoch 1"), "head kept: {line}");
+        assert!(line.contains("FINAL val_acc=0.97"), "tail kept: {line}");
+    }
+
+    #[test]
+    fn rules_only_is_never_upgraded() {
+        struct Never;
+        impl Backend for Never {
+            fn chat(
+                &self,
+                _m: &[ChatMessage],
+            ) -> Pin<Box<dyn Future<Output = llung_core::network::message::AgentResult<String>> + Send + '_>> {
+                Box::pin(async { Ok(String::new()) })
+            }
+        }
+        let mut pinned = HistoryCompressor::rules_only(1_000);
+        pinned.upgrade_to_model(Box::new(Never));
+        assert!(!pinned.is_model_backed());
+        let mut plain = HistoryCompressor::new(Box::new(HeadlineSummarizer::new()), 1_000);
+        plain.upgrade_to_model(Box::new(Never));
+        assert!(plain.is_model_backed(), "an unpinned rule-based compressor still upgrades");
+    }
+
+    #[tokio::test]
+    async fn model_summaries_are_memoized() {
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Backend for Counting {
+            fn chat(
+                &self,
+                _m: &[ChatMessage],
+            ) -> Pin<Box<dyn Future<Output = llung_core::network::message::AgentResult<String>> + Send + '_>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok("a summary".to_string()) })
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = ModelSummarizer::new(Box::new(Counting(calls.clone())));
+        assert_eq!(s.summarize("some long text").await, "a summary");
+        assert_eq!(s.summarize("some long text").await, "a summary");
+        assert_eq!(s.merge("l", "r").await, "a summary");
+        assert_eq!(s.merge("l", "r").await, "a summary");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one call per distinct request");
+    }
+
+    #[test]
+    fn head_tail_is_char_boundary_safe() {
+        let text = "é".repeat(400);
+        let cut = head_tail(&text, 101);
+        assert!(cut.len() <= 101 + 4, "{}", cut.len());
+        assert!(cut.contains(" … "));
+    }
 }
+

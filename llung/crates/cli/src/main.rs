@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 const KEY_USAGE: &str = "\
 Usage: llung-cli key <set|get|delete|list> [provider]
 
-Providers name a model backend's API key (e.g. kimi). Keys are stored
+Providers name a model backend's API key (kimi, anthropic). Keys are stored
 in the login keyring (freedesktop Secret Service), encrypted at rest;
 LLUNG_<PROVIDER>_API_KEY overrides for one shell.\n
 Examples:
@@ -61,7 +61,7 @@ async fn run_key_command(args: &[String]) -> Result<bool, Box<dyn std::error::Er
         }
         Some("list") => {
             // Providers are discovered on demand; list the known ones.
-            for provider in ["kimi"] {
+            for provider in ["kimi", "anthropic"] {
                 let state = if llung_core::secrets::has_api_key(provider).await {
                     "set"
                 } else {

@@ -268,6 +268,7 @@ const BACKENDS: &[(&str, &str)] = &[
     ("lemonade", "local Lemonade :13305 (LFM2.5)"),
     ("kimi", "Moonshot cloud · needs API key"),
     ("kimi-coding", "Kimi for Coding · needs API key"),
+    ("anthropic", "Anthropic cloud (Claude) · needs API key"),
 ];
 
 /// Static model catalog per backend. Local servers host exactly one
@@ -283,6 +284,12 @@ fn models_for(kind: BackendKind) -> &'static [(&'static str, &'static str)] {
             ("moonshot-v1-128k", "older generation, 128k"),
         ],
         BackendKind::KimiCoding => &[("kimi-for-coding", "coding subscription")],
+        BackendKind::Anthropic => &[
+            ("claude-sonnet-4-5", "default · balanced, 64k out"),
+            ("claude-opus-4-5", "most capable"),
+            ("claude-opus-4-1", "previous Opus"),
+            ("claude-haiku-4-5", "fast and cheap"),
+        ],
     }
 }
 
@@ -547,6 +554,11 @@ mod tests {
         let c = for_input(text, text.len(), "").unwrap();
         assert!(c.title.contains("Kimi"), "{c:?}");
         assert!(labels(&c).contains(&"kimi-k2-0905-preview"));
+
+        let text = "/agent spawn scout backend=claude model=";
+        let c = for_input(text, text.len(), "").unwrap();
+        assert!(labels(&c).contains(&agent::interface::ANTHROPIC_DEFAULT_MODEL), "{c:?}");
+        assert!(labels(&c).contains(&agent::interface::ANTHROPIC_COMPRESSOR_MODEL));
 
         // No backend typed yet: the default backend's single model.
         let text = "/agent spawn scout model=";

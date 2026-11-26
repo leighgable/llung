@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         &view,
         &trigger_text,
+        &[],
         None,
         None,
     );

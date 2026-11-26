@@ -11,10 +11,12 @@
 //   Wasm        (bare)     landscape, plot_device  wasm worker  no
 //   Host        host:      show_image              orchestrator no
 //   FsRead      fs:        glob, grep              host::       no
+//                          pdf_read                bwrap        no (read-only, no network)
 //   Edit        edit:      edit                    host::       no
 //   ProcBash    proc:      bash (Phase 3)          bwrap        YES
 //   Repl        repl:      python, chibi, futhark  REPL mgr     YES
 //   Gpu         gpu:       futhark, torch          bwrap+GPU    YES, never implicit
+//   Net         net:       web_fetch               host HTTP    YES
 //
 // Bare (prefix-less) names resolve through the registry: known host-tool
 // names map to their tier, everything else stays Wasm (preserving the
@@ -42,6 +44,11 @@ pub enum Tier {
     /// GPU-backed execution (futhark opencl/cuda). Always prompts;
     /// never covered by an implicit standing grant.
     Gpu,
+    /// Outbound network access from the host (web_fetch). Always
+    /// prompts (the URL is in the prompt): fetched text is untrusted
+    /// input, and a URL is also a way OUT — whatever the agent puts in
+    /// it reaches the server. Standing grants are allowed.
+    Net,
     /// Side-effecting host tools that need the AGENT's context (network
     /// stack, media cache) — e.g. `show_image` publishes a media
     /// message from the agent's own being. The orchestrator executes
@@ -62,6 +69,7 @@ impl Tier {
             Tier::Repl => "repl",
             Tier::Gpu => "gpu",
             Tier::Host => "host",
+            Tier::Net => "net",
         }
     }
 
@@ -69,7 +77,7 @@ impl Tier {
     /// Phase 5 wires this into the TUI permission flow; Phase 3/4
     /// executors should also refuse to run unprompted when true.
     pub fn requires_prompt(&self) -> bool {
-        matches!(self, Tier::ProcBash | Tier::Repl | Tier::Gpu)
+        matches!(self, Tier::ProcBash | Tier::Repl | Tier::Gpu | Tier::Net)
     }
 
     /// May a standing (perpetual) grant authorize this tier? Gpu is the
@@ -95,6 +103,10 @@ const BARE_TIERS: &[(&str, Tier)] = &[
     ("show_image", Tier::Host),
     ("glob", Tier::FsRead),
     ("grep", Tier::FsRead),
+    // Read-only and network-less, but a real process: PDFium + ONNX
+    // Runtime run inside bubblewrap (sandbox/pdf.rs), never in-process.
+    ("pdf_read", Tier::FsRead),
+    ("web_fetch", Tier::Net),
     ("edit", Tier::Edit),
     ("bash", Tier::ProcBash),
     ("repl", Tier::Repl),
@@ -115,6 +127,7 @@ pub fn classify(target_effect: &str) -> Effect<'_> {
             "repl" => Tier::Repl,
             "gpu" => Tier::Gpu,
             "host" => Tier::Host,
+            "net" => Tier::Net,
             // Unknown prefix: do not silently run it as something else.
             // Classify as Wasm under the full original string so the
             // worker reports the missing component with its real name.
@@ -152,6 +165,12 @@ mod tests {
         // The sandboxed shell is NOT a host tool: it must route to bwrap.
         assert_eq!(classify("bash").tier, Tier::ProcBash);
         assert_eq!(classify("proc:bash").tier, Tier::ProcBash);
+        assert_eq!(classify("pdf_read").tier, Tier::FsRead);
+        assert_eq!(classify("web_fetch").tier, Tier::Net);
+        assert_eq!(classify("net:web_fetch").name, "web_fetch");
+        assert!(Tier::Net.requires_prompt(), "network access always asks");
+        assert!(Tier::Net.standing_allowed());
+        assert!(!Tier::FsRead.requires_prompt(), "reading a PDF does not");
     }
 
     #[test]
@@ -179,9 +198,9 @@ mod tests {
     fn unknown_prefix_is_not_misclassified() {
         // An unknown prefix keeps the FULL original string as the wasm
         // name so the failure message names the real effect.
-        let e = classify("net:send");
+        let e = classify("xyz:send");
         assert_eq!(e.tier, Tier::Wasm);
-        assert_eq!(e.name, "net:send");
+        assert_eq!(e.name, "xyz:send");
     }
 
     #[test]

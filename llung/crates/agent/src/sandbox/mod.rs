@@ -17,6 +17,7 @@
 pub mod bwrap;
 pub mod closure;
 pub mod bash;
+pub mod pdf;
 pub mod repl;
 
 /// Resolve the sandbox runtime ahead of the first tool call. The first

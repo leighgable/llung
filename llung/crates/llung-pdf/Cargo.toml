@@ -1,0 +1,18 @@
+[package]
+name = "llung-pdf"
+version = "0.1.0"
+edition = "2024"
+description = "PDF -> Markdown helper for the llung agent's pdf_read tool (runs inside the sandbox)"
+
+[[bin]]
+name = "llung-pdf"
+path = "src/main.rs"
+
+[dependencies]
+# Native extraction (pure Rust, lopdf) + selective OCR: PDFium renders
+# the pages that need it, PP-OCRv6 via ONNX Runtime reads them. Both
+# native libraries load at RUN time (PDFIUM_LIB_PATH, ORT_DYLIB_PATH) —
+# this binary runs inside the bubblewrap sandbox, never in the agent
+# host process, so a hostile PDF meets PDFium in a disposable process
+# with no network and a read-only view of one file.
+pdf-inspector = { version = "1.27", features = ["ocr"] }

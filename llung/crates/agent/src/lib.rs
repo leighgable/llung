@@ -9,6 +9,7 @@ pub mod permissions;
 pub mod places;
 pub mod sandbox;
 pub mod tools;
+pub mod web;
 
 pub use orchestrator::{AgentCommand, AgentLoopContext, AgentStream, run_agent_loop};
 

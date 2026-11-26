@@ -102,6 +102,13 @@ pub fn summarize_arguments(effect: &crate::effects::Effect<'_>, arguments: &[u8]
             .and_then(|p| p.as_str())
             .map(|p| format!("{} {p}", effect.name))
             .unwrap_or_else(|| truncate(&args, 120)),
+        // The URL IS the decision: show it whole-ish (it is also where
+        // any exfiltrated data would ride).
+        Tier::Net => json
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(|u| format!("GET {}", truncate(u, 200)))
+            .unwrap_or_else(|| truncate(&args, 120)),
         _ => truncate(&args, 120),
     }
 }
@@ -141,6 +148,13 @@ mod tests {
         let e = classify("proc:bash");
         let s = summarize_arguments(&e, b"not json at all");
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn summarizes_fetch_urls() {
+        let e = classify("web_fetch");
+        let s = summarize_arguments(&e, br#"{"url": "https://github.com/a/b?x=1"}"#);
+        assert_eq!(s, "GET https://github.com/a/b?x=1");
     }
 
     #[test]

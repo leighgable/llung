@@ -192,6 +192,13 @@ impl Sandbox {
     pub fn bind_binary(&mut self, name: &str) -> Result<(), String> {
         let path = closure::which(name)
             .ok_or_else(|| format!("'{name}' not found on PATH (is it in the flake devShell?)"))?;
+        self.bind_binary_at(&path)
+    }
+
+    /// [`Self::bind_binary`] for an explicit path (a Nix store binary
+    /// named by an env override rather than found on PATH).
+    pub fn bind_binary_at(&mut self, path: &Path) -> Result<(), String> {
+        let path = path.to_path_buf();
         for store_path in closure::store_closure(&path)? {
             self.mounts.push(Mount {
                 src: store_path.clone(),

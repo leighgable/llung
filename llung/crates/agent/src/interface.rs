@@ -8,6 +8,9 @@ use llung_core::network::message::{AgentResult, ChatMessage};
 
 use crate::config::{AgentConfig, BackendKind, ThinkingLevel};
 
+mod anthropic;
+pub use anthropic::{ANTHROPIC_COMPRESSOR_MODEL, ANTHROPIC_DEFAULT_MODEL, Anthropic};
+
 /// Multimodal input: resolve an attachment's content id to its cached
 /// bytes.
 type MediaLookupFn = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
@@ -106,6 +109,20 @@ pub trait Backend: Send + Sync {
     fn chat_template(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
         Box::pin(async { None })
     }
+
+    /// The tool-call format this model handles best, when the backend
+    /// knows better than its chat template (cloud models have none).
+    /// `None`: decide from the chat template, else the TOOL line.
+    fn preferred_tool_protocol(&self) -> Option<crate::tools::ToolProtocol> {
+        None
+    }
+
+    /// Quick liveness check so embedders can warn at spawn time when
+    /// the model server is unreachable (or the key is rejected),
+    /// instead of the agent silently failing on its first turn.
+    fn probe(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub struct OpenAiCompatible {
@@ -159,6 +176,76 @@ fn model_idle_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// A non-2xx answer from a model endpoint. Typed (not a bare string)
+/// so the retry policy can tell transient failures (429, 5xx, 529
+/// overloaded) from ones a retry cannot fix (400, 401, 404).
+#[derive(Debug)]
+pub struct HttpStatusError {
+    pub status: u16,
+    /// The server's `retry-after`, when it sent one (seconds form).
+    pub retry_after: Option<std::time::Duration>,
+    /// Status line plus the response body (providers put the reason there).
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+/// A failure retrying cannot fix even though no HTTP status says so:
+/// a reply cut at the model's `max_tokens` (it would be cut again, at
+/// full price) or a refusal.
+#[derive(Debug)]
+pub struct PermanentError(pub String);
+
+impl std::fmt::Display for PermanentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentError {}
+
+/// Retry policy for one failed backend ask: `Some(delay)` to retry,
+/// `None` to give up now. HTTP 429 / 408 / 5xx (incl. Anthropic's 529)
+/// honor `retry-after`; other 4xx are permanent. Everything else
+/// (connection drops, stalls, truncated or empty replies) is transient.
+pub fn retry_delay(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+    attempt: u32,
+    base: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let backoff = base.saturating_mul(1u32 << attempt.min(6));
+    if error.downcast_ref::<PermanentError>().is_some() {
+        return None;
+    }
+    match error.downcast_ref::<HttpStatusError>() {
+        Some(e) => match e.status {
+            408 | 429 | 500..=599 => Some(
+                e.retry_after
+                    .unwrap_or(backoff)
+                    .min(std::time::Duration::from_secs(60)),
+            ),
+            _ => None,
+        },
+        None => Some(backoff),
+    }
+}
+
+/// HTTP client for model backends: bounds connection setup and SILENCE
+/// between reads, never total time (see `with_idle_timeout`).
+fn http_client(idle_timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(idle_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Turn a reqwest timeout into a message that says what happened
 /// (reqwest reports a mid-body stall as "error decoding response body").
 fn stall_aware(
@@ -197,18 +284,13 @@ impl OpenAiCompatible {
         // stream that keeps producing tokens may run as long as it
         // needs. For non-streaming calls the body arrives in one piece
         // at the end, so there it still bounds the whole generation.
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(idle_timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url: base_url.into(),
             model: model.into(),
             api_key: None,
             thinking: None,
             media_lookup: None,
-            client,
+            client: http_client(idle_timeout),
             idle_timeout,
         }
     }
@@ -344,6 +426,12 @@ impl OpenAiCompatible {
             BackendKind::Lemonade => Self::lemonade(13305),
             BackendKind::Kimi => Self::kimi("kimi-k2-0905-preview", None),
             BackendKind::KimiCoding => Self::kimi_coding("kimi-for-coding", None),
+            // Anthropic speaks its own Messages API: use
+            // `interface::Anthropic`. This only exists for exhaustiveness
+            // (Anthropic's OpenAI-compatibility endpoint).
+            BackendKind::Anthropic => {
+                Self::new("https://api.anthropic.com/v1", ANTHROPIC_DEFAULT_MODEL)
+            }
         }
     }
 
@@ -551,6 +639,12 @@ async fn check(
     if status.is_success() {
         return Ok(response);
     }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
     let body = response.text().await.unwrap_or_default();
     let body = body.trim();
     let detail = if body.is_empty() {
@@ -558,7 +652,11 @@ async fn check(
     } else {
         format!(" — {body}")
     };
-    Err(format!("{status}{detail}").into())
+    Err(Box::new(HttpStatusError {
+        status: status.as_u16(),
+        retry_after,
+        message: format!("{status}{detail}"),
+    }))
 }
 
 impl OpenAiCompatible {
@@ -590,6 +688,10 @@ impl Backend for OpenAiCompatible {
     fn try_duplicate(&self) -> Option<Box<dyn Backend>> {
         // Cheap to clone: two strings plus a shared connection pool.
         Some(Box::new(self.clone()))
+    }
+
+    fn probe(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(OpenAiCompatible::probe(self))
     }
 
     fn chat_template(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
@@ -1030,6 +1132,63 @@ mod tests {
         assert_eq!(extract_delta(reasoning), None);
         let content = r#"{"choices":[{"delta":{"content":"Hi"}}]}"#;
         assert_eq!(extract_reasoning(content), None);
+    }
+
+    #[test]
+    fn retry_policy_separates_transient_from_permanent() {
+        let base = std::time::Duration::from_millis(100);
+        let http = |status, retry_after| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(HttpStatusError { status, retry_after, message: String::new() })
+        };
+        // Permanent: a retry cannot fix a bad request or a bad key.
+        for status in [400, 401, 403, 404] {
+            assert_eq!(retry_delay(&*http(status, None), 0, base), None, "{status}");
+        }
+        // Transient: exponential backoff, or the server's retry-after.
+        assert_eq!(retry_delay(&*http(529, None), 0, base), Some(base));
+        assert_eq!(retry_delay(&*http(500, None), 2, base), Some(base * 4));
+        let after = std::time::Duration::from_secs(7);
+        assert_eq!(retry_delay(&*http(429, Some(after)), 0, base), Some(after));
+        let huge = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            retry_delay(&*http(429, Some(huge)), 0, base),
+            Some(std::time::Duration::from_secs(60)),
+            "capped"
+        );
+        // Untyped errors (stream drops, truncation) are transient.
+        let plain: Box<dyn std::error::Error + Send + Sync> = "stream ended".into();
+        assert_eq!(retry_delay(&*plain, 1, base), Some(base * 2));
+        let cut: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(PermanentError("truncated at max_tokens".into()));
+        assert_eq!(retry_delay(&*cut, 0, base), None);
+    }
+
+    #[tokio::test]
+    async fn non_2xx_becomes_a_typed_error_with_retry_after() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":"rate limited"}"#;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let sent = reqwest::get(format!("http://{addr}/")).await;
+        let err = check(sent, std::time::Duration::from_secs(5)).await.unwrap_err();
+        let typed = err.downcast_ref::<HttpStatusError>().expect("typed");
+        assert_eq!(typed.status, 429);
+        assert_eq!(typed.retry_after, Some(std::time::Duration::from_secs(3)));
+        assert!(typed.message.contains("rate limited"), "body kept: {}", typed.message);
     }
 
     struct NoopBackend;

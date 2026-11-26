@@ -1264,11 +1264,12 @@ impl App {
     /// `/key list`: which providers have a stored key (env override not
     /// visible to the keyring — mentioned for completeness).
     async fn key_list(&mut self) {
-        for provider in ["kimi"] {
+        for provider in agent::config::BackendKind::KEY_PROVIDERS {
             match llung_core::secrets::has_api_key(provider).await {
                 true => self.system(format!("{provider}: set")),
                 false => self.system(format!(
-                    "{provider}: not set — `/key set {provider}` or LLUNG_KIMI_API_KEY"
+                    "{provider}: not set — `/key set {provider}` or LLUNG_{}_API_KEY",
+                    provider.to_ascii_uppercase()
                 )),
             }
         }
@@ -2215,7 +2216,7 @@ impl App {
                         if name.is_empty() {
                             self.chat_panel.push(
                                 "system".into(), "system".into(),
-                                "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high]".into(),
+                                "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding|anthropic] [model=<id>] [thinking=low|medium|high]".into(),
                                 None, None,
                             );
                             return Ok(());
@@ -2237,7 +2238,7 @@ impl App {
                         // Optional terms after the name, e.g.
                         // `/agent spawn helper backend=lemonade` or
                         // `/agent spawn scout backend=kimi model=kimi-k2-thinking thinking=high`.
-                        const SPAWN_USAGE: &str = "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high]";
+                        const SPAWN_USAGE: &str = "Usage: /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding|anthropic] [model=<id>] [thinking=low|medium|high]";
                         let mut backend_kind = agent::config::BackendKind::default();
                         let mut model: Option<String> = None;
                         let mut thinking: Option<agent::config::ThinkingLevel> = None;
@@ -2248,7 +2249,7 @@ impl App {
                                     None => {
                                         self.chat_panel.push(
                                             "system".into(), "system".into(),
-                                            format!("Unknown backend '{value}'. Try: llamacpp, lemonade, kimi, kimi-coding"),
+                                            format!("Unknown backend '{value}'. Try: llamacpp, lemonade, kimi, kimi-coding, anthropic"),
                                             None, None,
                                         );
                                         return Ok(());
@@ -2287,7 +2288,10 @@ impl App {
                                 Err(e) => {
                                     self.chat_panel.push(
                                         "system".into(), "system".into(),
-                                        format!("Kimi backend needs an API key: {e}"),
+                                        format!(
+                                            "{backend_kind:?} backend needs an API key: {e} \
+                                             (`/key set {provider}`)"
+                                        ),
                                         None, None,
                                     );
                                     return Ok(());
@@ -2348,42 +2352,58 @@ impl App {
                         // spawn without model= gets the Kimi default.
                         let agent_config = AgentConfig {
                             name: name.clone(),
-                            model: model.clone().unwrap_or_else(|| match backend_kind {
-                                agent::config::BackendKind::Kimi => "kimi-k2-0905-preview".to_string(),
-                                agent::config::BackendKind::KimiCoding => "kimi-for-coding".to_string(),
-                                _ => AgentConfig::default().model,
-                            }),
+                            model: model.clone().unwrap_or_else(|| backend_kind.default_model()),
                             backend: backend_kind,
                             thinking,
                             ..Default::default()
                         };
-                        let mut backend = OpenAiCompatible::from_config(&agent_config);
-                        if let Some(key) = api_key {
-                            backend = backend.with_api_key(key);
-                        }
                         // Multimodal input: resolve attachment cids
                         // against the media cache so a vision backend
-                        // (SenseNova + mmproj) can SEE images the chat
-                        // carries — the agent's own published plots
+                        // (SenseNova + mmproj, Claude) can SEE images the
+                        // chat carries — the agent's own published plots
                         // included. A dedicated connection: rusqlite
                         // `Connection` is Send but not Sync.
-                        {
+                        let media_lookup = {
                             let media_db = Database::open(
                                 self.config.db_path.to_str().ok_or("non-UTF8 db path")?,
                             )?;
                             let media_db = std::sync::Arc::new(std::sync::Mutex::new(media_db));
-                            backend = backend.with_media_lookup(move |cid| {
-                                media_db.lock().ok()?.get_avatar_cache(cid).ok().flatten()
-                            });
-                        }
-                        // llama-server identifies models by their full
-                        // GGUF path — ask which model it serves instead
-                        // of guessing a friendly name. Failure keeps the
-                        // configured fallback; probe() reports the outage
-                        // right below when the server is down.
-                        if agent_config.backend == agent::config::BackendKind::LlamaCpp {
-                            backend.discover_model().await;
-                        }
+                            move |cid: &str| media_db.lock().ok()?.get_avatar_cache(cid).ok().flatten()
+                        };
+                        // The agent's model, plus (Anthropic) a cheaper
+                        // model for history compression.
+                        let (backend, cheap_compressor): (
+                            Box<dyn agent::interface::Backend>,
+                            Option<(Box<dyn agent::interface::Backend>, String)>,
+                        ) = match agent_config.backend {
+                            agent::config::BackendKind::Anthropic => {
+                                let mut claude = agent::interface::Anthropic::from_config(&agent_config)
+                                    .with_media_lookup(media_lookup);
+                                if let Some(key) = api_key {
+                                    claude = claude.with_api_key(key);
+                                }
+                                let compressor = claude.compressor();
+                                let label = compressor.model().to_string();
+                                (Box::new(claude), Some((Box::new(compressor), label)))
+                            }
+                            _ => {
+                                let mut backend = OpenAiCompatible::from_config(&agent_config)
+                                    .with_media_lookup(media_lookup);
+                                if let Some(key) = api_key {
+                                    backend = backend.with_api_key(key);
+                                }
+                                // llama-server identifies models by their
+                                // full GGUF path — ask which model it
+                                // serves instead of guessing a friendly
+                                // name. Failure keeps the configured
+                                // fallback; probe() reports the outage
+                                // right below when the server is down.
+                                if agent_config.backend == agent::config::BackendKind::LlamaCpp {
+                                    backend.discover_model().await;
+                                }
+                                (Box::new(backend), None)
+                            }
+                        };
 
                         // Warn early when the model server isn't there —
                         // otherwise the agent simply never answers and it
@@ -2405,8 +2425,20 @@ impl App {
 
                         // History compression: on the local llamacpp
                         // backend SmolVLM does it (same llama-server,
-                        // router mode); elsewhere the agent's own model.
-                        let compressor = if agent::history::uses_smolvlm(&agent_config) {
+                        // router mode); on Anthropic the cheap model;
+                        // elsewhere the agent's own model.
+                        // The profile sizes the history view: a frontier
+                        // model sees ~400 KB verbatim before any compression.
+                        let profile = agent::config::ModelProfile::for_backend(agent_config.backend);
+                        // LLUNG_COMPRESSOR=rules: plain truncation, never a
+                        // model call (explicit; not upgraded to the agent's model).
+                        let rules_only = std::env::var("LLUNG_COMPRESSOR")
+                            .is_ok_and(|v| v.eq_ignore_ascii_case("rules"));
+                        let compressor = if rules_only {
+                            HistoryCompressor::rules_only(profile.context_budget)
+                        } else if let Some((model, label)) = cheap_compressor {
+                            HistoryCompressor::with_model(model).with_label(label)
+                        } else if agent::history::uses_smolvlm(&agent_config) {
                             let mut smol = OpenAiCompatible::smolvlm(9931);
                             if !smol.discover_smolvlm().await && backend_up {
                                 self.chat_panel.push(
@@ -2419,8 +2451,11 @@ impl App {
                             }
                             HistoryCompressor::with_model(Box::new(smol)).with_label("SmolVLM")
                         } else {
-                            HistoryCompressor::with_model(Box::new(backend.clone()))
-                        };
+                            HistoryCompressor::with_model(
+                                backend.try_duplicate().ok_or("model backend cannot be duplicated")?,
+                            )
+                        }
+                        .with_budget(profile.context_budget);
                         let stream_tx = self
                             .stream_tx
                             .clone()
@@ -2431,7 +2466,7 @@ impl App {
                             .ok_or("permission channel not initialized")?;
                         let ctx = AgentLoopContext::new(
                             agent_config.clone(),
-                            Box::new(backend.clone()),
+                            backend,
                             compressor,
                             Database::open(
                                 self.config.db_path.to_str().ok_or("non-UTF8 db path")?,
@@ -2784,12 +2819,13 @@ impl App {
     }
 
     /// `/tools` output: every tool (no arg), or one tool's description,
-    /// usage, and argument schema (`/tools <name>`).
+    /// usage, and argument schema (`/tools <name>`). The list hides tools
+    /// this install cannot run; asking for one by name says why.
     fn format_tool_listing(name: &str) -> Vec<String> {
         let catalog = agent::tools::tool_catalog();
         if name.is_empty() {
             let mut lines = vec!["Tools:".to_string()];
-            for spec in catalog {
+            for spec in agent::tools::available_tools() {
                 lines.push(format!("  {} — {}", spec.name, spec.description));
             }
             lines.push("Usage: /tools <name> — full description and arguments".into());
@@ -2804,6 +2840,9 @@ impl App {
             format!("{} — {}", spec.name, spec.description),
             format!("usage: {}", spec.usage),
         ];
+        if let Some(reason) = agent::tools::unavailable_reason(spec.name) {
+            lines.insert(1, format!("(not in this build) {reason}"));
+        }
         if let Ok(schema) = serde_json::from_str::<serde_json::Value>(spec.schema) {
             if let Ok(pretty) = serde_json::to_string_pretty(&schema) {
                 lines.push("arguments (JSON schema):".into());
@@ -2819,8 +2858,8 @@ impl App {
             "Commands:".into(),
             "  /join #<topic> — switch to a topic (and subscribe)".into(),
             "  /invite <peer> [peer...] [#<topic>] [display name] — invite peers to a topic (default: current chat)".into(),
-            "  /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding] [model=<id>] [thinking=low|medium|high] — spawn a local agent, then invite it like any peer".into(),
-            "  /key set kimi — store the Kimi API key in your login keyring from here (hidden input); /key list · /key delete".into(),
+            "  /agent spawn <name> [backend=llamacpp|lemonade|kimi|kimi-coding|anthropic] [model=<id>] [thinking=low|medium|high] — spawn a local agent, then invite it like any peer".into(),
+            "  /key set kimi|anthropic — store a cloud API key in your login keyring from here (hidden input); /key list · /key delete".into(),
             "  /branch — where am I in the chat tree?".into(),
             "  /branch <n> — focus the message n-back; your next message forks the chat there".into(),
             "  /branch up|down — walk to the parent / most recent child message".into(),
@@ -3028,7 +3067,7 @@ const GRANT_USAGE: &str = "Usage: /grant list | /grant <effect> perpetual [agent
 const KEY_USAGE: &str = "\
 Usage: /key list | /key set <provider> | /key delete <provider>
 
-Providers name a model backend's API key (currently: kimi). Keys are
+Providers name a model backend's API key (currently: kimi, anthropic). Keys are
 stored in the login keyring (freedesktop Secret Service — gnome-keyring
 or KWallet), encrypted at rest and unlocked with your login; `/key set`
 reads the key with hidden input, so it never sits in the chat history.
@@ -3167,6 +3206,7 @@ fn tier_label(tier: agent::effects::Tier) -> &'static str {
         Tier::Repl => " (interpreter)",
         Tier::Gpu => " (GPU)",
         Tier::Host => " (host publish)",
+        Tier::Net => " (network)",
     }
 }
 
@@ -3522,7 +3562,7 @@ mod tests {
     fn tools_listing_shows_every_tool_then_details() {
         let lines = App::format_tool_listing("");
         assert!(lines[0].starts_with("Tools:"));
-        for spec in agent::tools::tool_catalog() {
+        for spec in agent::tools::available_tools() {
             assert!(
                 lines.iter().any(|l| l.contains(spec.name)),
                 "listing must include {}",

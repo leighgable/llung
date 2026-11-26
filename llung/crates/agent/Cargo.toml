@@ -24,3 +24,6 @@ grep-regex = "0.1"
 similar = "2"
 libc = "0.2"
 base64 = "0.22"
+# web_fetch: HTML -> Markdown (html5ever, pure Rust)
+htmd = "0.6"
+url = "2"

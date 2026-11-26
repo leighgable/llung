@@ -7,6 +7,7 @@ members = [
   "crates/ios-bridge",
   "crates/agent",
   "crates/agent-rt",
+  "crates/llung-pdf",
   "crates/tools/landscape",
   "crates/tools/artist",
   "crates/tools/diagram",

@@ -145,6 +145,12 @@ impl ChatMessage {
         Self::prompt_message(MessageKind::Human, content)
     }
 
+    /// Prompt-only message (never stored or gossiped): the agent's own
+    /// earlier output within a turn (e.g. the tool call it made).
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::prompt_message(MessageKind::Agent, content)
+    }
+
     fn prompt_message(kind: MessageKind, content: impl Into<String>) -> Self {
         Self {
             id: String::new(),

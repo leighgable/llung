@@ -70,6 +70,34 @@ pub async fn secure_execute_agent_tool_in(
         crate::effects::Tier::Wasm => {
             // fall through to the wasm worker below
         }
+        crate::effects::Tier::FsRead if effect.name == "pdf_read" => {
+            // Read-only, but a real process: the llung-pdf helper runs
+            // inside bubblewrap (PDFium/ONNX Runtime never in-process).
+            let output = crate::sandbox::pdf::run(&arguments_json, places)
+                .await
+                .map_err(|e| format!("pdf_read failed: {e}"))?;
+            receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
+            state.advance_history_root(&receipt);
+            return Ok((receipt, output));
+        }
+        crate::effects::Tier::Net => {
+            // Host-side HTTP with SSRF checks (web.rs). The operator
+            // approved this URL (or holds a standing grant) upstream.
+            // Only the one known net effect: `net:<anything>` must not
+            // become a fetch under another name (and another grant).
+            if effect.name != "web_fetch" {
+                return Err(format!(
+                    "effect '{}' (tier 'net') has no executor — only web_fetch",
+                    manifest.target_effect
+                ));
+            }
+            let output = crate::web::run(&arguments_json, places)
+                .await
+                .map_err(|e| format!("Fetch failed: {e}"))?;
+            receipt.output_commitment = compute_sha256_bytes(output.as_bytes());
+            state.advance_history_root(&receipt);
+            return Ok((receipt, output));
+        }
         crate::effects::Tier::FsRead | crate::effects::Tier::Edit => {
             // Host-native tools execute in-process (no wasm, no
             // external processes).

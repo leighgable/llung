@@ -36,6 +36,10 @@ use crate::sandbox::closure;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
+/// gpu:torch evaluations may run longer: the first Triton kernel use
+/// JIT-compiles and autotunes for minutes (e.g. `cli.py check` on a
+/// model using the prefix kernels). Training itself is detached.
+const MAX_TORCH_TIMEOUT_SECS: u64 = 900;
 /// Futhark idle-read: stdout silence that ends a turn.
 const IDLE_QUIET: Duration = Duration::from_millis(500);
 /// Futhark idle-read: if nothing arrived at all, call the turn done.
@@ -139,6 +143,7 @@ impl Interp {
                     extra_ro_binds: empty.clone(),
                     rw_subdirs: Vec::new(),
                     require_runs: false,
+                    max_timeout_secs: MAX_TIMEOUT_SECS,
                 }
             };
         match self {
@@ -187,6 +192,7 @@ impl Interp {
                     true,
                 );
                 cfg.require_runs = true;
+                cfg.max_timeout_secs = MAX_TORCH_TIMEOUT_SECS;
                 Ok(cfg)
             }
         }
@@ -286,6 +292,8 @@ pub struct SessionConfig {
     /// trainer's checkpoints must not silently go nowhere). Other
     /// sessions just start without it.
     pub require_runs: bool,
+    /// Upper clamp for a call's `timeout_secs`.
+    pub max_timeout_secs: u64,
 }
 
 impl SessionConfig {
@@ -304,7 +312,7 @@ pub struct ReplArgs {
     /// Session name separating independent states (default: the interpreter name).
     #[serde(default)]
     pub session: Option<String>,
-    /// Per-evaluation wall-clock seconds (default 30, max 120).
+    /// Per-evaluation wall-clock seconds (default 30; max 120, torch 900).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     /// Futhark only: c (default) | opencl | cuda. Non-c backends need the
@@ -734,7 +742,7 @@ impl ReplManager {
         let timeout = Duration::from_secs(
             args.timeout_secs
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .clamp(1, MAX_TIMEOUT_SECS),
+                .clamp(1, config.max_timeout_secs),
         );
         let session = self.sessions.get_mut(&key).expect("just inserted");
         let result = session.evaluate(&args.input, timeout).await;
@@ -910,6 +918,7 @@ done
             extra_ro_binds: vec![(script.to_path_buf(), in_sandbox)],
             rw_subdirs: Vec::new(),
             require_runs: false,
+            max_timeout_secs: MAX_TIMEOUT_SECS,
         }
     }
 
